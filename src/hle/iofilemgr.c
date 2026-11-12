@@ -36,7 +36,7 @@
 #define PSP_O_CREAT  0x0200
 #define PSP_O_TRUNC  0x0400
 
-typedef struct { FILE *f; int used; } io_file;
+typedef struct { FILE *f; int used; int raw; uint64_t lba; } io_file;
 
 typedef struct {
     int used;
@@ -56,6 +56,18 @@ static io_dir  g_dir[MAX_DIRS];
 static char    g_root[512];
 static uint64_t g_bytes_read;
 
+/* Raw UMD sectors. The game's disc check Getstats a container, seeks the raw
+ * device to the file's start LBA, reads one sector and checksums it, so
+ * serving sectors out of the extracted file is enough. LBAs are this disc's.
+ * shortcut: only these containers are mapped; add entries if another file is
+ * ever read raw. */
+static const struct { const char *guest; uint64_t lba; } g_disc_lba[] = {
+    { "disc0:/PSP_GAME/INSDIR/DATA.TPA",    54496 },
+    { "disc0:/PSP_GAME/INSDIR/STREAMI.TPA", 155184 },
+    { "disc0:/PSP_GAME/INSDIR/STREAMS.TPA", 189024 },
+    { "disc0:/PSP_GAME/USRDIR/STREAMV.TPA", 469104 },
+};
+
 void psp_io_set_root(const char *root) {
     snprintf(g_root, sizeof g_root, "%s", root ? root : ".");
 }
@@ -67,6 +79,7 @@ void psp_io_reset(void) {
         if (g_file[i].used && g_file[i].f) fclose(g_file[i].f);
         g_file[i].used = 0;
         g_file[i].f = NULL;
+        g_file[i].raw = 0;
     }
     memset(g_dir, 0, sizeof g_dir);
     g_bytes_read = 0;
@@ -98,6 +111,21 @@ static void hle_Open(void) {
     char guest[512], host[1024];
     psp_str(psp_arg(0), guest, sizeof guest);
     uint32_t flags = psp_arg(1);
+
+    /* The raw UMD device: no host file, just a sector cursor. */
+    if (!strncmp(guest, "umd0:", 5) && (guest[5] == '\0' || guest[5] == '/')) {
+        for (int i = 0; i < MAX_FILES; i++) {
+            if (g_file[i].used) continue;
+            g_file[i].used = 1;
+            g_file[i].raw = 1;
+            g_file[i].lba = 0;
+            psp_ret((uint32_t)(i + 3));
+            return;
+        }
+        psp_ret(0x80010018);
+        return;
+    }
+
     map_path(guest, host, sizeof host);
 
     const char *mode = "rb";
@@ -141,10 +169,34 @@ static io_file *fd_arg(void) {
 static void hle_Close(void) {
     io_file *h = fd_arg();
     if (!h) { psp_ret(0x80020323); return; }
-    fclose(h->f);
+    if (h->f) fclose(h->f);
     h->f = NULL;
+    h->raw = 0;
     h->used = 0;
     psp_ret(0);
+}
+
+/* Fill dst from the container whose LBA range covers the cursor. Returns the
+ * bytes read and advances the cursor by whole sectors. */
+static int raw_read(io_file *h, uint8_t *dst, uint32_t bytes) {
+    const char *guest = NULL;
+    uint64_t base = 0;
+    for (size_t i = 0; i < sizeof g_disc_lba / sizeof *g_disc_lba; i++) {
+        if (h->lba >= g_disc_lba[i].lba && g_disc_lba[i].lba >= base) {
+            base = g_disc_lba[i].lba;
+            guest = g_disc_lba[i].guest;
+        }
+    }
+    if (!guest) return 0;
+    char host[1024];
+    map_path(guest, host, sizeof host);
+    FILE *f = fopen(host, "rb");
+    if (!f) return 0;
+    fseek(f, (long)((h->lba - base) * 2048), SEEK_SET);
+    size_t got = fread(dst, 1, bytes, f);
+    fclose(f);
+    h->lba += (got + 2047) / 2048;
+    return (int)got;
 }
 
 static void hle_Read(void) {
@@ -153,6 +205,17 @@ static void hle_Read(void) {
     if (!h) { psp_ret(0x80020323); return; }
     if (!dst) { psp_ret(0x80020130); return; }
     if (!size) { psp_ret(0); return; }
+
+    if (h->raw) {
+        uint8_t *tmp = (uint8_t *)malloc(size);
+        if (!tmp) { psp_ret(0x80020190); return; }
+        int got = raw_read(h, tmp, size);
+        for (int i = 0; i < got; i++) psp_write8(dst + (uint32_t)i, tmp[i]);
+        free(tmp);
+        g_bytes_read += (uint64_t)got;
+        psp_ret((uint32_t)got);
+        return;
+    }
 
     /* Read through a host buffer and then place it, so a read that straddles
      * the end of a guest region is rejected by the memory layer rather than
@@ -201,6 +264,15 @@ static void hle_Lseek(void) {
     uint64_t off = (uint64_t)psp_arg(2) | ((uint64_t)psp_arg(3) << 32);
     uint32_t whence = psp_arg(4);
     if (!h) { psp_ret(0x80020323); return; }
+
+    if (h->raw) {
+        /* Raw device positions are in 2048-byte sectors. */
+        if (whence == 0) h->lba = off;
+        else if (whence == 1) h->lba += off;
+        psp_cpu.r[PSP_REG_V0] = (uint32_t)h->lba;
+        psp_cpu.r[PSP_REG_V1] = (uint32_t)(h->lba >> 32);
+        return;
+    }
 
     int w = (whence == 1) ? SEEK_CUR : (whence == 2) ? SEEK_END : SEEK_SET;
     if (fseek(h->f, (long)(int64_t)off, w) != 0) { psp_ret(0xFFFFFFFFu); return; }
@@ -370,9 +442,17 @@ static void hle_Getstat(void) {
         int is_dir = S_ISDIR(st.st_mode);
         psp_write32(st_ptr + 0, (is_dir ? 0x1000u : 0x2000u) | 0x01FFu);
         psp_write32(st_ptr + 4, is_dir ? 0x10u : 0x20u);
+        /* SceIoStat: mode, attr, three 16-byte dates, u64 size at 56,
+         * st_private[6] at 64. The disc check reads st_private[0] as the
+         * file's start LBA. */
         uint64_t sz = is_dir ? 0 : (uint64_t)st.st_size;
-        psp_write32(st_ptr + 8,  (uint32_t)sz);
-        psp_write32(st_ptr + 12, (uint32_t)(sz >> 32));
+        psp_write32(st_ptr + 56, (uint32_t)sz);
+        psp_write32(st_ptr + 60, (uint32_t)(sz >> 32));
+        for (size_t i = 0; i < sizeof g_disc_lba / sizeof *g_disc_lba; i++)
+            if (!strcmp(guest, g_disc_lba[i].guest)) {
+                psp_write32(st_ptr + 64, (uint32_t)g_disc_lba[i].lba);
+                psp_write32(st_ptr + 68, (uint32_t)(g_disc_lba[i].lba >> 32));
+            }
     }
     psp_ret(0);
 }
@@ -430,7 +510,41 @@ static void hle_Devctl(void) {
     psp_ret(0);
 }
 
-static void hle_Ioctl(void) { psp_ret(0); }
+static void hle_Ioctl(void) {
+    io_file *h = fd_arg();
+    uint32_t cmd = psp_arg(1);
+    uint32_t indata = psp_arg(2);
+    uint32_t outdata = psp_arg(4), outlen = psp_arg(5);
+
+    if (h && h->raw) {
+        if (getenv("PSPRECOMP_TRACE_IO"))
+            fprintf(stderr, "io: ioctl raw cmd 0x%08X in=0x%08X out=0x%08X/%u lba=%llu\n",
+                    cmd, indata, outdata, outlen, (unsigned long long)h->lba);
+        if (cmd == 0x01F100A6u && indata) {
+            /* Seek to a 64-bit LBA (input is {u64 lba, u64 pad}). */
+            h->lba = (uint64_t)psp_read32(indata) | ((uint64_t)psp_read32(indata + 4) << 32);
+            psp_ret(0);
+            return;
+        }
+        if (cmd == 0x01F30003u) {
+            /* Uncached read of N sectors; returns the sector count. */
+            uint32_t sectors = indata ? psp_read32(indata) : 1;
+            uint32_t bytes = sectors * 2048;
+            if (bytes > outlen) bytes = outlen;
+            uint8_t *tmp = (uint8_t *)malloc(bytes ? bytes : 1);
+            if (!tmp) { psp_ret(0x80020190); return; }
+            /* A real UMD seek+read takes tens of ms, and the game rejects a
+             * read that finishes in under 20 ms. */
+            psp_threadman_sleep_real(25000);
+            int got = raw_read(h, tmp, bytes);
+            for (int i = 0; i < got; i++) psp_write8(outdata + (uint32_t)i, tmp[i]);
+            free(tmp);
+            psp_ret((uint32_t)((got + 2047) / 2048));
+            return;
+        }
+    }
+    psp_ret(0);
+}
 
 static void hle_Chdir(void) {
     /* DJMAX uses Chdir to point to directory context; our map_path handles absolute paths */

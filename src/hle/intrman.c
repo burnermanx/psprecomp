@@ -136,9 +136,17 @@ void psp_intr_tick(void) {
     if (psp_threadman_intr_disabled()) return;
     g_delivering = 1;
 
+    /* The vblank interrupt (30) is a real 59.94 Hz source, not a per-wait
+     * event: deliver it once per guest frame, not at every wait point. */
+    static uint64_t last_vblank;
+    uint64_t vb = psp_vblank_index();
+    int vblank_new = vb != last_vblank;
+    last_vblank = vb;
+
     for (int i = 0; i < MAX_SUBINTR; i++) {
         psp_subintr *s = &g_sub[i];
         if (!s->used || !s->enabled) continue;
+        if (s->intr == 30 && !vblank_new) continue;
 
         if (!psp_lookup(s->handler)) {
             /* Worth naming loudly: the guest registered a handler we cannot

@@ -268,20 +268,29 @@ static uint64_t g_switches;         /* baton handovers */
 static uint64_t g_parks;
 static uint64_t g_wait_gaveup;      /* unbounded waits that ran out of ticks */
 static uint64_t g_vtime_us;         /* see the clock note above */
-static uint64_t g_epoch_us;         /* boot epoch; a PSP clock is uptime, not wall time */
 
-static int      g_fps_limit = 0;    /* 0 = default (from env or 30/60) */
+static int      g_fps_limit = 0;    /* 0 = native 59.94 Hz */
 static int      g_fps_init = 0;
-static uint64_t g_frame_target_us = 33333ull; /* default 30 FPS */
-static uint64_t g_next_frame_dl_us = 0;
+/* Frame period as a fraction (num/den us), so the native 59.94 Hz timeline is
+ * exact: vblank n is at t0 + n * 1001000/60 us, with no accumulated error. */
+static uint64_t g_frame_num = 1001000ull, g_frame_den = 60;
+static uint64_t g_frame_t0_us = 0;
+static uint64_t g_frame_index = 0;
+
+/* Guest-visible clock. Real time since boot, except in deterministic mode
+ * (EMOTIONALSENSE_CLOCK=virtual), where it is one frame period per frame so
+ * --frames runs are reproducible and fast. */
+static int      g_clock_virtual = 0;
+static uint64_t g_boot_mono_us = 0;
 
 void psp_threadman_set_fps_limit(int fps) {
     g_fps_init = 1;
     g_fps_limit = fps;
     if (fps <= 0) {
-        g_frame_target_us = 0; /* uncap */
+        g_frame_num = 0; /* uncap */
     } else {
-        g_frame_target_us = 1000000ull / (uint64_t)fps;
+        g_frame_num = 1000000ull;
+        g_frame_den = (uint64_t)fps;
     }
 }
 
@@ -295,7 +304,7 @@ static void frame_pacing_init_if_needed(void) {
     const char *uncap = getenv("EMOTIONALSENSE_UNCAP");
     if (uncap && (uncap[0] == '1' || uncap[0] == 'y' || uncap[0] == 'Y')) {
         g_fps_limit = 0;
-        g_frame_target_us = 0;
+        g_frame_num = 0;
         return;
     }
     const char *env_fps = getenv("EMOTIONALSENSE_FPS");
@@ -303,25 +312,44 @@ static void frame_pacing_init_if_needed(void) {
         int v = atoi(env_fps);
         if (v > 0) {
             g_fps_limit = v;
-            g_frame_target_us = 1000000ull / (uint64_t)v;
+            g_frame_num = 1000000ull;
+            g_frame_den = (uint64_t)v;
             return;
         } else if (v == 0) {
             g_fps_limit = 0;
-            g_frame_target_us = 0;
+            g_frame_num = 0;
             return;
         }
     }
-    /* Default to 30 FPS (original PSP experience) */
-    g_fps_limit = 30;
-    g_frame_target_us = 33333ull;
+    /* Native: the game's own 59.94 Hz. */
+    g_fps_limit = 0;
+    g_frame_num = 1001000ull;
+    g_frame_den = 60;
 }
 
-static uint64_t host_now_us(void) {
+/* Monotonic microseconds, for pacing. host_deadline_us is already monotonic
+ * (QPC on Windows, CLOCK_MONOTONIC on POSIX). */
+static uint64_t mono_us(void) {
 #if PSPRECOMP_REAL_THREADS
-    return host_epoch_us();
+    return host_deadline_us();
 #else
     return (uint64_t)time(NULL) * 1000000ull;
 #endif
+}
+
+/* The clock the guest reads: uptime in microseconds. g_vtime_us stays internal
+ * scheduler accounting and is no longer visible to the game. */
+uint64_t psp_clock_us(void) {
+    if (g_clock_virtual) return g_frame_index * 16683ull;
+    return mono_us() - g_boot_mono_us;
+}
+
+/* The real vblank timeline, independent of whether the guest asked to wait:
+ * the video player's interrupt handler has to fire even while the main thread
+ * is blocked on something else. */
+uint64_t psp_vblank_index(void) {
+    if (g_clock_virtual || !g_frame_num || !g_frame_t0_us) return g_frame_index;
+    return (mono_us() - g_frame_t0_us) * g_frame_den / g_frame_num;
 }
 
 /* The handovers, one line each, on request: PSPRECOMP_TRACE_SCHED=1. Bounded,
@@ -603,7 +631,11 @@ void psp_threadman_reset(void) {
     /* A PSP reports microseconds since boot, not wall clock. A wall-clock
      * sized value overflows the int32 truncation in games that convert it to
      * float seconds (DJMAX P3's scene fade-in then never fires). */
-    g_epoch_us = 0;
+    g_frame_t0_us = 0;
+    g_frame_index = 0;
+    g_fps_init = 0;
+    g_frame_num = 1001000ull;
+    g_frame_den = 60;
 
 #if PSPRECOMP_REAL_THREADS
     /* The caller is running the module entry: it holds the CPU from here. */
@@ -624,6 +656,9 @@ void psp_threadman_init(void) {
 #if PSPRECOMP_REAL_THREADS
     host_timer_init();
 #endif
+    const char *clk = getenv("EMOTIONALSENSE_CLOCK");
+    g_clock_virtual = clk && !strcmp(clk, "virtual");
+    g_boot_mono_us = mono_us();
     psp_threadman_reset();
     trace_sched_enable();
 }
@@ -674,20 +709,20 @@ void psp_threadman_frame_wait(void) {
     frame_pacing_init_if_needed();
 
     uint64_t wait_real_us = 0;
-    if (g_frame_target_us > 0) {
-        uint64_t now = host_now_us();
-        if (g_next_frame_dl_us == 0 || now > g_next_frame_dl_us + 100000ull) {
-            /* First frame or severe lag: start fresh deadline */
-            g_next_frame_dl_us = now + g_frame_target_us;
-        } else {
-            g_next_frame_dl_us += g_frame_target_us;
+    if (g_frame_num && !g_clock_virtual) {
+        uint64_t now = mono_us();
+        if (g_frame_t0_us == 0) g_frame_t0_us = now;
+        uint64_t dl = g_frame_t0_us + (g_frame_index + 1) * g_frame_num / g_frame_den;
+        if (now > dl + 100000ull) {
+            /* Severe lag: restart the timeline instead of trying to catch up. */
+            g_frame_t0_us = now;
+            g_frame_index = 0;
+            dl = now + g_frame_num / g_frame_den;
         }
-
-        if (g_next_frame_dl_us > now) {
-            wait_real_us = g_next_frame_dl_us - now;
-        }
+        g_frame_index++;
+        if (dl > now) wait_real_us = dl - now;
     } else {
-        wait_real_us = REAL_TICK_US;
+        wait_real_us = g_clock_virtual ? 0 : REAL_TICK_US;
     }
 
     check_terminated();
@@ -1146,7 +1181,8 @@ static void park_ticks(uint64_t us, int kind) {
 void psp_threadman_delay(uint64_t us) { park_ticks(us, W_DELAY); }
 
 static void hle_DelayThread(void) {
-    park_ticks(psp_arg(0), W_DELAY);
+    /* The guest clock is real now, so a delay has to cost real time too. */
+    psp_threadman_sleep_real(psp_arg(0));
     deliver_tick();
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
@@ -1262,7 +1298,7 @@ static void hle_GetThreadStackFreeSize(void) {
  * readings -- or against a value it stored at startup -- never sees time go
  * backwards, and so the value is in the same range a real clock would give. */
 static uint64_t now_us(void) {
-    return g_epoch_us + g_vtime_us;
+    return psp_clock_us();
 }
 
 static void hle_GetSystemTime(void) {

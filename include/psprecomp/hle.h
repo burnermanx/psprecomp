@@ -212,6 +212,11 @@ int  psp_threadman_intr_disabled(void);
 uint64_t psp_threadman_switches(void);
 uint64_t psp_threadman_parks(void);
 uint64_t psp_threadman_vtime_us(void);
+/* The guest-visible clock: microseconds since boot, real time unless
+ * EMOTIONALSENSE_CLOCK=virtual, which makes it one frame per frame. */
+uint64_t psp_clock_us(void);
+/* The real vblank count, for the once-per-vblank interrupt. */
+uint64_t psp_vblank_index(void);
 uint32_t psp_threadman_current_uid(void);
 /* Parks after which another thread had run (so the CPU really was handed over),
  * and the ones that gave up before the thread they waited for was scheduled.

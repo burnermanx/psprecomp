@@ -145,6 +145,11 @@ uint32_t psp_sysmem_alloc(uint32_t size, int from_high) {
     b->size = rounded;
     b->used = 1;
     snprintf(b->name, sizeof b->name, "internal");
+    /* Fresh memory reads as fresh. Games allocate a block, never initialise it,
+     * and then release it; stale bytes from the previous owner look like a
+     * pointer and crash them (DJMAX P3 releases an uninitialised VPL block). */
+    void *p = psp_mem_ptr(addr, rounded);
+    if (p) memset(p, 0, rounded);
     return addr;
 }
 

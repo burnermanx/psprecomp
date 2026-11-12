@@ -18,15 +18,30 @@ uint64_t   psp_mem_bad_access;
  * path is the one place that can answer it directly. */
 static uint32_t g_wwatch;
 static int g_whits;
-void psp_mem_watch_write(uint32_t addr) { g_wwatch = addr; g_whits = 0; }
+static int g_wlimit = 8;
+static uint32_t g_wlast;
+static int g_wseen;
+void psp_mem_watch_write(uint32_t addr) {
+    g_wwatch = addr; g_whits = 0; g_wseen = 0;
+    /* A field written every frame drowns in its own noise; let the caller ask
+     * for more than the default handful. */
+    const char *l = getenv("EMOTIONALSENSE_WATCH_LIMIT");
+    if (l) g_wlimit = atoi(l);
+}
 int psp_mem_watch_hits(void) { return g_whits; }
 
 static void note_write(uint32_t addr, uint32_t width) {
     if (!g_wwatch || addr + width <= g_wwatch || addr > g_wwatch) return;
-    if (g_whits++ < 8)
+    /* Only report a change: a counter bumping once a frame is one fact, not
+     * a million lines. */
+    uint32_t v = psp_read32(g_wwatch);
+    if (g_wseen && v == g_wlast) return;
+    g_wlast = v; g_wseen = 1;
+    if (g_whits++ < g_wlimit)
     {
-        fprintf(stderr, "write%u to 0x%08X (watch 0x%08X) from fn 0x%08X ra 0x%08X calls",
-                width * 8, addr, g_wwatch, psp_trace_last(), psp_cpu.r[PSP_REG_RA]);
+        fprintf(stderr, "write%u to 0x%08X (watch 0x%08X) = 0x%08X from fn 0x%08X ra 0x%08X calls",
+                width * 8, addr, g_wwatch, v,
+                psp_trace_last(), psp_cpu.r[PSP_REG_RA]);
         /* The return sites of the guest calls in flight, innermost first:
          * the writer is the body that called the first of them. */
         for (const psp_frame *f = psp_cpu.frame; f && f->ret; f = f->prev)
@@ -172,6 +187,7 @@ int psp_mem_write_block(uint32_t addr, const void *src, uint32_t len) {
     void *p = psp_mem_ptr(addr, len);
     if (!p) return -1;
     memcpy(p, src, len);
+    note_write(addr, len);   /* a block copy is a write too */
     return 0;
 }
 

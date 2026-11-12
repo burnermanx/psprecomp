@@ -380,6 +380,15 @@ static int edge(const psp_vertex *p, const psp_vertex *q, int x, int y) {
     return (q->x - p->x) * (y - p->y) - (q->y - p->y) * (x - p->x);
 }
 
+/* Edge function at the pixel centre (x+0.5, y+0.5), doubled so it stays
+ * integral. The GE rasterises float vertices against pixel centres, so testing
+ * the integer corner instead shifts every triangle half a pixel up and left
+ * and makes the far edge inclusive. Its denominator is twice the area from
+ * `edge`, because the constant it adds cancels only over a closed triangle. */
+static int edge_centre(const psp_vertex *p, const psp_vertex *q, int x, int y) {
+    return (q->x - p->x) * (2 * y + 1 - 2 * p->y) - (q->y - p->y) * (2 * x + 1 - 2 * p->x);
+}
+
 /* Barycentric fill with integer edge functions, so a shared edge belongs to
  * exactly one triangle: adjacent geometry neither double-draws nor leaves
  * seams. Both windings are accepted — back-face culling is not implemented, and
@@ -398,26 +407,22 @@ static void sw_tri(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c
     if (maxx > 479) maxx = 479;
     if (maxy > 271) maxy = 271;
 
-    const int area = edge(a, b, c->x, c->y);
+    const int area = 2 * edge(a, b, c->x, c->y);
     if (area == 0) return;
     const float inv = 1.0f / (float)area;
-    /* Coverage is decided on the integer grid; attributes are sampled at the
-     * pixel centre, half a pixel on, as the GE does. Sampled at the corner, a
-     * row lands exactly on a texel edge, float error floors it to the texel
-     * before, and WTF's LED panels -- dots on every other texel row -- lost
-     * whole rows of dots. */
-    const float h0 = 0.5f * (float)((b->x - a->x) - (b->y - a->y));
-    const float h1 = 0.5f * (float)((c->x - b->x) - (c->y - b->y));
-    const float h2 = 0.5f * (float)((a->x - c->x) - (a->y - c->y));
-
+    /* Coverage and attributes are both sampled at the pixel centre, which the
+     * edge function above already does. Sampled at the corner, a row lands
+     * exactly on a texel edge, float error floors it to the texel before, and
+     * WTF's LED panels -- dots on every other texel row -- lost whole rows of
+     * dots. */
     for (int y = miny; y <= maxy; y++) {
         for (int x = minx; x <= maxx; x++) {
-            int w0 = edge(a, b, x, y);   /* weight of c */
-            int w1 = edge(b, c, x, y);   /* weight of a */
-            int w2 = edge(c, a, x, y);   /* weight of b */
+            int w0 = edge_centre(a, b, x, y);   /* weight of c */
+            int w1 = edge_centre(b, c, x, y);   /* weight of a */
+            int w2 = edge_centre(c, a, x, y);   /* weight of b */
             if (!((w0 >= 0 && w1 >= 0 && w2 >= 0) || (w0 <= 0 && w1 <= 0 && w2 <= 0)))
                 continue;
-            float la = ((float)w1 + h1) * inv, lb = ((float)w2 + h2) * inv, lc = ((float)w0 + h0) * inv;
+            float la = (float)w1 * inv, lb = (float)w2 * inv, lc = (float)w0 * inv;
             uint32_t col = c->rgba;
             if (st->gouraud) {
                 col = rgba((int)(R(a->rgba) * la + R(b->rgba) * lb + R(c->rgba) * lc + 0.5f),

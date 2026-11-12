@@ -1611,7 +1611,8 @@ static void vk_draw(int prim, const psp_vertex *v, int count, const psp_draw_sta
                      (st->atest ? 512u : 0u) |
                      ((uint32_t)(st->atest_func & 7) << 10) |
                      ((uint32_t)(st->atest_ref & 0xFF) << 16) |
-                     ((uint32_t)(st->atest_mask & 0xFF) << 24);
+                     ((uint32_t)(st->atest_mask & 0xFF) << 24) |
+                     (st->tex_filter ? 8192u : 0u);   /* F_BILINEAR */
 
     vk_push_constants pc = {
         .tex_w = st->tex_w,

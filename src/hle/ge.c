@@ -206,9 +206,9 @@ static int transform(const float p[3], float *sx, float *sy, float *sz) {
     for (int r = 0; r < 4; r++)
         c[r] = P[r] * v[0] + P[4 + r] * v[1] + P[8 + r] * v[2] + P[12 + r];
     if (trace_frame()) {
-        fprintf(trace_out(), "  xf: p=(%.2f,%.2f,%.2f) w=(%.2f,%.2f,%.2f) v=(%.2f,%.2f,%.2f) c=(%.2f,%.2f,%.2f,%.2f) yscale=%.2f ypos=%.2f offy=%.2f\n",
+        fprintf(trace_out(), "  xf: p=(%.2f,%.2f,%.2f) w=(%.2f,%.2f,%.2f) v=(%.2f,%.2f,%.2f) c=(%.2f,%.2f,%.2f,%.2f) xscale=%.2f xpos=%.2f offx=%.2f yscale=%.2f ypos=%.2f offy=%.2f\n",
                 p[0], p[1], p[2], w[0], w[1], w[2], v[0], v[1], v[2], c[0], c[1], c[2], c[3],
-                g_xf.yscale, g_xf.ypos, g_xf.offy);
+                g_xf.xscale, g_xf.xpos, g_xf.offx, g_xf.yscale, g_xf.ypos, g_xf.offy);
     }
     if (c[3] <= 0) return 0;
     *sx = c[0] / c[3] * g_xf.xscale + g_xf.xpos - g_xf.offx;
@@ -529,8 +529,11 @@ static int read_vertex(uint32_t addr, uint32_t vtype, int tex_off, int col_off,
     }
     float sx, sy, sz;
     if (!transform(pos, &sx, &sy, &sz)) { out->behind = 1; g_xf.behind++; return 1; }
-    out->x = (int)floorf(sx);
-    out->y = (int)floorf(sy);
+    /* Round, do not truncate: the GE rasterises float vertices against pixel
+     * centres, so 169.9992 (170 in the guest, minus float error) must land on
+     * pixel 170, not 169. */
+    out->x = (int)floorf(sx + 0.5f);
+    out->y = (int)floorf(sy + 0.5f);
     out->z = sz;
     return 1;
 }

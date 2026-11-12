@@ -664,6 +664,26 @@ static void test_samples_at_pixel_centres(void) {
     CHECK(bad == 0, "every row samples its own texel row: %d wrong, first in row %d", bad, first);
 }
 
+/* Coverage is decided at pixel centres, so a quad from 10 to 20 fills exactly
+ * pixels 10..19. Testing the integer corner instead added a column and a row
+ * on the far edge, and -- together with the vertex rounding in ge.c -- put the
+ * whole track one pixel up and left of where the GE draws it. */
+static void test_coverage_is_at_pixel_centres(void) {
+    psp_ge_reset();
+    clear_fb();
+    begin_list();
+    vertex(0, 10, 10, 0xFFFF0000u);
+    vertex(1, 20, 10, 0xFFFF0000u);
+    vertex(2, 10, 20, 0xFFFF0000u);
+    vertex(3, 20, 20, 0xFFFF0000u);
+    cmd(0x04, (4u << 16) | 4);                     /* tri_strip, 4 vertices */
+    end_list();
+    CHECK(pixel(10, 10) == 0xFFFF0000u, "first covered pixel drawn: 0x%08X", pixel(10, 10));
+    CHECK(pixel(19, 19) == 0xFFFF0000u, "last covered pixel drawn: 0x%08X", pixel(19, 19));
+    CHECK(pixel(20, 10) == 0, "far column is exclusive: 0x%08X", pixel(20, 10));
+    CHECK(pixel(10, 20) == 0, "far row is exclusive: 0x%08X", pixel(10, 20));
+}
+
 /* A PRIM leaves the vertex pointer after what it used, so a second PRIM with
  * no VADDR continues from there; with an index type, vertices come through
  * the index list instead and IADDR advances. */
@@ -755,6 +775,7 @@ int main(void) {
     test_dxt1();
     test_depth();
     test_samples_at_pixel_centres();
+    test_coverage_is_at_pixel_centres();
     test_vertex_flow();
     test_lighting();
     test_backend_selection();
@@ -776,6 +797,7 @@ int main(void) {
         test_dxt1();
         test_depth();
         test_samples_at_pixel_centres();
+        test_coverage_is_at_pixel_centres();
         test_vertex_flow();
         test_lighting();
         psp_render_current()->shutdown();

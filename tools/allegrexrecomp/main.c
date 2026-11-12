@@ -530,6 +530,7 @@ static int load_and_discover(const char *path, psp_blob *b, elf_info *e,
                                          seeds + nseeds, cap - nseeds);
     if (nptr > cap - nseeds) nptr = cap - nseeds;
     nseeds += nptr;
+    const int ptr_first = nseeds - nptr;
 
     /* A statically linked module (ET_EXEC) has empty relocation sections — its
      * addresses are absolute, so there is nothing for the loader to patch and
@@ -555,6 +556,23 @@ static int load_and_discover(const char *path, psp_blob *b, elf_info *e,
                 if (out_scanned) *out_scanned = 1;
             }
         }
+    }
+
+    /* Pointer seeds are a heuristic, and a pointer that lands on another
+     * instruction's delay slot is not a function entry: the hardware runs that
+     * word as part of the transfer before it and nothing can call it.
+     * Promoting it splits the transfer from its own delay slot, and the slot
+     * then runs after the call instead of before it.
+     *
+     * The filter is applied only to the pointer seeds. The entry point, the
+     * exports and the `jal` targets are facts, not guesses, and are left
+     * alone. */
+    {
+        int kept = 0;
+        for (int i = ptr_first; i < nseeds; i++)
+            if (!a_is_delay_slot(an, seeds[i])) seeds[ptr_first + kept++] = seeds[i];
+        nptr = kept;
+        nseeds = ptr_first + kept;
     }
 
     int rc = a_discover(an, seeds, nseeds);

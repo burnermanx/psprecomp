@@ -52,6 +52,13 @@ static uint32_t fetch(const a_analysis *an, uint32_t addr) {
            ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
 
+int a_is_delay_slot(const a_analysis *an, uint32_t addr) {
+    if (addr < an->base + 4 || !a_in_range(an, addr)) return 0;
+    a_insn prev;
+    a_decode(fetch(an, addr - 4), addr - 4, &prev);
+    return prev.has_delay_slot;
+}
+
 /* ---- the walk ------------------------------------------------------------ */
 
 typedef struct {
@@ -532,7 +539,12 @@ int a_discover(a_analysis *an, const uint32_t *seeds, int nseeds) {
      * by anything else -- not a relocation, not a jal target, not in any
      * data table. Any lui whose paired addiu/ori yields an address that is
      * in range and decodes as valid code is promoted to an entry, same
-     * over-split-is-safe reasoning as everywhere else in this file. */
+     * over-split-is-safe reasoning as everywhere else in this file.
+     *
+     * The one exception is a delay slot: it is not an entry, because the
+     * hardware runs it as part of the transfer before it and nothing can call
+     * it. A constant that happens to equal a slot address is a false positive
+     * with real consequences -- see a_is_delay_slot. */
     if (an->scan_calls) {
         uint32_t sbase = an->scan_size ? an->scan_base : an->base;
         uint32_t ssize = an->scan_size ? an->scan_size : an->size;
@@ -557,7 +569,7 @@ int a_discover(a_analysis *an, const uint32_t *seeds, int nseeds) {
                      * the image: lui+addiu builds far more data pointers than
                      * code pointers, and nearly any data word decodes. */
                     if (a_in_range(an, addr) && !is_import_stub(an, addr) &&
-                        addr - sbase < ssize) {
+                        addr - sbase < ssize && !a_is_delay_slot(an, addr)) {
                         a_insn probe;
                         if (a_decode(fetch(an, addr), addr, &probe) && probe.op != A_INVALID) {
                             uint32_t ti = word_index(an, addr);

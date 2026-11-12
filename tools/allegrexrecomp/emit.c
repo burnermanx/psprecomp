@@ -26,6 +26,9 @@ typedef struct {
     uint8_t *is_slot;      /* per word: consumed as a delay slot */
     uint32_t *entries;     /* interior labels that got a dispatch thunk */
     int nentries, centries;
+    /* Transfers that could not be emitted faithfully. Generation fails rather
+     * than writing code that silently does the wrong thing. */
+    int errors;
 } ectx;
 
 static void entry_push(ectx *c, uint32_t a) {
@@ -970,7 +973,18 @@ static void emit_function(ectx *c, const a_func *fn) {
              * may write that register -- `jalr $t5` / `addiu $t5,$t5,8` calls
              * the OLD $t5. Capture it first, as a branch captures `_c`. */
             if (in.is_indirect) fprintf(f, "    { uint32_t _t = %s;\n", RN[in.rs]);
-            if (have_slot) { comment(c, &slot); emit_simple(c, &slot, "    "); }
+            if (!have_slot && !taken_slot) {
+                /* The slot belongs to another body and cannot be copied --
+                 * which means it is itself a transfer, something the ISA does
+                 * not allow. There is no faithful way to emit this call, and
+                 * dropping the slot is exactly the defect this guard exists to
+                 * prevent. Say so instead of generating wrong code. */
+                fprintf(stderr,
+                        "error: 0x%08X: `jal` delay slot at 0x%08X belongs to "
+                        "another function and cannot be re-emitted\n", a, a + 4);
+                c->errors++;
+            }
+            if (have_slot || taken_slot) { comment(c, &slot); emit_simple(c, &slot, "    "); }
             /* Set $ra.
              *
              * Recompiled calls are C calls and `jr $ra` is emitted as `return`,
@@ -999,7 +1013,21 @@ static void emit_function(ectx *c, const a_func *fn) {
             fprintf(f, "    PSP_CALL_END(0x%08Xu);\n", link ? a + 8 : 0u);
             if (in.is_indirect) fprintf(f, "    }\n");
             if (have_slot && c->is_label[widx(an, a + 4)]) emit_slot_alias(c, a, &slot, 1);
-            if (have_slot) a += 4;               /* see the branch case above */
+            /* A call always runs its delay slot, and always runs it BEFORE the
+             * call. When the slot belongs to this body it was emitted inline
+             * above. When it belongs to another body there was no copy to fold
+             * in, so it is emitted above too -- and either way the walk has to
+             * step over it, or the next statement emitted would be the slot
+             * again, after the call.
+             *
+             * Measured on DJMAX Portable 3: 0x1BFFC is `jal 0x63088` whose slot
+             * at 0x1C000 sets $a2, the comparison length. The slot was promoted
+             * to a function entry by a constant that happened to equal its
+             * address, so the call ran with $a2 still 0, `strncasecmp(..., 0)`
+             * returned "equal" for every section header, and the track script
+             * parser took the wrong branch and failed. The whole gameplay
+             * overlay -- track, notes, HUD -- was never created. */
+            if (have_slot || taken_slot) a += 4;  /* see the branch case above */
             continue;
         }
 
@@ -1351,6 +1379,7 @@ int a_emit(const a_analysis *an, const emit_opts *o) {
     c.is_slot  = (uint8_t *)calloc(an->nwords ? an->nwords : 1, 1);
     c.entries = NULL;
     c.nentries = c.centries = 0;
+    c.errors = 0;
     if (!c.is_label || !c.is_slot) goto fail;
 
 /* Commit the current output file, counting it, and bail out on an I/O error. */
@@ -1403,6 +1432,9 @@ int a_emit(const a_analysis *an, const emit_opts *o) {
             c.func = &an->funcs[i];
             emit_function(&c, &an->funcs[i]);
         }
+        /* A body that could not be emitted faithfully fails the whole run:
+         * writing the rest of the corpus would only bury the error. */
+        if (c.errors) goto fail;
         COMMIT();
     }
 
@@ -1485,6 +1517,7 @@ int a_emit_one(const a_analysis *an, uint32_t addr, FILE *out) {
     c.is_slot  = (uint8_t *)calloc(an->nwords ? an->nwords : 1, 1);
     c.entries = NULL;
     c.nentries = c.centries = 0;
+    c.errors = 0;
     if (!c.is_label || !c.is_slot) {
         free(c.is_label); free(c.is_slot);
         return -1;

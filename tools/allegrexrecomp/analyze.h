@@ -154,6 +154,21 @@ void a_analysis_free(a_analysis *an);
 /* Is `addr` inside the discovered code extent? */
 int a_in_range(const a_analysis *an, uint32_t addr);
 
+/* Is `addr` the delay slot of the instruction before it?
+ *
+ * A delay slot is never a function entry: the hardware runs it as part of the
+ * transfer before it, and nothing can call it. The heuristics that promote
+ * addresses to entries -- immediate-constructed pointers, data pointers -- have
+ * no way to know that, and promoting a slot splits a transfer from its own
+ * delay slot. The emitter then has a `jal` whose slot belongs to another body,
+ * and the slot ends up running after the call instead of before it.
+ *
+ * Measured on DJMAX Portable 3: `lui+addiu` at 0x15EC8 builds the constant
+ * 0x1C000, which happens to be the delay slot of the `jal 0x63088` at 0x1BFFC.
+ * Promoting it dropped the `ori $a2,$zero,0xA` that sets the comparison length,
+ * so every section header compared equal and the track script parser failed. */
+int a_is_delay_slot(const a_analysis *an, uint32_t addr);
+
 #ifdef __cplusplus
 }
 #endif

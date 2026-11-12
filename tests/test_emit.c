@@ -152,6 +152,10 @@ static const uint32_t SLOT_NOT_OWNED_BRANCH[] = {
  *  0880400C  nop
  *  08804010  jr    $ra             the call target, a function of its own
  *  08804014  nop
+ *
+ * A call always runs its delay slot, and always runs it BEFORE the call. The
+ * slot was dropped here until the emitter learned to re-emit a foreign slot on
+ * the call path; the body then continued into it after the call returned.
  */
 static const uint32_t SLOT_NOT_OWNED_CALL[] = {
     0x0C201004u,   /* 08804000  jal   08804010                    */
@@ -320,32 +324,35 @@ static void check_slot_of_another_body(void) {
     }
 
     /* Case two: the same shape under a call, which is a separate line of the
-     * emitter and would otherwise drift. */
+     * emitter and would otherwise drift. The body resumes after the slot, as
+     * the hardware does, so the slot has to sit before the call. The owner of
+     * the slot is deliberately not a function of its own: that is what the
+     * analysis filter produces once it stops promoting delay slots. */
     {
-        uint32_t owners[6] = { BASE,
-                               BASE + 0x04u, BASE + 0x04u, BASE + 0x04u,
+        uint32_t owners[6] = { BASE, BASE + 0x04u, BASE, BASE,
                                BASE + 0x10u, BASE + 0x10u };
-        a_func funcs[3];
+        a_func funcs[2];
         memset(funcs, 0, sizeof funcs);
         funcs[0].addr = BASE;          funcs[0].start = BASE;
-        funcs[0].end  = BASE + 0x08u;  funcs[0].insns = 1;
-        funcs[1].addr = BASE + 0x04u;  funcs[1].start = BASE + 0x04u;
-        funcs[1].end  = BASE + 0x10u;  funcs[1].insns = 3;
-        funcs[2].addr = BASE + 0x10u;  funcs[2].start = BASE + 0x10u;
-        funcs[2].end  = BASE + 0x18u;  funcs[2].insns = 2;
-        funcs[2].has_return = 1;
+        funcs[0].end  = BASE + 0x10u;  funcs[0].insns = 3;
+        funcs[0].has_return = 1;
+        funcs[1].addr = BASE + 0x10u;  funcs[1].start = BASE + 0x10u;
+        funcs[1].end  = BASE + 0x18u;  funcs[1].insns = 2;
+        funcs[1].has_return = 1;
 
         a_analysis an;
-        hand_built(&an, owners, 6, funcs, 3, SLOT_NOT_OWNED_CALL);
+        hand_built(&an, owners, 6, funcs, 2, SLOT_NOT_OWNED_CALL);
         char *src = emit_case(&an, "t_slot_call");
         CHECK(src != NULL, "call case: generated .c is readable");
         if (src) {
-            expect_contains(src, "/* falls into 0x08804004, owned by another function */",
-                            "after the call, control continues at the delay slot");
-            expect_contains(src, "psp_func_08804004();",
-                            "and reaches it as a function");
             int n = count_of(src, "r_v0 = r_zero + 76;");
-            CHECK(n == 1, "the delay slot is still emitted exactly once, got %d", n);
+            CHECK(n == 1, "the delay slot is emitted exactly once, got %d", n);
+            const char *slot = strstr(src, "r_v0 = r_zero + 76;");
+            const char *call = strstr(src, "psp_dispatch(0x00804010u);");
+            CHECK(slot && call && slot < call,
+                  "and before the call, which is when the hardware runs it");
+            CHECK(strstr(src, "falls into 0x08804004") == NULL,
+                  "control no longer falls into the slot after the call");
             free(src);
         }
     }
@@ -890,6 +897,56 @@ static void check_jump_runs_foreign_slot(void) {
     }
 }
 
+/* A `lui`+`addiu` pair that builds the address of a delay slot.
+ *
+ *   08804000  lui   $v0,0x0880
+ *   08804004  addiu $v0,$v0,0x400C     -> 0x0880400C, the slot of the jal below
+ *   08804008  jal   08804020
+ *   0880400C  ori   $a2,$zero,10       <- the delay slot
+ *   08804010  jr    $ra
+ *   08804014  nop
+ *   08804020  jr    $ra
+ *   08804024  nop
+ *
+ * The constant is the false positive: it is in range and it decodes, so the
+ * immediate-constructed-pointer harvest promoted it to an entry and split the
+ * `jal` from its own delay slot. Measured on DJMAX Portable 3 at 0x15EC8 /
+ * 0x1C000, where the split cost the `ori` that sets a comparison length. */
+static const uint32_t SLOT_CONSTANT[] = {
+    0x3C020880u, 0x2442400Cu, 0x0C201008u, 0x3406000Au,
+    0x03E00008u, 0x00000000u, 0x03E00008u, 0x00000000u,
+};
+
+static void check_slot_is_not_an_entry(void) {
+    uint8_t code[sizeof SLOT_CONSTANT];
+    for (size_t i = 0; i < sizeof SLOT_CONSTANT / sizeof SLOT_CONSTANT[0]; i++) {
+        code[i * 4 + 0] = (uint8_t)(SLOT_CONSTANT[i]);
+        code[i * 4 + 1] = (uint8_t)(SLOT_CONSTANT[i] >> 8);
+        code[i * 4 + 2] = (uint8_t)(SLOT_CONSTANT[i] >> 16);
+        code[i * 4 + 3] = (uint8_t)(SLOT_CONSTANT[i] >> 24);
+    }
+
+    a_analysis an;
+    memset(&an, 0, sizeof an);
+    an.code = code;
+    an.base = BASE;
+    an.size = (uint32_t)sizeof code;
+    an.scan_calls = 1;
+    an.scan_base = BASE;
+    an.scan_size = (uint32_t)sizeof code;
+
+    CHECK(!a_is_delay_slot(&an, BASE), "the entry point is not a delay slot");
+    CHECK(a_is_delay_slot(&an, BASE + 0x0Cu), "0x0880400C is the jal's delay slot");
+
+    uint32_t seed = BASE;
+    CHECK(a_discover(&an, &seed, 1) == 0, "discovery runs");
+    int found_slot = 0;
+    for (int i = 0; i < an.nfuncs; i++)
+        if (an.funcs[i].addr == BASE + 0x0Cu) found_slot = 1;
+    CHECK(!found_slot, "a constant that equals a delay slot does not become an entry");
+    a_analysis_free(&an);
+}
+
 int main(void) {
     uint8_t code[sizeof CODE];
     for (size_t i = 0; i < sizeof CODE / sizeof CODE[0]; i++) {
@@ -1118,6 +1175,7 @@ int main(void) {
     check_jr_ra_continuation();
     check_link_branch_is_a_call();
     check_jump_runs_foreign_slot();
+    check_slot_is_not_an_entry();
 
     if (failures) {
         printf("\n%d check(s) failed\n", failures);

@@ -142,6 +142,9 @@ int      psp_display_capture(const char *path);
 /* The front buffer as 480x272 pixels of 0xAABBGGRR; -1 before the game has
  * set a framebuffer. */
 int      psp_display_read(uint32_t *out);
+/* Copy the last completed frame if it is newer than *seq. Returns 1 and
+ * updates *seq when a new frame was copied. */
+int      psp_display_snapshot(uint32_t *out, uint32_t *seq);
 uint64_t psp_display_vblanks(void);
 uint32_t psp_display_framebuffer(void);
 

@@ -122,7 +122,6 @@ static void hle_ModuleOk(void)             { psp_ret(SCE_KERNEL_ERROR_OK); }
 
 static uint32_t g_buttons;
 static uint8_t  g_analog_x = 128, g_analog_y = 128;
-static uint32_t g_ctrl_frame;
 
 void psp_ctrl_set(uint32_t buttons, uint8_t ax, uint8_t ay) {
     g_buttons = buttons;
@@ -190,7 +189,7 @@ static void hle_ReadBufferPositive(void) {
                 psp_read16(buf + 16), psp_read16(buf + 18));
     for (uint32_t i = 0; i < count; i++) {
         uint32_t at = buf + i * 16;
-        psp_write32(at, g_ctrl_frame++);
+        psp_write32(at, (uint32_t)psp_clock_us());   /* SceCtrlData timestamp is us */
         psp_write32(at + 4, btns);
         psp_write8(at + 8, g_analog_x);
         psp_write8(at + 9, g_analog_y);
@@ -355,7 +354,6 @@ void psp_misc_reset(void) {
     g_exit_requested = 0;
     g_buttons = 0;
     g_analog_x = g_analog_y = 128;
-    g_ctrl_frame = 0;
     memset(g_audio, 0, sizeof g_audio);
 #if PSPRECOMP_REAL_THREADS
     memset(g_audio_due_us, 0, sizeof g_audio_due_us);

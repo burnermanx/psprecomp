@@ -255,8 +255,10 @@ static int window_main(void *arg) {
     SDL_Window *win = SDL_CreateWindow(g_title, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
                                        W * g_scale, H * g_scale,
                                        SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
-    SDL_Renderer *ren = win ? SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED |
-                                                          SDL_RENDERER_PRESENTVSYNC) : NULL;
+    const char *vsync = getenv("EMOTIONALSENSE_VSYNC");
+    Uint32 rflags = SDL_RENDERER_ACCELERATED;
+    if (!(vsync && vsync[0] == '0')) rflags |= SDL_RENDERER_PRESENTVSYNC;
+    SDL_Renderer *ren = win ? SDL_CreateRenderer(win, -1, rflags) : NULL;
     if (win && !ren) ren = SDL_CreateRenderer(win, -1, SDL_RENDERER_SOFTWARE);
     SDL_Texture *tex = ren ? SDL_CreateTexture(ren, SDL_PIXELFORMAT_ABGR8888,
                                                SDL_TEXTUREACCESS_STREAMING, W, H) : NULL;
@@ -270,11 +272,17 @@ static int window_main(void *arg) {
     atomic_store(&g_ready, 1);
 
     SDL_GameController *gc = NULL;
+    uint32_t snap_seq = 0;
+    int dirty = 1;                              /* first frame and every resize */
     while (!atomic_load(&g_closed)) {
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
             switch (ev.type) {
             case SDL_QUIT: atomic_store(&g_closed, 1); break;
+            case SDL_WINDOWEVENT:
+                if (ev.window.event == SDL_WINDOWEVENT_SIZE_CHANGED ||
+                    ev.window.event == SDL_WINDOWEVENT_EXPOSED) dirty = 1;
+                break;
             case SDL_CONTROLLERDEVICEADDED:
                 if (!gc) gc = SDL_GameControllerOpen(ev.cdevice.which);
                 break;
@@ -296,13 +304,17 @@ static int window_main(void *arg) {
         if (SDL_GetWindowFlags(win) & SDL_WINDOW_INPUT_FOCUS) b |= keyboard();
         psp_ctrl_set(b, ax, ay);
 
-        SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
-        SDL_RenderClear(ren);
-        if (psp_display_read(g_px) == 0) {     /* 0xAABBGGRR == SDL's ABGR8888 */
-            SDL_UpdateTexture(tex, NULL, g_px, W * 4);
+        /* Present only when the guest produced a frame (or the window changed),
+         * so the screen rate never paces the game. */
+        if (psp_display_snapshot(g_px, &snap_seq)) dirty = 1;
+        if (dirty) {
+            SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
+            SDL_RenderClear(ren);
+            SDL_UpdateTexture(tex, NULL, g_px, W * 4);   /* 0xAABBGGRR == ABGR8888 */
             SDL_RenderCopy(ren, tex, NULL, NULL);
+            SDL_RenderPresent(ren);
+            dirty = 0;
         }
-        SDL_RenderPresent(ren);                 /* vsync paces this; delay if it does not */
         SDL_Delay(1);
     }
     if (gc) SDL_GameControllerClose(gc);

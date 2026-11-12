@@ -12,6 +12,7 @@
 
 #include "psprecomp/hle.h"
 #include "psprecomp/render.h"
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <stdio.h>
 
@@ -33,6 +34,31 @@ static uint32_t g_fb_format;
 static uint32_t g_mode, g_mode_w, g_mode_h;
 static uint64_t g_vblank_count;
 
+/* A completed frame, copied at the flip point so the window never reads a
+ * buffer the guest is drawing into. Seqlock: odd means a copy is in progress. */
+static uint32_t g_snap[PSP_SCREEN_W * PSP_SCREEN_H];
+static _Atomic uint32_t g_snap_seq;
+
+static void snap_capture(void) {
+    uint32_t s = atomic_load_explicit(&g_snap_seq, memory_order_relaxed);
+    atomic_store_explicit(&g_snap_seq, s + 1, memory_order_relaxed);
+    atomic_thread_fence(memory_order_release);
+    psp_display_read(g_snap);
+    atomic_store_explicit(&g_snap_seq, s + 2, memory_order_release);
+}
+
+int psp_display_snapshot(uint32_t *out, uint32_t *seq) {
+    for (;;) {
+        uint32_t s1 = atomic_load_explicit(&g_snap_seq, memory_order_acquire);
+        if (s1 == *seq) return 0;
+        if (s1 & 1) return 0;          /* copy in progress; try next loop */
+        memcpy(out, g_snap, sizeof g_snap);
+        atomic_thread_fence(memory_order_acquire);
+        uint32_t s2 = atomic_load_explicit(&g_snap_seq, memory_order_acquire);
+        if (s1 == s2) { *seq = s1; return 1; }
+    }
+}
+
 void psp_display_reset(void) {
     g_fb_addr = 0;
     g_fb_width = 512;
@@ -41,6 +67,8 @@ void psp_display_reset(void) {
     g_mode_w = PSP_SCREEN_W;
     g_mode_h = PSP_SCREEN_H;
     g_vblank_count = 0;
+    atomic_store(&g_snap_seq, 0);
+    memset(g_snap, 0, sizeof g_snap);
 }
 
 void psp_display_init(void) { psp_display_reset(); }
@@ -147,11 +175,14 @@ static void hle_SetFrameBuf(void) {
         }
     }
     shot_if_wanted();
+    /* Finish the frame the guest just drew and snapshot it before the new
+     * buffer is published; the window reads the snapshot, not live VRAM. */
+    psp_render_current()->present();
+    if (g_fb_addr) snap_capture();
     g_fb_addr   = psp_arg(0);
     g_fb_width  = psp_arg(1);
     g_fb_format = psp_arg(2);
     if (!g_fb_width) g_fb_width = 512;
-    psp_render_current()->present();
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 

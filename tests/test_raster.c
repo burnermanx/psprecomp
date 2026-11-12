@@ -384,6 +384,42 @@ static void test_textured_sprite(void) {
     CHECK(pixel(0, 0) == 0xFF408020u, "modulate by half grey: 0x%08X (want 0xFF408020)", pixel(0, 0));
 }
 
+/* TEXFILTER: nearest picks one texel, bilinear averages the four around the
+ * sample point. A 2x2 texture of white/black columns sampled at fractional
+ * texel coordinates reads 255/0 with nearest and 191/64 with bilinear. */
+static void test_texfilter_bilinear(void) {
+    for (int y = 0; y < 2; y++)
+        for (int x = 0; x < 2; x++)
+            psp_write32(TEX + (uint32_t)(y * 2 + x) * 4, x ? 0xFF000000u : 0xFFFFFFFFu);
+
+    /* u spans 4 texels over 16 pixels, so pixel centres land on 0.25, 0.75,
+     * 1.25, ... -- between texel centres, where the two filters differ. */
+    psp_ge_reset();
+    clear_fb();
+    begin_tex_list(3, 1, 1, 0);
+    cmd(0xC6, 0);                                   /* TEXFILTER nearest */
+    tvertex(0, 10, 10, 0, 0, 0xFFFFFFFFu);
+    tvertex(1, 26, 12, 8, 2, 0xFFFFFFFFu);
+    cmd(0x04, (6u << 16) | 2);
+    end_list();
+    CHECK(pixel(10, 10) == 0xFFFFFFFFu, "nearest at u=0.25: 0x%08X", pixel(10, 10));
+    CHECK(pixel(12, 10) == 0xFF000000u, "nearest at u=1.25: 0x%08X", pixel(12, 10));
+
+    psp_ge_reset();
+    clear_fb();
+    begin_tex_list(3, 1, 1, 0);
+    cmd(0xC6, 1);                                   /* TEXFILTER bilinear */
+    tvertex(0, 10, 10, 0, 0, 0xFFFFFFFFu);
+    tvertex(1, 26, 12, 8, 2, 0xFFFFFFFFu);
+    cmd(0x04, (6u << 16) | 2);
+    end_list();
+    int a = (int)(pixel(10, 10) & 0xFF);
+    int b = (int)(pixel(12, 10) & 0xFF);
+    CHECK(a > 185 && a < 197, "bilinear at u=0.25 should be ~191: %d", a);
+    CHECK(b > 58 && b < 70, "bilinear at u=1.25 should be ~64: %d", b);
+    CHECK((pixel(10, 10) >> 24) == 0xFF, "bilinear keeps alpha: 0x%08X", pixel(10, 10));
+}
+
 /* Swizzle by moving blocks in storage order, independent of the renderer's
  * address arithmetic: 16-byte x 8-row blocks, row of blocks after row. */
 static void swizzle_copy(uint32_t dst, uint32_t src, uint32_t row_bytes, uint32_t rows) {
@@ -712,6 +748,7 @@ int main(void) {
     test_triangle_strip();
     test_framebuffer_is_vram_relative();
     test_textured_sprite();
+    test_texfilter_bilinear();
     test_clut4_swizzled();
     test_alpha_test_and_blend();
     test_clear_mode_and_scissor();
@@ -732,6 +769,7 @@ int main(void) {
         test_triangle_strip();
         test_framebuffer_is_vram_relative();
         test_textured_sprite();
+        test_texfilter_bilinear();
         test_clut4_swizzled();
         test_alpha_test_and_blend();
         test_clear_mode_and_scissor();

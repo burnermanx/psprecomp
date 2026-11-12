@@ -59,6 +59,7 @@ typedef struct {
     VkDeviceMemory    memory;
     VkImageView       view;
     VkDescriptorSet   desc_set;
+    VkDescriptorSet   desc_set_linear;
     int               layout_ready;
 } vk_tex_entry;
 
@@ -78,6 +79,7 @@ typedef struct {
     uint32_t          vert_count;
     uint64_t          pipe_key;
     int               tex_slot;
+    int               tex_filter;
     int               sc_x, sc_y, sc_w, sc_h;
     float             blend_const[4];
     vk_push_constants pc;
@@ -135,6 +137,7 @@ static uint32_t                g_tex_staging_off;
 
 /* Descriptors, shaders, and pipelines */
 static VkSampler               g_sampler;
+static VkSampler               g_sampler_linear;
 static VkDescriptorSetLayout   g_desc_layout;
 static VkDescriptorPool        g_desc_pool;
 static VkPipelineLayout        g_pipe_layout;
@@ -369,6 +372,39 @@ static uint64_t hash_texture_data(const psp_draw_state *st) {
     return hash_full(ptr, total_bytes);
 }
 
+/* Point both sampler variants at the entry's current view. Called whenever the
+ * image is (re)created, so a recycled slot never keeps a stale view. */
+static int tex_desc_write(vk_tex_entry *e) {
+    VkDescriptorSet *sets[2] = { &e->desc_set, &e->desc_set_linear };
+    VkSampler samplers[2] = { g_sampler, g_sampler_linear };
+    for (int i = 0; i < 2; i++) {
+        if (!*sets[i]) {
+            VkDescriptorSetAllocateInfo dsai = {
+                .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+                .descriptorPool = g_desc_pool,
+                .descriptorSetCount = 1,
+                .pSetLayouts = &g_desc_layout
+            };
+            if (vkAllocateDescriptorSets(g_dev, &dsai, sets[i]) != VK_SUCCESS) return -1;
+        }
+        VkDescriptorImageInfo dii = {
+            .sampler = samplers[i],
+            .imageView = e->view,
+            .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+        };
+        VkWriteDescriptorSet wds = {
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = *sets[i],
+            .dstBinding = 0,
+            .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            .pImageInfo = &dii
+        };
+        vkUpdateDescriptorSets(g_dev, 1, &wds, 0, NULL);
+    }
+    return 0;
+}
+
 static int alloc_tex_slot(int w, int h) {
     int best = -1;
     uint64_t oldest = UINT64_MAX;
@@ -404,29 +440,7 @@ static int alloc_tex_slot(int w, int h) {
                          VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
                          VK_IMAGE_ASPECT_COLOR_BIT, &e->image, &e->memory, &e->view) != 0)
             return -1;
-        if (!e->desc_set) {
-            VkDescriptorSetAllocateInfo dsai = {
-                .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-                .descriptorPool = g_desc_pool,
-                .descriptorSetCount = 1,
-                .pSetLayouts = &g_desc_layout
-            };
-            if (vkAllocateDescriptorSets(g_dev, &dsai, &e->desc_set) != VK_SUCCESS) return -1;
-        }
-        VkDescriptorImageInfo dii = {
-            .sampler = g_sampler,
-            .imageView = e->view,
-            .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
-        };
-        VkWriteDescriptorSet wds = {
-            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-            .dstSet = e->desc_set,
-            .dstBinding = 0,
-            .descriptorCount = 1,
-            .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-            .pImageInfo = &dii
-        };
-        vkUpdateDescriptorSets(g_dev, 1, &wds, 0, NULL);
+        if (tex_desc_write(e) != 0) return -1;
         e->used = 1;
         e->layout_ready = 0;
     }
@@ -440,27 +454,7 @@ static int queue_solid_texture(int slot, uint32_t color) {
                          VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
                          VK_IMAGE_ASPECT_COLOR_BIT, &e->image, &e->memory, &e->view) != 0)
             return -1;
-        VkDescriptorSetAllocateInfo dsai = {
-            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-            .descriptorPool = g_desc_pool,
-            .descriptorSetCount = 1,
-            .pSetLayouts = &g_desc_layout
-        };
-        if (vkAllocateDescriptorSets(g_dev, &dsai, &e->desc_set) != VK_SUCCESS) return -1;
-        VkDescriptorImageInfo dii = {
-            .sampler = g_sampler,
-            .imageView = e->view,
-            .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
-        };
-        VkWriteDescriptorSet wds = {
-            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-            .dstSet = e->desc_set,
-            .dstBinding = 0,
-            .descriptorCount = 1,
-            .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-            .pImageInfo = &dii
-        };
-        vkUpdateDescriptorSets(g_dev, 1, &wds, 0, NULL);
+        if (tex_desc_write(e) != 0) return -1;
         e->used = 1;
         e->tex_w = 1;
         e->tex_h = 1;
@@ -1045,6 +1039,12 @@ static int vk_init(int width, int height) {
         g_vk_failed = 1;
         return -1;
     }
+    sci.magFilter = VK_FILTER_LINEAR;
+    sci.minFilter = VK_FILTER_LINEAR;
+    if (vkCreateSampler(g_dev, &sci, NULL, &g_sampler_linear) != VK_SUCCESS) {
+        g_vk_failed = 1;
+        return -1;
+    }
 
     VkDescriptorSetLayoutBinding dslb = {
         .binding = 0,
@@ -1064,11 +1064,11 @@ static int vk_init(int width, int height) {
 
     VkDescriptorPoolSize dps = {
         .type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-        .descriptorCount = MAX_TEX_CACHE
+        .descriptorCount = MAX_TEX_CACHE * 2
     };
     VkDescriptorPoolCreateInfo dpci = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-        .maxSets = MAX_TEX_CACHE,
+        .maxSets = MAX_TEX_CACHE * 2,
         .poolSizeCount = 1,
         .pPoolSizes = &dps
     };
@@ -1322,7 +1322,7 @@ static void vk_flush(void) {
     int query_active = 0, query_used = 0;
 
     uint64_t last_pipe_key = UINT64_MAX;
-    int last_tex_slot = -1;
+    int last_tex = -1;
     int last_sc[4] = { -1, -1, -1, -1 };
 
     for (int i = 0; i < g_num_cmds; i++) {
@@ -1343,11 +1343,13 @@ static void vk_flush(void) {
             vkCmdBindPipeline(g_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
             last_pipe_key = dc->pipe_key;
         }
-        if (dc->tex_slot != last_tex_slot) {
+        const int want_tex = dc->tex_slot * 2 + (dc->tex_filter ? 1 : 0);
+        if (want_tex != last_tex) {
+            vk_tex_entry *te = &g_tex_cache[dc->tex_slot];
             vkCmdBindDescriptorSets(g_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
                                     g_pipe_layout, 0, 1,
-                                    &g_tex_cache[dc->tex_slot].desc_set, 0, NULL);
-            last_tex_slot = dc->tex_slot;
+                                    dc->tex_filter ? &te->desc_set_linear : &te->desc_set, 0, NULL);
+            last_tex = want_tex;
         }
         if (dc->sc_x != last_sc[0] || dc->sc_y != last_sc[1] ||
             dc->sc_w != last_sc[2] || dc->sc_h != last_sc[3]) {
@@ -1627,6 +1629,7 @@ static void vk_draw(int prim, const psp_vertex *v, int count, const psp_draw_sta
         if (prev->first_vert + prev->vert_count == first_vert &&
             prev->pipe_key == pipe_key &&
             prev->tex_slot == tex_slot &&
+            prev->tex_filter == st->tex_filter &&
             prev->sc_x == sc_x && prev->sc_y == sc_y &&
             prev->sc_w == sc_w && prev->sc_h == sc_h &&
             prev->count_pixels == count_pixels &&
@@ -1642,6 +1645,7 @@ static void vk_draw(int prim, const psp_vertex *v, int count, const psp_draw_sta
     dc->vert_count = vert_count;
     dc->pipe_key = pipe_key;
     dc->tex_slot = tex_slot;
+    dc->tex_filter = st->tex_filter;
     dc->sc_x = sc_x;
     dc->sc_y = sc_y;
     dc->sc_w = sc_w;

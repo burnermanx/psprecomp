@@ -102,8 +102,10 @@
 #define GE_CLOAD        0xC4
 #define GE_CMODE        0xC5
 #define GE_TWRAP        0xC7
-#define GE_TFLT         0xC8
+#define GE_TEXFILTER    0xC6
+#define GE_TEXLEVEL     0xC8
 #define GE_TFUNC        0xC9
+#define GE_TEXFLUSH     0xCB
 #define GE_TEC          0xCA
 #define GE_PSM          0xD2
 #define GE_CLEAR        0xD3
@@ -768,7 +770,12 @@ static void run_list(ge_queue *q) {
             g_ds.tex_clamp_u = arg & 1;
             g_ds.tex_clamp_v = (arg >> 8) & 1;
             break;
-        case GE_TFLT:
+        case GE_TEXFILTER: g_ds.tex_filter = arg & 1; break;
+        case GE_TEXLEVEL:
+            /* Mipmaps are not sampled; the base level is always used. */
+            break;
+        case GE_TEXFLUSH:
+            /* Flushes the GE's texture cache. Nothing is cached here. */
             break;
         case GE_TFUNC:
             g_ds.tex_func = (int)(arg & 7);

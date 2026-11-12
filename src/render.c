@@ -16,6 +16,7 @@
 #include "psprecomp/render.h"
 #include "psprecomp/mem.h"
 
+#include <math.h>
 #include <string.h>
 
 /* ---- shared target state ------------------------------------------------- */
@@ -187,6 +188,32 @@ uint32_t psp_tex_fetch(const psp_draw_state *st, int x, int y) {
     }
 }
 
+static int lerp8(int a, int b, float t) { return (int)((float)a + ((float)b - (float)a) * t + 0.5f); }
+
+/* TEXFILTER: nearest is floor() in texel units, bilinear averages the four
+ * texels around the sample point (texel centres at i+0.5). */
+static uint32_t tex_sample(const psp_draw_state *st, float u, float v) {
+    if (!st->tex_filter) {
+        int tx = (int)u, ty = (int)v;
+        if (u < 0 && (float)tx != u) tx--;  /* floor, for negative wraps */
+        if (v < 0 && (float)ty != v) ty--;
+        return psp_tex_fetch(st, tx, ty);
+    }
+    const float fu = u - 0.5f, fv = v - 0.5f;
+    const float fx0 = floorf(fu), fy0 = floorf(fv);
+    const float fx = fu - fx0, fy = fv - fy0;
+    const int x0 = (int)fx0, y0 = (int)fy0;
+    const uint32_t c00 = psp_tex_fetch(st, x0, y0);
+    const uint32_t c10 = psp_tex_fetch(st, x0 + 1, y0);
+    const uint32_t c01 = psp_tex_fetch(st, x0, y0 + 1);
+    const uint32_t c11 = psp_tex_fetch(st, x0 + 1, y0 + 1);
+    const int r = lerp8(lerp8(R(c00), R(c10), fx), lerp8(R(c01), R(c11), fx), fy);
+    const int g = lerp8(lerp8(G(c00), G(c10), fx), lerp8(G(c01), G(c11), fx), fy);
+    const int b = lerp8(lerp8(B(c00), B(c10), fx), lerp8(B(c01), B(c11), fx), fy);
+    const int a = lerp8(lerp8(A(c00), A(c10), fx), lerp8(A(c01), A(c11), fx), fy);
+    return (uint32_t)r | ((uint32_t)g << 8) | ((uint32_t)b << 16) | ((uint32_t)a << 24);
+}
+
 /* The texture function combines the texel `t` with the fragment colour `c`. */
 static uint32_t tex_combine(const psp_draw_state *st, uint32_t t, uint32_t c) {
     int r, g, b, a;
@@ -334,10 +361,7 @@ static void fragment(const psp_draw_state *st, int x, int y, uint32_t c, float u
         }
     } else {
         if (st->tex_enable) {
-            int tx = (int)u, ty = (int)v;
-            if (u < 0 && (float)tx != u) tx--;  /* floor, for negative wraps */
-            if (v < 0 && (float)ty != v) ty--;
-            c = tex_combine(st, psp_tex_fetch(st, tx, ty), c);
+            c = tex_combine(st, tex_sample(st, u, v), c);
         }
         if (st->atest && !alpha_pass(st, c)) return;
         if (st->ztest && have_z) {

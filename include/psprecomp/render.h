@@ -62,6 +62,7 @@ typedef struct {
     int      tex_fmt;        /* TPSM */
     int      tex_swizzle;    /* TMODE bit 0 */
     int      tex_clamp_u, tex_clamp_v;   /* TWRAP */
+    int      tex_filter;     /* TEXFILTER bit 0: 0 nearest, 1 bilinear */
     int      tex_func;       /* TFUNC bits 0-2 */
     int      tex_alpha;      /* TFUNC bit 8: texture alpha is used */
     int      tex_double;     /* TFUNC bit 16: colour doubling */

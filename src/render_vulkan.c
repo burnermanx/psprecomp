@@ -166,6 +166,12 @@ static int                     g_batch_has_z;
 static uint32_t                g_batch_zaddr;
 static int                     g_batch_zbw;
 
+/* Region touched by the current batch. A flush only uploads and writes back
+ * this much, so drawing into a target smaller than the screen cannot stomp
+ * the VRAM around it. */
+static int                     g_dirty_x0 = FB_W, g_dirty_y0 = FB_H;
+static int                     g_dirty_x1, g_dirty_y1;
+
 static void vk_flush(void);
 
 /* ---- Memory & Buffer helpers --------------------------------------------- */
@@ -1131,39 +1137,47 @@ static void vk_flush(void) {
         g_batch_zaddr = 0;
         g_batch_zbw = 0;
         g_batch_id++;
+        g_dirty_x0 = FB_W; g_dirty_y0 = FB_H;
+        g_dirty_x1 = 0;    g_dirty_y1 = 0;
         return;
     }
 
-    /* 1. Upload current guest VRAM framebuffer into staging */
+    /* 1. Upload the guest framebuffer region this batch touches */
+    int dx0 = g_dirty_x0, dy0 = g_dirty_y0, dx1 = g_dirty_x1, dy1 = g_dirty_y1;
+    if (dx0 < 0) dx0 = 0;
+    if (dy0 < 0) dy0 = 0;
+    if (dx1 > FB_W) dx1 = FB_W;
+    if (dy1 > FB_H) dy1 = FB_H;
+    if (dx0 >= dx1 || dy0 >= dy1) { dx0 = dy0 = dx1 = dy1 = 0; }
     if (g_fb_fmt == 3) {
-        for (int y = 0; y < FB_H; y++) {
-            uint32_t row_addr = g_fb_addr + (uint32_t)(y * (int)g_fb_stride) * 4u;
-            const void *src = psp_mem_ptr(row_addr, FB_W * 4u);
+        for (int y = dy0; y < dy1; y++) {
+            uint32_t row_addr = g_fb_addr + (uint32_t)(y * (int)g_fb_stride + dx0) * 4u;
+            const void *src = psp_mem_ptr(row_addr, (uint32_t)(dx1 - dx0) * 4u);
             if (src) {
-                memcpy(g_fb_staging_ptr + y * FB_W, src, FB_W * 4u);
+                memcpy(g_fb_staging_ptr + y * FB_W + dx0, src, (size_t)(dx1 - dx0) * 4u);
             } else {
-                for (int x = 0; x < FB_W; x++)
-                    g_fb_staging_ptr[y * FB_W + x] = psp_read32(row_addr + (uint32_t)x * 4u);
+                for (int x = dx0; x < dx1; x++)
+                    g_fb_staging_ptr[y * FB_W + x] = psp_read32(row_addr + (uint32_t)(x - dx0) * 4u);
             }
         }
     } else {
-        for (int y = 0; y < FB_H; y++) {
-            uint32_t row_addr = g_fb_addr + (uint32_t)(y * (int)g_fb_stride) * 2u;
-            for (int x = 0; x < FB_W; x++)
-                g_fb_staging_ptr[y * FB_W + x] = psp_color_expand(psp_read16(row_addr + (uint32_t)x * 2u), g_fb_fmt);
+        for (int y = dy0; y < dy1; y++) {
+            uint32_t row_addr = g_fb_addr + (uint32_t)(y * (int)g_fb_stride + dx0) * 2u;
+            for (int x = dx0; x < dx1; x++)
+                g_fb_staging_ptr[y * FB_W + x] = psp_color_expand(psp_read16(row_addr + (uint32_t)(x - dx0) * 2u), g_fb_fmt);
         }
     }
 
     /* 2. Upload current guest VRAM depth buffer if used */
     if (g_batch_has_z && g_batch_zaddr && g_batch_zbw > 0) {
-        for (int y = 0; y < FB_H; y++) {
-            uint32_t row_addr = g_batch_zaddr + (uint32_t)(y * g_batch_zbw) * 2u;
-            const void *src = psp_mem_ptr(row_addr, FB_W * 2u);
+        for (int y = dy0; y < dy1; y++) {
+            uint32_t row_addr = g_batch_zaddr + (uint32_t)(y * g_batch_zbw + dx0) * 2u;
+            const void *src = psp_mem_ptr(row_addr, (uint32_t)(dx1 - dx0) * 2u);
             if (src) {
-                memcpy(g_zb_staging_ptr + y * FB_W, src, FB_W * 2u);
+                memcpy(g_zb_staging_ptr + y * FB_W + dx0, src, (size_t)(dx1 - dx0) * 2u);
             } else {
-                for (int x = 0; x < FB_W; x++)
-                    g_zb_staging_ptr[y * FB_W + x] = psp_read16(row_addr + (uint32_t)x * 2u);
+                for (int x = dx0; x < dx1; x++)
+                    g_zb_staging_ptr[y * FB_W + x] = psp_read16(row_addr + (uint32_t)(x - dx0) * 2u);
             }
         }
     }
@@ -1422,36 +1436,36 @@ static void vk_flush(void) {
         }
     }
 
-    /* 5. Write staging back to guest VRAM */
+    /* 5. Write the touched region back to guest VRAM */
     if (g_fb_fmt == 3) {
-        for (int y = 0; y < FB_H; y++) {
-            uint32_t row_addr = g_fb_addr + (uint32_t)(y * (int)g_fb_stride) * 4u;
-            void *dst = psp_mem_ptr(row_addr, FB_W * 4u);
+        for (int y = dy0; y < dy1; y++) {
+            uint32_t row_addr = g_fb_addr + (uint32_t)(y * (int)g_fb_stride + dx0) * 4u;
+            void *dst = psp_mem_ptr(row_addr, (uint32_t)(dx1 - dx0) * 4u);
             if (dst) {
-                memcpy(dst, g_fb_staging_ptr + y * FB_W, FB_W * 4u);
+                memcpy(dst, g_fb_staging_ptr + y * FB_W + dx0, (size_t)(dx1 - dx0) * 4u);
             } else {
-                for (int x = 0; x < FB_W; x++)
-                    psp_write32(row_addr + (uint32_t)x * 4u, g_fb_staging_ptr[y * FB_W + x]);
+                for (int x = dx0; x < dx1; x++)
+                    psp_write32(row_addr + (uint32_t)(x - dx0) * 4u, g_fb_staging_ptr[y * FB_W + x]);
             }
         }
     } else {
-        for (int y = 0; y < FB_H; y++) {
-            uint32_t row_addr = g_fb_addr + (uint32_t)(y * (int)g_fb_stride) * 2u;
-            for (int x = 0; x < FB_W; x++)
-                psp_write16(row_addr + (uint32_t)x * 2u,
+        for (int y = dy0; y < dy1; y++) {
+            uint32_t row_addr = g_fb_addr + (uint32_t)(y * (int)g_fb_stride + dx0) * 2u;
+            for (int x = dx0; x < dx1; x++)
+                psp_write16(row_addr + (uint32_t)(x - dx0) * 2u,
                             (uint16_t)color_pack(g_fb_staging_ptr[y * FB_W + x], g_fb_fmt));
         }
     }
 
     if (g_batch_has_z && g_batch_zaddr && g_batch_zbw > 0) {
-        for (int y = 0; y < FB_H; y++) {
-            uint32_t row_addr = g_batch_zaddr + (uint32_t)(y * g_batch_zbw) * 2u;
-            void *dst = psp_mem_ptr(row_addr, FB_W * 2u);
+        for (int y = dy0; y < dy1; y++) {
+            uint32_t row_addr = g_batch_zaddr + (uint32_t)(y * g_batch_zbw + dx0) * 2u;
+            void *dst = psp_mem_ptr(row_addr, (uint32_t)(dx1 - dx0) * 2u);
             if (dst) {
-                memcpy(dst, g_zb_staging_ptr + y * FB_W, FB_W * 2u);
+                memcpy(dst, g_zb_staging_ptr + y * FB_W + dx0, (size_t)(dx1 - dx0) * 2u);
             } else {
-                for (int x = 0; x < FB_W; x++)
-                    psp_write16(row_addr + (uint32_t)x * 2u, g_zb_staging_ptr[y * FB_W + x]);
+                for (int x = dx0; x < dx1; x++)
+                    psp_write16(row_addr + (uint32_t)(x - dx0) * 2u, g_zb_staging_ptr[y * FB_W + x]);
             }
         }
     }
@@ -1464,6 +1478,8 @@ static void vk_flush(void) {
     g_batch_zaddr = 0;
     g_batch_zbw = 0;
     g_batch_id++;
+    g_dirty_x0 = FB_W; g_dirty_y0 = FB_H;
+    g_dirty_x1 = 0;    g_dirty_y1 = 0;
 }
 
 /* ---- Backend interface methods ------------------------------------------- */
@@ -1565,6 +1581,20 @@ static void vk_draw(int prim, const psp_vertex *v, int count, const psp_draw_sta
 
     uint32_t vert_count = g_vbo_count - first_vert;
     if (vert_count == 0) return;
+
+    /* Grow the dirty rect by the vertices actually emitted, clamped to the
+     * scissor. */
+    for (uint32_t i = first_vert; i < g_vbo_count; i++) {
+        int x = (int)g_vbo_ptr[i].x, y = (int)g_vbo_ptr[i].y;
+        if (x < sx0) x = sx0;
+        if (x > sx1) x = sx1;
+        if (y < sy0) y = sy0;
+        if (y > sy1) y = sy1;
+        if (x < g_dirty_x0) g_dirty_x0 = x;
+        if (y < g_dirty_y0) g_dirty_y0 = y;
+        if (x + 1 > g_dirty_x1) g_dirty_x1 = x + 1;
+        if (y + 1 > g_dirty_y1) g_dirty_y1 = y + 1;
+    }
 
     float blend_const[4];
     uint64_t pipe_key = make_pipe_key(st, blend_const);

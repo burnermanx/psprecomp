@@ -165,6 +165,32 @@ static void test_clipping(void) {
     CHECK(pixel(479, 271) == 0, "far corner untouched: 0x%08X", pixel(479, 271));
 }
 
+/* A target smaller than the screen must not be stomped by the flush: only the
+ * region actually drawn may change. This is what keeps off-screen render
+ * targets from corrupting the VRAM around them. */
+static void test_small_target_preserves_vram(void) {
+    const uint32_t TGT = FB + 0x40000u;
+    const uint32_t STRIDE = 64;
+    psp_ge_reset();
+    for (int i = 0; i < 400 * 64; i++) psp_write32(TGT + (uint32_t)i * 4, 0x11223344u);
+    begin_list();
+    cmd(0x9C, TGT & 0xFFFFFF);                     /* FBP */
+    cmd(0x9D, ((TGT >> 8) & 0xFF0000) | STRIDE);   /* FBW + address high byte */
+    vertex(0, 10, 10, 0xFFFFFFFFu);
+    vertex(1, 30, 30, 0xFFFFFFFFu);
+    cmd(0x04, (6u << 16) | 2);
+    end_list();
+
+    CHECK(psp_read32(TGT + (10u * STRIDE + 15u) * 4u) == 0xFFFFFFFFu,
+          "small target: drawn pixel");
+    CHECK(psp_read32(TGT + (40u * STRIDE + 15u) * 4u) == 0x11223344u,
+          "small target: row below the draw untouched");
+    CHECK(psp_read32(TGT + (10u * STRIDE + 50u) * 4u) == 0x11223344u,
+          "small target: column right of the draw untouched");
+    CHECK(psp_read32(TGT + (300u * STRIDE + 15u) * 4u) == 0x11223344u,
+          "small target: rows past the screen untouched");
+}
+
 /* Transformed geometry goes through world, view and projection, then the
  * viewport and offset the way sceGuViewport(2048, 2048, 480, 272) and
  * sceGuOffset(2048 - 240, 2048 - 136) set them up: clip-space (-1, 1) is the
@@ -681,6 +707,7 @@ int main(void) {
     test_triangle();
     test_winding();
     test_clipping();
+    test_small_target_preserves_vram();
     test_transformed_quad();
     test_triangle_strip();
     test_framebuffer_is_vram_relative();
@@ -700,6 +727,7 @@ int main(void) {
         test_triangle();
         test_winding();
         test_clipping();
+    test_small_target_preserves_vram();
         test_transformed_quad();
         test_triangle_strip();
         test_framebuffer_is_vram_relative();

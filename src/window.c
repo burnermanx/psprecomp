@@ -196,6 +196,22 @@ static int g_scale;
 static const char *g_title = "psprecomp";
 static uint32_t g_px[W * H];
 
+/* Host keyboard and gamepad are a convenience when someone is playing, and a
+ * source of non-determinism when a script is driving: a connected pad with a
+ * drifting stick (or a key held down) injects buttons the script never asked
+ * for, and the run walks through the menus on its own. Off by default when a
+ * script or the dummy video driver is in use; EMOTIONALSENSE_HOST_INPUT=0/1
+ * forces it either way. */
+static int host_input_enabled(void) {
+    static int on = -1;
+    if (on >= 0) return on;
+    const char *e = getenv("EMOTIONALSENSE_HOST_INPUT");
+    if (e && *e) { on = e[0] != '0'; return on; }
+    const char *drv = getenv("SDL_VIDEODRIVER");
+    on = !(getenv("EMOTIONALSENSE_SCRIPT") || (drv && strcmp(drv, "dummy") == 0));
+    return on;
+}
+
 static uint32_t keyboard(void) {
     static const struct { SDL_Scancode sc; uint32_t bit; } K[] = {
         { SDL_SCANCODE_UP, B_UP }, { SDL_SCANCODE_RIGHT, B_RIGHT },
@@ -285,7 +301,7 @@ static int window_main(void *arg) {
                     ev.window.event == SDL_WINDOWEVENT_EXPOSED) dirty = 1;
                 break;
             case SDL_CONTROLLERDEVICEADDED:
-                if (!gc) gc = SDL_GameControllerOpen(ev.cdevice.which);
+                if (!gc && host_input_enabled()) gc = SDL_GameControllerOpen(ev.cdevice.which);
                 break;
             case SDL_CONTROLLERDEVICEREMOVED:
                 if (gc && SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(gc)) == ev.cdevice.which) {
@@ -311,9 +327,22 @@ static int window_main(void *arg) {
             }
         }
         uint8_t ax = 128, ay = 128;
-        uint32_t b = pad(gc, &ax, &ay);
-        if (SDL_GetWindowFlags(win) & SDL_WINDOW_INPUT_FOCUS) b |= keyboard();
-        psp_ctrl_set(b, ax, ay);
+        uint32_t bp = 0, bk = 0;
+        if (host_input_enabled()) {
+            bp = pad(gc, &ax, &ay);
+            if (SDL_GetWindowFlags(win) & SDL_WINDOW_INPUT_FOCUS) bk = keyboard();
+        }
+        psp_ctrl_set(bp | bk, ax, ay);
+        static int in_trace = -1;
+        if (in_trace < 0) in_trace = getenv("EMOTIONALSENSE_TRACE_INPUT") != NULL;
+        if (in_trace) {
+            static uint32_t l_b; static uint8_t l_ax = 128, l_ay = 128;
+            if ((bp | bk) != l_b || ax != l_ax || ay != l_ay) {
+                fprintf(stderr, "input[%llu]: pad=%04X kbd=%04X ax=%u ay=%u\n",
+                        (unsigned long long)psp_display_vblanks(), bp, bk, ax, ay);
+                l_b = bp | bk; l_ax = ax; l_ay = ay;
+            }
+        }
 
         /* Present only when the guest produced a frame (or the window changed),
          * so the screen rate never paces the game. */

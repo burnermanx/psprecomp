@@ -168,6 +168,17 @@ static void hle_ReadBufferPositive(void) {
                 vb >= at && vb < at + len) btns |= (uint32_t)mask;
             q = strchr(q, ','); if (q) q++;
         }
+        static int in_trace = -1;
+        if (in_trace < 0) in_trace = getenv("EMOTIONALSENSE_TRACE_INPUT") != NULL;
+        if (in_trace) {
+            static uint32_t l_script;
+            uint32_t script_bits = btns & ~g_buttons;
+            if (script_bits != l_script) {
+                fprintf(stderr, "input[%llu]: script=%04X\n",
+                        (unsigned long long)vb, script_bits);
+                l_script = script_bits;
+            }
+        }
     }
     if (getenv("EMOTIONALSENSE_TEST_NAME")) {
         uint64_t vb = psp_display_vblanks();

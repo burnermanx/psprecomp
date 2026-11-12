@@ -189,6 +189,7 @@ static void xf_reset(void) {
 }
 
 static int trace_frame(void);
+static FILE *trace_out(void);
 
 /* Model space to screen pixels. Returns 0 for a point behind the eye.
  * ponytail: no near-plane clipping, so a primitive with any vertex behind the
@@ -203,7 +204,7 @@ static int transform(const float p[3], float *sx, float *sy, float *sz) {
     for (int r = 0; r < 4; r++)
         c[r] = P[r] * v[0] + P[4 + r] * v[1] + P[8 + r] * v[2] + P[12 + r];
     if (trace_frame()) {
-        fprintf(stderr, "  xf: p=(%.2f,%.2f,%.2f) w=(%.2f,%.2f,%.2f) v=(%.2f,%.2f,%.2f) c=(%.2f,%.2f,%.2f,%.2f) yscale=%.2f ypos=%.2f offy=%.2f\n",
+        fprintf(trace_out(), "  xf: p=(%.2f,%.2f,%.2f) w=(%.2f,%.2f,%.2f) v=(%.2f,%.2f,%.2f) c=(%.2f,%.2f,%.2f,%.2f) yscale=%.2f ypos=%.2f offy=%.2f\n",
                 p[0], p[1], p[2], w[0], w[1], w[2], v[0], v[1], v[2], c[0], c[1], c[2], c[3],
                 g_xf.yscale, g_xf.ypos, g_xf.offy);
     }
@@ -533,17 +534,35 @@ static int read_vertex(uint32_t addr, uint32_t vtype, int tex_off, int col_off,
 }
 
 
-/* PSPRECOMP_TRACE_GE=<frame> logs every primitive drawn during that vblank:
- * what it is, its vertex format, and the texture state it is drawn with. */
+/* PSPRECOMP_TRACE_GE=<frame> or <first>-<last> logs every primitive drawn
+ * during those vblanks: what it is, its vertex format, and the texture state
+ * it is drawn with. PSPRECOMP_TRACE_GE_FILE sends the log to a file. */
+static FILE *trace_out(void) {
+    static FILE *fp;
+    static int tried;
+    if (!tried) {
+        tried = 1;
+        const char *p = getenv("PSPRECOMP_TRACE_GE_FILE");
+        if (p && *p) fp = fopen(p, "w");
+    }
+    return fp ? fp : stderr;
+}
+
 static int trace_frame(void) {
-    static long f = -2;
-    if (f == -2) { const char *e = getenv("PSPRECOMP_TRACE_GE"); f = e ? atol(e) : -1; }
-    return f >= 0 && (long)psp_display_vblanks() == f;
+    static long lo = -2, hi = -1;
+    if (lo == -2) {
+        const char *e = getenv("PSPRECOMP_TRACE_GE");
+        lo = e ? atol(e) : -1;
+        hi = lo;
+        if (e) { const char *d = strchr(e, '-'); if (d) hi = atol(d + 1); }
+    }
+    long v = (long)psp_display_vblanks();
+    return lo >= 0 && v >= lo && v <= hi;
 }
 
 static void draw_prim(uint32_t type, uint32_t count) {
     if (trace_frame())
-        fprintf(stderr, "GE prim %u x%u vtype %06X vaddr %08X tex %d fmt %d %dx%d bw %d at %08X sw %d func %d clut fmt %d blend %d atest %d clear %d z %d/%d/%d\n",
+        fprintf(trace_out(), "GE prim %u x%u vtype %06X vaddr %08X tex %d fmt %d %dx%d bw %d at %08X sw %d func %d clut fmt %d blend %d atest %d clear %d z %d/%d/%d\n",
                 type, count, g_ge.vtype, g_ge.vaddr, g_ds.tex_enable, g_ds.tex_fmt, g_ds.tex_w, g_ds.tex_h,
                 g_ds.tex_bw, g_ds.tex_addr, g_ds.tex_swizzle, g_ds.tex_func, g_ds.clut_fmt, g_ds.blend,
                 g_ds.atest, g_ds.clear, g_ds.ztest, g_ds.zfunc, g_ds.zwrite);
@@ -577,10 +596,10 @@ static void draw_prim(uint32_t type, uint32_t count) {
     else     g_ge.vaddr += count * (uint32_t)stride;
 
     if (trace_frame()) {
-        fprintf(stderr, "  mat %08X cbp %08X lt %d tex0 %08X\n", g_material, g_cbp, g_lt.enable,
+        fprintf(trace_out(), "  mat %08X cbp %08X lt %d tex0 %08X\n", g_material, g_cbp, g_lt.enable,
                 psp_read32(g_ds.tex_addr));
         for (uint32_t k = 0; k < n && k < 16; k++)
-            fprintf(stderr, "  v%u (%d,%d,%.0f) rgba %08X uv %.1f %.1f texel %08X\n", k, v[k].x, v[k].y,
+            fprintf(trace_out(), "  v%u (%d,%d,%.0f) rgba %08X uv %.1f %.1f texel %08X\n", k, v[k].x, v[k].y,
                     (double)v[k].z, v[k].rgba, v[k].u, v[k].v, psp_tex_fetch(&g_ds, (int)v[k].u, (int)v[k].v));
     }
     if (n) psp_render_current()->draw((int)type, v, (int)n, &g_ds);
@@ -611,7 +630,7 @@ static void run_list(ge_queue *q) {
         uint32_t arg  = word & 0x00FFFFFF;
         q->list = (q->list + 4) & PSP_ADDR_MASK;
         g_ge.commands++;
-        if (trace_frame()) fprintf(stderr, "GE @%08X %02X %06X\n", q->list - 4, cmd, arg);
+        if (trace_frame()) fprintf(trace_out(), "GE @%08X %02X %06X\n", q->list - 4, cmd, arg);
 
         switch (cmd) {
         case GE_NOP:
@@ -836,7 +855,7 @@ static void enqueue(int head) {
     q->used  = 1;
     (void)head;
     if (trace_frame()) {
-        fprintf(stderr, "sceGeListEnQueue list=0x%08X stall=0x%08X id=0x%08X vb=%llu\n",
+        fprintf(trace_out(), "sceGeListEnQueue list=0x%08X stall=0x%08X id=0x%08X vb=%llu\n",
                 q->list, q->stall, q->id, (unsigned long long)psp_display_vblanks());
     }
 
@@ -855,7 +874,7 @@ static void hle_ListUpdateStallAddr(void) {
     uint32_t id = psp_arg(0);
     uint32_t stall = (psp_arg(1) & ~3u) & PSP_ADDR_MASK;
     if (trace_frame()) {
-        fprintf(stderr, "sceGeListUpdateStallAddr id=0x%08X stall=0x%08X vb=%llu\n",
+        fprintf(trace_out(), "sceGeListUpdateStallAddr id=0x%08X stall=0x%08X vb=%llu\n",
                 id, stall, (unsigned long long)psp_display_vblanks());
     }
     ge_queue *q = find_queue(id);

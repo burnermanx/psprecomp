@@ -106,6 +106,36 @@ static void hle_SetMode(void) {
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
+/* EMOTIONALSENSE_SHOT=<vb,vb,...> and EMOTIONALSENSE_SHOT_EVERY=N capture the
+ * presented frame at those vblanks into EMOTIONALSENSE_SHOT_DIR (default
+ * /tmp) as frame_<vb>.ppm. */
+static void shot_if_wanted(void) {
+    static int init;
+    static char spec[512];
+    static long every;
+    static char dir[512] = "/tmp";
+    if (!init) {
+        init = 1;
+        const char *s = getenv("EMOTIONALSENSE_SHOT");
+        if (s) snprintf(spec, sizeof spec, "%s", s);
+        const char *e = getenv("EMOTIONALSENSE_SHOT_EVERY");
+        if (e) every = atol(e);
+        const char *d = getenv("EMOTIONALSENSE_SHOT_DIR");
+        if (d && *d) snprintf(dir, sizeof dir, "%s", d);
+    }
+    int want = every > 0 && g_vblank_count % (uint64_t)every == 0;
+    if (!want && spec[0]) {
+        char buf[sizeof spec];
+        snprintf(buf, sizeof buf, "%s", spec);
+        for (char *p = strtok(buf, ","); p && !want; p = strtok(NULL, ","))
+            want = strtoul(p, NULL, 0) == g_vblank_count;
+    }
+    if (!want) return;
+    char path[600];
+    snprintf(path, sizeof path, "%s/frame_%llu.ppm", dir, (unsigned long long)g_vblank_count);
+    if (psp_display_capture(path) == 0) fprintf(stderr, "Saved screenshot %s\n", path);
+}
+
 static void hle_SetFrameBuf(void) {
     /* (topaddr, bufferwidth, pixelformat, sync) */
     if (getenv("EMOTIONALSENSE_DEBUG_FB")) {
@@ -115,16 +145,8 @@ static void hle_SetFrameBuf(void) {
                     last_fb, psp_arg(0), psp_arg(1), psp_arg(2), (unsigned long long)g_vblank_count);
             last_fb = psp_arg(0);
         }
-        if ((g_vblank_count >= 600 && g_vblank_count <= 1200 && (g_vblank_count % 50) == 0) ||
-            g_vblank_count == 301 || g_vblank_count == 302 || g_vblank_count == 335 ||
-            g_vblank_count == 350 || g_vblank_count == 550) {
-            char path[128];
-            snprintf(path, sizeof(path), "/tmp/frame_%llu.ppm", (unsigned long long)g_vblank_count);
-            if (psp_display_capture(path) == 0) {
-                fprintf(stderr, "Saved screenshot %s\n", path);
-            }
-        }
     }
+    shot_if_wanted();
     g_fb_addr   = psp_arg(0);
     g_fb_width  = psp_arg(1);
     g_fb_format = psp_arg(2);

@@ -138,9 +138,29 @@ static void hle_ReadBufferPositive(void) {
     if (!count) count = 1;
     uint32_t btns = g_buttons;
     /* EMOTIONALSENSE_SCRIPT="vblank:hexmask:frames,..." presses buttons at
-     * given vblanks, so a headless run can walk through menus. */
+     * given vblanks, so a headless run can walk through menus. A value
+     * starting with '@' names a file with one entry per line ('#' comments). */
+    static char script_buf[4096];
     static const char *script; static int script_init;
-    if (!script_init) { script_init = 1; script = getenv("EMOTIONALSENSE_SCRIPT"); }
+    if (!script_init) {
+        script_init = 1;
+        const char *s = getenv("EMOTIONALSENSE_SCRIPT");
+        if (s && *s == '@') {
+            FILE *f = fopen(s + 1, "r");
+            if (f) {
+                size_t n = fread(script_buf, 1, sizeof script_buf - 1, f);
+                fclose(f);
+                script_buf[n] = 0;
+                for (char *p = script_buf; *p; p++) {
+                    if (*p == '#') while (*p && *p != '\n') *p++ = ' ';
+                    if (*p == '\n') *p = ',';
+                }
+                script = script_buf;
+            }
+        } else {
+            script = s;
+        }
+    }
     if (script) {
         uint64_t vb = psp_display_vblanks();
         for (const char *q = script; q && *q; ) {

@@ -60,6 +60,7 @@ typedef struct {
     int      playing;
     int      ended;
     int      paused;
+    int      is_pcm;
 } sas_voice;
 
 static sas_voice g_voice[SAS_VOICES];
@@ -176,12 +177,24 @@ static void render(int32_t *mix_l, int32_t *mix_r, uint32_t samples) {
         if (!v->playing || v->paused || !v->vag_addr) continue;
 
         for (uint32_t i = 0; i < samples; i++) {
-            if (!v->decoded_valid || v->sample_idx >= 28) {
-                v->sample_idx = 0;
-                if (!decode_block(v)) { v->playing = 0; v->ended = 1; break; }
+            int32_t s;
+            if (v->is_pcm) {
+                if (v->pos + 2 > v->vag_size) {
+                    if (v->loop && v->vag_size >= 2) {
+                        v->pos = v->loop_pos;
+                    } else {
+                        v->playing = 0; v->ended = 1; break;
+                    }
+                }
+                s = (int32_t)(int16_t)psp_read16(v->vag_addr + v->pos);
+            } else {
+                if (!v->decoded_valid || v->sample_idx >= 28) {
+                    v->sample_idx = 0;
+                    if (!decode_block(v)) { v->playing = 0; v->ended = 1; break; }
+                }
+                s = v->decoded[v->sample_idx];
             }
 
-            int32_t s = v->decoded[v->sample_idx];
             int32_t env = step_envelope(v);
             /* Envelope is 30-bit; bring it down to a 12-bit multiplier before
              * applying, so the product stays inside 32 bits. */
@@ -195,10 +208,21 @@ static void render(int32_t *mix_l, int32_t *mix_r, uint32_t samples) {
             v->frac += v->pitch;
             while (v->frac >= 0x1000) {
                 v->frac -= 0x1000;
-                v->sample_idx++;
-                if (v->sample_idx >= 28) {
-                    v->sample_idx = 0;
-                    if (!decode_block(v)) { v->playing = 0; v->ended = 1; break; }
+                if (v->is_pcm) {
+                    v->pos += 2;
+                    if (v->pos + 2 > v->vag_size) {
+                        if (v->loop && v->vag_size >= 2) {
+                            v->pos = v->loop_pos;
+                        } else {
+                            v->playing = 0; v->ended = 1; break;
+                        }
+                    }
+                } else {
+                    v->sample_idx++;
+                    if (v->sample_idx >= 28) {
+                        v->sample_idx = 0;
+                        if (!decode_block(v)) { v->playing = 0; v->ended = 1; break; }
+                    }
                 }
             }
             if (!v->playing) break;
@@ -239,6 +263,25 @@ static void hle_SetVoice(void) {
     v->sample_idx = 0;
     v->hist1 = v->hist2 = 0;
     v->decoded_valid = 0;
+    v->is_pcm = 0;
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+static void hle_SetVoicePCM(void) {
+    SAS_LOG("sas: SetVoicePCM v%u pcm 0x%08X size 0x%X loop %u\n", psp_arg(1), psp_arg(2), psp_arg(3), psp_arg(4));
+    /* (sasCore, voice, pcmAddr, size, loopmode) */
+    sas_voice *v = voice_arg();
+    if (!v) { psp_ret(SCE_KERNEL_ERROR_ERROR); return; }
+    v->vag_addr = psp_arg(2);
+    v->vag_size = psp_arg(3);
+    v->loop     = (int)psp_arg(4);
+    v->pos = 0;
+    v->loop_pos = 0;
+    v->end_pending = 0;
+    v->sample_idx = 0;
+    v->hist1 = v->hist2 = 0;
+    v->decoded_valid = 0;
+    v->is_pcm = 1;
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
@@ -385,10 +428,28 @@ static void hle_CoreWithMix(void) {
 /* Reverb and noise: accepted and recorded so a game's setup sequence completes.
  * The dry mix is what carries the music and effects; reverb is a refinement. */
 static void hle_accept(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
+static void hle_GetOutputmode(void) { psp_ret(g_output_mode); }
+static void hle_SetOutputmode(void) { g_output_mode = psp_arg(1); psp_ret(SCE_KERNEL_ERROR_OK); }
+static void hle_SetGrain(void) {
+    uint32_t g = psp_arg(1);
+    if (g && g <= SAS_MAX_GRAIN) g_grain = g;
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+static void hle_GetGrain(void) { psp_ret(g_grain); }
+static void hle_GetAllEnvelopeHeights(void) {
+    uint32_t out = psp_arg(1);
+    if (out) {
+        for (int i = 0; i < SAS_VOICES; i++) {
+            psp_write32(out + (uint32_t)i * 4u, (uint32_t)(g_voice[i].env >> 16));
+        }
+    }
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
 
 void psp_sas_register(void) {
     psp_hle_register(0x42778A9F, "sceSasCore", "__sceSasInit",              hle_Init);
     psp_hle_register(0x99944089, "sceSasCore", "__sceSasSetVoice",          hle_SetVoice);
+    psp_hle_register(0xE1CD9561, "sceSasCore", "__sceSasSetVoicePCM",       hle_SetVoicePCM);
     psp_hle_register(0xAD84D37F, "sceSasCore", "__sceSasSetPitch",          hle_SetPitch);
     psp_hle_register(0x440CA7D8, "sceSasCore", "__sceSasSetVolume",         hle_SetVolume);
     psp_hle_register(0x019B25EB, "sceSasCore", "__sceSasSetADSR",           hle_SetADSR);
@@ -403,6 +464,11 @@ void psp_sas_register(void) {
     psp_hle_register(0x787D04D5, "sceSasCore", "__sceSasSetPause",          hle_SetPause);
     psp_hle_register(0x2C8E6AB3, "sceSasCore", "__sceSasGetPauseFlag",      hle_GetPauseFlag);
     psp_hle_register(0x74AE582A, "sceSasCore", "__sceSasGetEnvelopeHeight", hle_GetEnvelopeHeight);
+    psp_hle_register(0x07F58C24, "sceSasCore", "__sceSasGetAllEnvelopeHeights", hle_GetAllEnvelopeHeights);
+    psp_hle_register(0xE175EF66, "sceSasCore", "__sceSasGetOutputmode",     hle_GetOutputmode);
+    psp_hle_register(0xE855BF76, "sceSasCore", "__sceSasSetOutputmode",     hle_SetOutputmode);
+    psp_hle_register(0xBD11B7C2, "sceSasCore", "__sceSasGetGrain",          hle_GetGrain);
+    psp_hle_register(0xD1E0A01E, "sceSasCore", "__sceSasSetGrain",          hle_SetGrain);
     psp_hle_register(0xB7660A23, "sceSasCore", "__sceSasSetNoise",          hle_accept);
     psp_hle_register(0x33D4AB37, "sceSasCore", "__sceSasRevType",           hle_accept);
     psp_hle_register(0x267A6DD2, "sceSasCore", "__sceSasRevParam",          hle_accept);

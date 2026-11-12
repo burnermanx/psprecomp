@@ -24,7 +24,7 @@
 #define PSP_SMEM_LowAligned   3
 #define PSP_SMEM_HighAligned  4
 
-#define MAX_BLOCKS 512
+#define MAX_BLOCKS 65536
 #define UID_BASE   0x00010000u
 
 typedef struct {
@@ -36,17 +36,19 @@ typedef struct {
 } mem_block;
 
 static mem_block g_block[MAX_BLOCKS];
+static int       g_block_hi;
 static uint32_t  g_next_uid;
 static uint32_t  g_heap_lo, g_heap_hi;
 
 /* Default user heap. Modules load at 0x08800000 and are a few megabytes, so
  * starting above them keeps the allocator from handing out memory the module
  * itself occupies. A host that knows its real layout should narrow this. */
-#define DEFAULT_HEAP_LO 0x08C00000u
-#define DEFAULT_HEAP_HI (PSP_RAM_BASE + PSP_RAM_SIZE)
+#define DEFAULT_HEAP_LO 0x08000000u
+#define DEFAULT_HEAP_HI (PSP_RAM_BASE + 0x04000000u)
 
 void psp_sysmem_reset(void) {
     memset(g_block, 0, sizeof g_block);
+    g_block_hi = 0;
     g_next_uid = UID_BASE;
     g_heap_lo = DEFAULT_HEAP_LO;
     g_heap_hi = DEFAULT_HEAP_HI;
@@ -55,20 +57,24 @@ void psp_sysmem_reset(void) {
 void psp_sysmem_init(void) { psp_sysmem_reset(); }
 
 static mem_block *find_uid(uint32_t uid) {
-    for (int i = 0; i < MAX_BLOCKS; i++)
+    for (int i = 0; i < g_block_hi; i++)
         if (g_block[i].used && g_block[i].uid == uid) return &g_block[i];
     return NULL;
 }
 
 static mem_block *alloc_slot(void) {
-    for (int i = 0; i < MAX_BLOCKS; i++)
-        if (!g_block[i].used) return &g_block[i];
+    for (int i = 0; i < MAX_BLOCKS; i++) {
+        if (!g_block[i].used) {
+            if (i + 1 > g_block_hi) g_block_hi = i + 1;
+            return &g_block[i];
+        }
+    }
     return NULL;
 }
 
 /* Does [addr, addr+size) overlap anything already handed out? */
 static int overlaps(uint32_t addr, uint32_t size) {
-    for (int i = 0; i < MAX_BLOCKS; i++) {
+    for (int i = 0; i < g_block_hi; i++) {
         if (!g_block[i].used) continue;
         uint32_t b = g_block[i].addr, e = b + g_block[i].size;
         if (addr < e && b < addr + size) return 1;
@@ -76,22 +82,23 @@ static int overlaps(uint32_t addr, uint32_t size) {
     return 0;
 }
 
-/* First fit walking up from the bottom of the heap. Blocks are few (a few
- * hundred at most) so a linear probe per candidate is fine and keeps the
- * bookkeeping to one array. */
+/* First fit walking up from the bottom of the heap. Advancing `a` in place
+ * during the scan handles runs of ascending allocations in a single pass
+ * rather than re-scanning from 0 for every block in the way. */
 static uint32_t place_low(uint32_t size, uint32_t align) {
     uint32_t a = (g_heap_lo + align - 1) & ~(align - 1);
     while (a + size <= g_heap_hi) {
-        if (!overlaps(a, size)) return a;
-        /* Skip past whatever is in the way rather than stepping by `align`,
-         * which on a full heap would be O(heap/align) probes per allocation. */
-        uint32_t next = g_heap_hi;
-        for (int i = 0; i < MAX_BLOCKS; i++) {
+        int hit = 0;
+        for (int i = 0; i < g_block_hi; i++) {
             if (!g_block[i].used) continue;
             uint32_t b = g_block[i].addr, e = b + g_block[i].size;
-            if (a < e && b < a + size && e < next) next = e;
+            if (a < e && b < a + size) {
+                a = (e + align - 1) & ~(align - 1);
+                hit = 1;
+                if (a + size > g_heap_hi) return 0;
+            }
         }
-        a = (next + align - 1) & ~(align - 1);
+        if (!hit) return a;
     }
     return 0;
 }
@@ -101,31 +108,34 @@ static uint32_t place_high(uint32_t size, uint32_t align) {
     if (size > g_heap_hi - g_heap_lo) return 0;
     uint32_t a = (g_heap_hi - size) & ~(align - 1);
     while (a >= g_heap_lo) {
-        if (!overlaps(a, size)) return a;
-        uint32_t prev = g_heap_lo;
-        for (int i = 0; i < MAX_BLOCKS; i++) {
+        int hit = 0;
+        for (int i = 0; i < g_block_hi; i++) {
             if (!g_block[i].used) continue;
             uint32_t b = g_block[i].addr, e = b + g_block[i].size;
-            if (a < e && b < a + size && b > prev) prev = b;
+            if (a < e && b < a + size) {
+                if (b <= g_heap_lo || b < size) return 0;
+                a = (b - size) & ~(align - 1);
+                hit = 1;
+            }
         }
-        if (prev <= g_heap_lo || prev < size) return 0;
-        a = (prev - size) & ~(align - 1);
+        if (!hit) return a;
     }
     return 0;
 }
 
 uint32_t psp_sysmem_free(void) {
     uint32_t used = 0;
-    for (int i = 0; i < MAX_BLOCKS; i++)
+    for (int i = 0; i < g_block_hi; i++)
         if (g_block[i].used) used += g_block[i].size;
     return (g_heap_hi - g_heap_lo) - used;
 }
 
 uint32_t psp_sysmem_alloc(uint32_t size, int from_high) {
-    uint32_t rounded = (size + 0xFF) & ~0xFFu;
-    if (!rounded) rounded = 0x100;
+    uint32_t align = from_high ? 0x100u : 0x10u;
+    uint32_t rounded = (size + align - 1) & ~(align - 1);
+    if (!rounded) rounded = align;
 
-    uint32_t addr = from_high ? place_high(rounded, 0x100) : place_low(rounded, 0x100);
+    uint32_t addr = from_high ? place_high(rounded, align) : place_low(rounded, align);
     if (!addr) return 0;
 
     mem_block *b = alloc_slot();
@@ -133,15 +143,13 @@ uint32_t psp_sysmem_alloc(uint32_t size, int from_high) {
     b->uid = g_next_uid++;
     b->addr = addr;
     b->size = rounded;
-    fprintf(stderr, "AllocPartition -> uid 0x%X at 0x%08X size %u (ends 0x%08X)\n",
-            b->uid, b->addr, b->size, b->addr + b->size);
     b->used = 1;
     snprintf(b->name, sizeof b->name, "internal");
     return addr;
 }
 
 void psp_sysmem_release(uint32_t addr) {
-    for (int i = 0; i < MAX_BLOCKS; i++)
+    for (int i = 0; i < g_block_hi; i++)
         if (g_block[i].used && g_block[i].addr == addr) { g_block[i].used = 0; return; }
 }
 

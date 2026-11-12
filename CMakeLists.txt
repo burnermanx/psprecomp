@@ -38,6 +38,7 @@ add_library(psprecomp STATIC
     src/dispatch.c
     src/ctors.c
     src/render.c
+    src/render_vulkan.c
     src/vfpu.c
     src/traps.c
     src/window.c
@@ -52,6 +53,7 @@ add_library(psprecomp STATIC
     src/hle/sascore.c
     src/hle/iofilemgr.c
     src/hle/misc.c
+    src/hle/audio_hist.c
 )
 
 target_include_directories(psprecomp PUBLIC
@@ -71,6 +73,27 @@ target_compile_definitions(psprecomp PUBLIC
 if(WIN32)
     target_link_libraries(psprecomp PUBLIC xinput9_1_0)   # the window's controller input
 endif()
+
+# SDL2 window/input backend for non-Windows hosts. Opt-in so the core keeps
+# building with nothing installed.
+option(PSPRECOMP_SDL2 "Build the SDL2 window backend (Linux, macOS)" OFF)
+if(PSPRECOMP_SDL2 AND NOT WIN32)
+    find_package(SDL2 REQUIRED)
+    target_compile_definitions(psprecomp PUBLIC PSPRECOMP_SDL2=1)
+    if(TARGET SDL2::SDL2)
+        target_link_libraries(psprecomp PUBLIC SDL2::SDL2)
+    else()
+        target_include_directories(psprecomp PUBLIC ${SDL2_INCLUDE_DIRS})
+        target_link_libraries(psprecomp PUBLIC ${SDL2_LIBRARIES})
+    endif()
+endif()
+option(PSPRECOMP_VULKAN "Build the Vulkan render backend" OFF)
+if(PSPRECOMP_VULKAN)
+    find_library(VULKAN_LIBRARY NAMES vulkan vulkan-1 REQUIRED)
+    target_compile_definitions(psprecomp PUBLIC PSPRECOMP_VULKAN=1)
+    target_link_libraries(psprecomp PUBLIC ${VULKAN_LIBRARY})
+endif()
+
 if(PSPRECOMP_REAL_THREADS AND WIN32)
     target_link_libraries(psprecomp PUBLIC winmm)   # timeBeginPeriod
 endif()

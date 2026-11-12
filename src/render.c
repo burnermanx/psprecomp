@@ -26,6 +26,7 @@ static uint64_t g_pixels;
 static uint64_t g_bad_texels;
 
 uint64_t psp_render_pixels(void) { return g_pixels; }
+void     psp_render_add_pixels(uint64_t n) { g_pixels += n; }
 void     psp_render_reset_pixels(void) { g_pixels = 0; g_bad_texels = 0; }
 uint64_t psp_render_unsupported_texels(void) { return g_bad_texels; }
 
@@ -90,7 +91,7 @@ static const int TEX_BPP[11] = { 16, 16, 16, 32, 4, 8, 16, 32, 4, 8, 8 };
 static uint32_t tex_offset(const psp_draw_state *st, uint32_t xb, uint32_t y) {
     uint32_t rowb = (uint32_t)st->tex_bw * (uint32_t)TEX_BPP[st->tex_fmt] / 8;
     if (!st->tex_swizzle) return y * rowb + xb;
-    uint32_t blocks = rowb / 16;
+    uint32_t blocks = rowb >= 16 ? (rowb / 16) : 1;
     return ((y >> 3) * blocks + (xb >> 4)) * 128 + (y & 7) * 16 + (xb & 15);
 }
 
@@ -418,6 +419,10 @@ static void sw_sprite(const psp_vertex *a, const psp_vertex *b, const psp_draw_s
     if (x0 == x1 || y0 == y1) return;
     const float du = (b->u - a->u) / (float)(b->x - a->x);
     const float dv = (b->v - a->v) / (float)(b->y - a->y);
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 > 480) x1 = 480;
+    if (y1 > 272) y1 = 272;
     for (int y = y0; y < y1; y++)
         for (int x = x0; x < x1; x++)
             fragment(st, x, y, b->rgba, a->u + ((float)(x - a->x) + 0.5f) * du,
@@ -474,7 +479,10 @@ const psp_render_backend *psp_render_current(void) { return g_backend; }
 
 int psp_render_select(const char *name) {
     static const psp_render_backend *const all[] = {
-        &psp_render_software, &psp_render_null
+        &psp_render_software, &psp_render_null,
+#ifdef PSPRECOMP_VULKAN
+        &psp_render_vulkan,
+#endif
     };
     if (!name) return -1;
     for (size_t i = 0; i < sizeof all / sizeof all[0]; i++) {

@@ -163,6 +163,7 @@ void psp_io_init(void);
 void psp_io_register(void);
 void psp_io_reset(void);
 void psp_io_set_root(const char *root);
+const char *psp_io_root(void);
 uint64_t psp_io_bytes_read(void);
 
 void psp_misc_init(void);
@@ -171,6 +172,7 @@ void psp_misc_reset(void);
 int  psp_exit_requested(void);
 void psp_ctrl_set(uint32_t buttons, uint8_t ax, uint8_t ay);
 uint64_t psp_audio_blocks(void);
+void psp_audio_output(int channel, int leftvol, int rightvol, const int16_t *buf, int samples);
 
 void psp_threadman_init(void);
 void psp_threadman_register(void);
@@ -194,6 +196,9 @@ void psp_threadman_yield(void);
  * that block on hardware for a known time, such as blocking audio output. */
 void psp_threadman_delay(uint64_t us);
 void psp_threadman_frame_wait(void);
+void psp_threadman_sleep_real(uint64_t us);   /* real host time, CPU handed over */
+void psp_threadman_set_fps_limit(int fps);
+int  psp_threadman_get_fps_limit(void);
 
 /* Interrupt masking is per thread, and the cookie is the previous state --
  * which is why resuming a nested suspend does not enable interrupts. */
@@ -207,6 +212,7 @@ int  psp_threadman_intr_disabled(void);
 uint64_t psp_threadman_switches(void);
 uint64_t psp_threadman_parks(void);
 uint64_t psp_threadman_vtime_us(void);
+uint32_t psp_threadman_current_uid(void);
 /* Parks after which another thread had run (so the CPU really was handed over),
  * and the ones that gave up before the thread they waited for was scheduled.
  * See the handover in src/hle/threadman.c. */
@@ -224,6 +230,8 @@ void     psp_threadman_dump(FILE *out);
 /* Whether an id names a callback the guest has actually created. A subsystem
  * that records a callback id (scePower's slots) has to ask first. */
 int psp_callback_valid(uint32_t uid);
+/* Queue a notification from another subsystem, like sceKernelNotifyCallback. */
+int psp_callback_notify(uint32_t uid, uint32_t arg);
 
 /* What delivery did, for a host's report: callbacks that ran, notifications
  * dropped because the target is not a recompiled function, and passes that hit

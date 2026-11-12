@@ -257,7 +257,103 @@ int psp_header_parse(const uint8_t *d, size_t len, psp_header *out) {
 
 /* ---- ELF / PRX ----------------------------------------------------------- */
 
+static int elf_parse_named(const uint8_t *d, size_t len, elf_info *out);
+
+/* Fallbacks for a module whose section *names* are gone.
+ *
+ * Retail builds of some titles (DJMAX Portable 3, ULKS46236, for one) keep all
+ * 55 section headers but zero the whole section-name string table, so the
+ * name-based scan in elf_parse_named() finds no `.text`, no `.sceStub.text*`
+ * and no `.rodata.sceModuleInfo`. Without the module info there is no import
+ * table, and without the stub range every firmware call is mistaken for an
+ * internal function. Each of the three can be recovered from something that
+ * does not depend on names:
+ *
+ *   module info  the first PT_LOAD's p_paddr holds its file offset -- the
+ *                same convention the runtime loader (src/module.c) relies on
+ *   stub range   the union of the thunk tables the import table points at
+ *   .text        the executable PROGBITS section at the bottom of segment 0
+ *                (the stub sections are separate, smaller AX sections above
+ *                it) */
+static void elf_unnamed_fallbacks(const uint8_t *d, size_t len, elf_info *out) {
+    if (!out->nsegments) return;
+    const elf_segment *s0 = &out->seg[0];
+
+    if (!out->modinfo_size) {
+        uint32_t phoff = rd32(d + 28);
+        uint16_t phentsize = rd16(d + 42), phnum = rd16(d + 44);
+        for (uint16_t i = 0; i < phnum; i++) {
+            size_t p = (size_t)phoff + (size_t)i * phentsize;
+            if (p + 32 > len) break;
+            if (rd32(d + p) != 1) continue;              /* first PT_LOAD */
+            uint32_t off = rd32(d + p + 12) & 0x7FFFFFFFu;
+            if (off >= s0->offset && (size_t)off + 0x34 <= len &&
+                off + 0x34 <= s0->offset + s0->filesz) {
+                out->modinfo_offset = off;
+                out->modinfo_addr   = off - s0->offset + s0->addr;
+                out->modinfo_size   = 0x34;
+            }
+            break;
+        }
+    }
+
+    if (!out->stub_size && out->modinfo_size) {
+        psp_module_info mi;
+        if (psp_modinfo_parse(d, len, out->modinfo_offset, &mi) == 0) {
+            uint32_t bias = s0->offset - s0->addr;
+            int n = psp_collect_imports(d, len, &mi, bias, NULL, 0);
+            psp_import_entry *imp = n > 0 ? (psp_import_entry *)malloc((size_t)n * sizeof *imp) : NULL;
+            if (imp) {
+                n = psp_collect_imports(d, len, &mi, bias, imp, n);
+                uint32_t lo = 0xFFFFFFFFu, hi = 0;
+                for (int i = 0; i < n; i++) {
+                    if (imp[i].addr < lo) lo = imp[i].addr;
+                    if (imp[i].addr + 8 > hi) hi = imp[i].addr + 8;
+                }
+                if (hi > lo && lo >= s0->addr && hi <= s0->addr + s0->filesz) {
+                    out->stub_addr   = lo;
+                    out->stub_offset = lo - s0->addr + s0->offset;
+                    out->stub_size   = hi - lo;
+                }
+                free(imp);
+            }
+        }
+    }
+
+    if (!out->text_from_section && out->shoff && out->shnum) {
+        uint32_t best_addr = 0xFFFFFFFFu, best_off = 0, best_size = 0;
+        for (uint32_t i = 0; i < out->shnum; i++) {
+            size_t sh = (size_t)out->shoff + (size_t)i * out->shentsize;
+            if (sh + 40 > len) break;
+            uint32_t type  = rd32(d + sh + 4);
+            uint32_t flags = rd32(d + sh + 8);
+            uint32_t addr  = rd32(d + sh + 12);
+            uint32_t off   = rd32(d + sh + 16);
+            uint32_t size  = rd32(d + sh + 20);
+            if (type != 1 || !(flags & 0x4) || !size) continue;   /* PROGBITS, SHF_EXECINSTR */
+            if ((size_t)off + size > len) continue;
+            if (out->stub_size && addr >= out->stub_addr &&
+                addr < out->stub_addr + out->stub_size) continue;
+            if (addr < best_addr || (addr == best_addr && size > best_size)) {
+                best_addr = addr; best_off = off; best_size = size;
+            }
+        }
+        if (best_size) {
+            out->text_addr = best_addr;
+            out->text_offset = best_off;
+            out->text_size = best_size;
+            out->text_from_section = 1;
+        }
+    }
+}
+
 int elf_parse(const uint8_t *d, size_t len, elf_info *out) {
+    int r = elf_parse_named(d, len, out);
+    if (r == 0) elf_unnamed_fallbacks(d, len, out);
+    return r;
+}
+
+static int elf_parse_named(const uint8_t *d, size_t len, elf_info *out) {
     if (len < 52 || memcmp(d, "\x7f" "ELF", 4) != 0) return -1;
     if (d[4] != 1 || d[5] != 1) return -1;   /* ELFCLASS32, ELFDATA2LSB */
 
@@ -577,6 +673,15 @@ int psp_collect_pointer_seeds(const uint8_t *d, size_t len, const elf_info *e,
              * the stored value is already the module-relative address and
              * needs no fixing up — only reading. */
             size_t at = (uint32_t)(r_offset + load_bias);
+            /* PSP relocations are segment-relative: bits 8..15 of r_info name
+             * the segment r_offset is in. On a module with a separate .data
+             * segment (DJMAX Portable 3) the function-pointer tables live
+             * there, and reading them at segment 0's bias finds nothing. */
+            {
+                uint32_t ofs_base = (r_info >> 8) & 0xFF;
+                if (ofs_base && ofs_base < (uint32_t)e->nsegments)
+                    at = (size_t)e->seg[ofs_base].offset + r_offset;
+            }
             if (at + 4 > len) continue;
 
             uint32_t target = rd32(d + at);

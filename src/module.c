@@ -48,6 +48,31 @@ int psp_module_load(const char *path, uint32_t span, psp_module *m) {
         return -1;
     }
 
+    /* Some modules (DJMAX Portable 3, for one) split code and data into two
+     * PT_LOADs: .text/.rodata in the first, .data/.bss in a second one linked
+     * above it. Place every further PT_LOAD inside the same span; the map is
+     * calloc'd, so .bss (memsz past filesz) is already zero. */
+    const uint16_t phentsize = (uint16_t)(b[42] | (b[43] << 8));
+    const uint16_t phnum     = (uint16_t)(b[44] | (b[45] << 8));
+    uint32_t mem_end = vaddr + rd32(ph + 20);
+    for (uint16_t i = 1; phentsize >= 32 && i < phnum; i++) {
+        const uint8_t *q = b + phoff + (size_t)i * phentsize;
+        if ((size_t)(q - b) + 32 > (size_t)n) break;
+        if (rd32(q) != 1) continue;                       /* PT_LOAD only */
+        const uint32_t qoff = rd32(q + 4), qaddr = rd32(q + 8);
+        const uint32_t qfile = rd32(q + 16), qmem = rd32(q + 20);
+        if (qaddr < vaddr || qaddr + qmem > vaddr + span ||
+            (size_t)qoff + qfile > (size_t)n ||
+            psp_mem_write_block(qaddr, b + qoff, qfile) != 0) {
+            free(b);
+            fprintf(stderr, "psprecomp: cannot place segment %u of %s at 0x%08X\n",
+                    (unsigned)i, path, qaddr);
+            return -1;
+        }
+        if (qaddr + qmem > mem_end) mem_end = qaddr + qmem;
+    }
+    m->mem_end = mem_end;
+
     m->base = vaddr;
     m->image_end = vaddr + filesz;
     m->entry = rd32(b + 24);
@@ -87,7 +112,17 @@ uint32_t psp_module_start(const psp_module *m) {
     psp_cpu.r[PSP_REG_A1] = 0;
     psp_cpu.r[26] = TCB_ADDR;                   /* $k0 */
     psp_write32(TCB_ADDR + 4, REENT_ADDR);
-    if (m->ctors) psp_ctors_run(m->ctors);
+    /* The constructor search is a heuristic over the end of the image. A
+     * plain-C module (DJMAX Portable 3: .ctors is just {-1, 0}) has no table,
+     * and the search then finds a run of pointers into .rodata instead. Only
+     * run a table whose every entry is recompiled code. */
+    int ctors_ok = m->ctors != 0;
+    for (int i = 0; ctors_ok && i < m->nctors; i++)
+        if (!psp_lookup(psp_read32(m->ctors + (uint32_t)i * 4))) ctors_ok = 0;
+    if (m->ctors && !ctors_ok)
+        fprintf(stderr, "psprecomp: ignoring constructor table candidate at 0x%08X "
+                        "(entries are not recompiled code)\n", m->ctors);
+    if (ctors_ok) psp_ctors_run(m->ctors);
     psp_call_from_host(m->entry);
     return psp_cpu.r[PSP_REG_V0];
 }

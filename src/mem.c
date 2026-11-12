@@ -4,6 +4,9 @@
 #include "psprecomp/dispatch.h"
 #include "psprecomp/cpu.h"
 
+#undef PSP_RAM_SIZE
+#define PSP_RAM_SIZE 0x04000000u /* 64 MB */
+
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -125,8 +128,8 @@ void *psp_mem_ptr(uint32_t addr, uint32_t size) {
         if (off + size > PSP_RAM_SIZE) return NULL;   /* straddles the end */
         return psp_mem.ram + off;
     }
-    if (a >= PSP_VRAM_BASE && a < PSP_VRAM_BASE + PSP_VRAM_SIZE) {
-        uint32_t off = a - PSP_VRAM_BASE;
+    if ((a >= PSP_VRAM_BASE && a < 0x05000000u) || ((a & 0x3F000000u) == PSP_VRAM_BASE)) {
+        uint32_t off = (a - PSP_VRAM_BASE) & (PSP_VRAM_SIZE - 1);
         if (off + size > PSP_VRAM_SIZE) return NULL;
         return psp_mem.vram + off;
     }

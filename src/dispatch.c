@@ -152,10 +152,15 @@ void psp_trace_dump(void) {
 
 static void default_miss(uint32_t addr) {
     fprintf(stderr,
-            "psprecomp: indirect call to 0x%08X, which is not a recompiled "
-            "function.\n"
+            "psprecomp: indirect call to 0x%08X (ra=0x%08X, sp=0x%08X, a0=0x%08X, a1=0x%08X, v0=0x%08X), "
+            "which is not a recompiled function.\n"
             "  Either discovery missed it, or it is data being called as code.\n",
-            addr);
+            addr, psp_cpu.r[PSP_REG_RA], psp_cpu.r[PSP_REG_SP],
+            psp_cpu.r[PSP_REG_A0], psp_cpu.r[PSP_REG_A1], psp_cpu.r[PSP_REG_V0]);
+    fprintf(stderr, "  guest call stack (frame->ret):\n");
+    int depth = 0;
+    for (const psp_frame *f = psp_cpu.frame; f && depth < 32; f = f->prev, depth++)
+        fprintf(stderr, "    [%2d] ret=0x%08X\n", depth, f->ret);
     psp_miss_context();
     abort();
 }

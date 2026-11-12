@@ -695,6 +695,27 @@ int main(void) {
     test_lighting();
     test_backend_selection();
 
+    if (psp_render_select("vulkan") == 0 && psp_render_current()->init(480, 272) == 0) {
+        test_sprite();
+        test_triangle();
+        test_winding();
+        test_clipping();
+        test_transformed_quad();
+        test_triangle_strip();
+        test_framebuffer_is_vram_relative();
+        test_textured_sprite();
+        test_clut4_swizzled();
+        test_alpha_test_and_blend();
+        test_clear_mode_and_scissor();
+        test_dxt1();
+        test_depth();
+        test_samples_at_pixel_centres();
+        test_vertex_flow();
+        test_lighting();
+        psp_render_current()->shutdown();
+        psp_render_select("software");
+    }
+
     psp_mem_free();
     printf(failures ? "raster: %d failure(s)\n" : "raster: all tests passed\n", failures);
     return failures ? 1 : 0;

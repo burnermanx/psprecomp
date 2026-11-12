@@ -102,6 +102,7 @@
 #define GE_CLOAD        0xC4
 #define GE_CMODE        0xC5
 #define GE_TWRAP        0xC7
+#define GE_TFLT         0xC8
 #define GE_TFUNC        0xC9
 #define GE_TEC          0xCA
 #define GE_PSM          0xD2
@@ -187,6 +188,8 @@ static void xf_reset(void) {
     g_xf.uscale = g_xf.vscale = 1;
 }
 
+static int trace_frame(void);
+
 /* Model space to screen pixels. Returns 0 for a point behind the eye.
  * ponytail: no near-plane clipping, so a primitive with any vertex behind the
  * eye is dropped whole; add clipping when 3D scenes lose triangles. */
@@ -199,6 +202,11 @@ static int transform(const float p[3], float *sx, float *sy, float *sz) {
         v[r] = V[r] * w[0] + V[3 + r] * w[1] + V[6 + r] * w[2] + V[9 + r];
     for (int r = 0; r < 4; r++)
         c[r] = P[r] * v[0] + P[4 + r] * v[1] + P[8 + r] * v[2] + P[12 + r];
+    if (trace_frame()) {
+        fprintf(stderr, "  xf: p=(%.2f,%.2f,%.2f) w=(%.2f,%.2f,%.2f) v=(%.2f,%.2f,%.2f) c=(%.2f,%.2f,%.2f,%.2f) yscale=%.2f ypos=%.2f offy=%.2f\n",
+                p[0], p[1], p[2], w[0], w[1], w[2], v[0], v[1], v[2], c[0], c[1], c[2], c[3],
+                g_xf.yscale, g_xf.ypos, g_xf.offy);
+    }
     if (c[3] <= 0) return 0;
     *sx = c[0] / c[3] * g_xf.xscale + g_xf.xpos - g_xf.offx;
     *sy = c[1] / c[3] * g_xf.yscale + g_xf.ypos - g_xf.offy;
@@ -596,12 +604,12 @@ static void run_list(ge_queue *q) {
     g_ge.lists++;
 
     while (budget--) {
-        if (q->stall && q->list == q->stall) break;   /* caught up to the CPU */
+        if (q->stall && ((q->list ^ q->stall) & PSP_ADDR_MASK) == 0) break;   /* caught up to the CPU */
 
         uint32_t word = psp_read32(q->list);
         uint32_t cmd  = word >> 24;
         uint32_t arg  = word & 0x00FFFFFF;
-        q->list += 4;
+        q->list = (q->list + 4) & PSP_ADDR_MASK;
         g_ge.commands++;
         if (trace_frame()) fprintf(stderr, "GE @%08X %02X %06X\n", q->list - 4, cmd, arg);
 
@@ -625,11 +633,11 @@ static void run_list(ge_queue *q) {
             break;
 
         case GE_JUMP:
-            q->list = (q->base | (arg & 0xFFFFFC));
+            q->list = (q->base | (arg & 0xFFFFFC)) & PSP_ADDR_MASK;
             break;
         case GE_CALL:
             if (sp < GE_STACK) stack[sp++] = q->list;
-            q->list = (q->base | (arg & 0xFFFFFC));
+            q->list = (q->base | (arg & 0xFFFFFC)) & PSP_ADDR_MASK;
             break;
         case GE_RET:
             if (sp > 0) q->list = stack[--sp];
@@ -644,6 +652,7 @@ static void run_list(ge_queue *q) {
         case GE_END:
         case GE_FINISH:
             if (cmd == GE_FINISH) g_ge.finishes++;
+            psp_render_current()->finish();
             /* A finished list gives its slot back. Keeping it used meant the
              * ninth enqueue failed, and WTF then dropped 3,870 of 3,885
              * frames while running at full speed. */
@@ -656,9 +665,9 @@ static void run_list(ge_queue *q) {
              * (no scheduler), so this is recorded and ignored. */
             break;
 
-        case GE_BASE:        q->base = (arg & 0xFF0000) << 8; break;
-        case GE_ORIGIN_ADDR: q->origin = q->list - 4; break;
-        case GE_OFFSET_ADDR: q->base = arg << 8; break;
+        case GE_BASE:        q->base = ((arg & 0xFF0000) << 8) & PSP_ADDR_MASK; break;
+        case GE_ORIGIN_ADDR: q->origin = (q->list - 4) & PSP_ADDR_MASK; break;
+        case GE_OFFSET_ADDR: q->base = (arg << 8) & PSP_ADDR_MASK; break;
 
         case GE_VTYPE: g_ge.vtype = arg; break;
         case GE_FBP:
@@ -740,6 +749,8 @@ static void run_list(ge_queue *q) {
             g_ds.tex_clamp_u = arg & 1;
             g_ds.tex_clamp_v = (arg >> 8) & 1;
             break;
+        case GE_TFLT:
+            break;
         case GE_TFUNC:
             g_ds.tex_func = (int)(arg & 7);
             g_ds.tex_alpha = (arg >> 8) & 1;
@@ -786,8 +797,8 @@ static void run_list(ge_queue *q) {
         case GE_SFIX:  g_ds.blend_sfix = arg; break;
         case GE_DFIX:  g_ds.blend_dfix = arg; break;
 
-        case GE_VADDR: g_ge.vaddr = (q->base | (arg & 0xFFFFFF)); break;
-        case GE_IADDR: g_ge.iaddr = (q->base | (arg & 0xFFFFFF)); break;
+        case GE_VADDR: g_ge.vaddr = (q->base | (arg & 0xFFFFFF)) & PSP_ADDR_MASK; break;
+        case GE_IADDR: g_ge.iaddr = (q->base | (arg & 0xFFFFFF)) & PSP_ADDR_MASK; break;
 
         default:
             if (light_cmd(cmd, arg)) break;
@@ -820,10 +831,14 @@ static void enqueue(int head) {
 
     memset(q, 0, sizeof *q);
     q->id    = g_next_id++;
-    q->list  = psp_arg(0) & ~3u;
-    q->stall = psp_arg(1) & ~3u;
+    q->list  = (psp_arg(0) & ~3u) & PSP_ADDR_MASK;
+    q->stall = (psp_arg(1) & ~3u) & PSP_ADDR_MASK;
     q->used  = 1;
     (void)head;
+    if (trace_frame()) {
+        fprintf(stderr, "sceGeListEnQueue list=0x%08X stall=0x%08X id=0x%08X vb=%llu\n",
+                q->list, q->stall, q->id, (unsigned long long)psp_display_vblanks());
+    }
 
     /* Hardware runs the list asynchronously. We run it here and finish before
      * returning, which is indistinguishable from the game's point of view
@@ -838,6 +853,11 @@ static void hle_ListEnQueueHead(void) { enqueue(1); }
 
 static void hle_ListUpdateStallAddr(void) {
     uint32_t id = psp_arg(0);
+    uint32_t stall = (psp_arg(1) & ~3u) & PSP_ADDR_MASK;
+    if (trace_frame()) {
+        fprintf(stderr, "sceGeListUpdateStallAddr id=0x%08X stall=0x%08X vb=%llu\n",
+                id, stall, (unsigned long long)psp_display_vblanks());
+    }
     ge_queue *q = find_queue(id);
     if (!q) {
         /* A list that already finished has released its slot; moving its
@@ -846,15 +866,15 @@ static void hle_ListUpdateStallAddr(void) {
                                                     : SCE_KERNEL_ERROR_UNKNOWN_UID);
         return;
     }
-    q->stall = psp_arg(1) & ~3u;
+    q->stall = stall;
     if (!q->done) run_list(q);          /* the new stall released more commands */
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
 /* Lists are complete by the time they are enqueued, so every sync succeeds
  * immediately. */
-static void hle_ListSync(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
-static void hle_DrawSync(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
+static void hle_ListSync(void) { psp_render_current()->finish(); psp_ret(SCE_KERNEL_ERROR_OK); }
+static void hle_DrawSync(void) { psp_render_current()->finish(); psp_ret(SCE_KERNEL_ERROR_OK); }
 
 static void hle_Break(void)    { psp_ret(SCE_KERNEL_ERROR_OK); }
 static void hle_Continue(void) { psp_ret(SCE_KERNEL_ERROR_OK); }

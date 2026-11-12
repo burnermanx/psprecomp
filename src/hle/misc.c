@@ -136,10 +136,42 @@ static void hle_CtrlSet(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
 static void hle_ReadBufferPositive(void) {
     uint32_t buf = psp_arg(0), count = psp_arg(1);
     if (!count) count = 1;
+    uint32_t btns = g_buttons;
+    /* EMOTIONALSENSE_SCRIPT="vblank:hexmask:frames,..." presses buttons at
+     * given vblanks, so a headless run can walk through menus. */
+    static const char *script; static int script_init;
+    if (!script_init) { script_init = 1; script = getenv("EMOTIONALSENSE_SCRIPT"); }
+    if (script) {
+        uint64_t vb = psp_display_vblanks();
+        for (const char *q = script; q && *q; ) {
+            unsigned long at = 0, mask = 0, len = 0;
+            if (sscanf(q, "%lu:%lx:%lu", &at, &mask, &len) == 3 &&
+                vb >= at && vb < at + len) btns |= (uint32_t)mask;
+            q = strchr(q, ','); if (q) q++;
+        }
+    }
+    if (getenv("EMOTIONALSENSE_TEST_NAME")) {
+        uint64_t vb = psp_display_vblanks();
+        if (vb >= 490 && vb < 495) btns |= 0x2000u; /* CIRCLE: letter A */
+        else if (vb >= 520 && vb < 525) btns |= 0x0040u; /* DOWN */
+        else if (vb >= 540 && vb < 545) btns |= 0x0040u; /* DOWN */
+        else if (vb >= 560 && vb < 565) btns |= 0x0040u; /* DOWN -> END */
+        else if (vb >= 580 && vb < 585) btns |= 0x2000u; /* CIRCLE: confirm END */
+        else if (vb >= 650 && vb < 655) btns |= 0x2000u; /* CIRCLE */
+        else if (vb >= 700 && vb < 705) btns |= 0x2000u; /* CIRCLE */
+        else if (vb >= 750 && vb < 755) btns |= 0x2000u; /* CIRCLE */
+        else if (vb >= 800 && vb < 805) btns |= 0x2000u; /* CIRCLE */
+    }
+    static int ctrl_trace = -1;
+    if (ctrl_trace < 0) ctrl_trace = getenv("EMOTIONALSENSE_TRACE_CTRL") != NULL;
+    if (ctrl_trace && (btns || psp_read16(buf + 16) != psp_read16(buf + 18)))
+        fprintf(stderr, "ctrl[%llu]: %04X last=%04X cur=%04X\n",
+                (unsigned long long)psp_display_vblanks(), btns,
+                psp_read16(buf + 16), psp_read16(buf + 18));
     for (uint32_t i = 0; i < count; i++) {
         uint32_t at = buf + i * 16;
         psp_write32(at, g_ctrl_frame++);
-        psp_write32(at + 4, g_buttons);
+        psp_write32(at + 4, btns);
         psp_write8(at + 8, g_analog_x);
         psp_write8(at + 9, g_analog_y);
         for (int k = 10; k < 16; k++) psp_write8(at + (uint32_t)k, 0);
@@ -181,13 +213,6 @@ static void hle_ChRelease(void) {
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
-/* Nothing consumes the samples; the block count is what tells you audio is
- * flowing. */
-static void hle_Output(void) {
-    g_audio_blocks++;
-    psp_ret(psp_arg(0) < AUDIO_CHANNELS ? g_audio[psp_arg(0)].samples : 0);
-}
-
 /* The blocking forms hold the caller while the hardware drains a buffer, and
  * that is what paces a game's audio thread. Returning at once lets a mixer
  * loop spin forever and starve every other guest thread.
@@ -208,26 +233,83 @@ static uint64_t host_now_us(void) {
     return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u;
 }
 static uint64_t g_audio_due_us[AUDIO_CHANNELS];
+
+static uint64_t audio_ahead_us(void) {
+    static uint64_t ahead_us;
+    if (!ahead_us) {
+        const char *e = getenv("EMOTIONALSENSE_AUDIO_AHEAD_MS");
+        ahead_us = (uint64_t)(e && atoi(e) > 0 ? atoi(e) : 150) * 1000u;
+    }
+    return ahead_us;
+}
 #endif
 
 static void hle_OutputBlocking(void) {
     uint32_t ch = psp_arg(0);
-    uint32_t samples = ch < AUDIO_CHANNELS ? g_audio[ch].samples : 0;
-    static int traced;
-    if (getenv("PSPRECOMP_TRACE_SAS") && traced++ < 4)
-        fprintf(stderr, "audio: OutputBlocking ch %u samples %u buf 0x%08X\n", ch, samples, psp_arg(2));
-    hle_Output();
+    int vol = (int)psp_arg(1);
+    uint32_t buf_addr = psp_arg(2);
+    uint32_t samples = (ch < AUDIO_CHANNELS && g_audio[ch].samples) ? g_audio[ch].samples : 256;
+    const int16_t *buf = (const int16_t *)psp_mem_ptr(buf_addr, samples * 4);
+    if (buf) {
+        psp_audio_output((int)ch, vol, vol, buf, (int)samples);
+    }
+    g_audio_blocks++;
     const uint64_t play_us = (uint64_t)samples * 1000000u / 44100u;
 #if PSPRECOMP_REAL_THREADS
     if (ch < AUDIO_CHANNELS) {
         uint64_t now = host_now_us();
-        if (g_audio_due_us[ch] < now) g_audio_due_us[ch] = now;   /* underrun */
+        if (g_audio_due_us[ch] < now) g_audio_due_us[ch] = now;
         g_audio_due_us[ch] += play_us;
-        while (host_now_us() + play_us < g_audio_due_us[ch]) psp_threadman_yield();
+        uint64_t ahead = audio_ahead_us();
+        uint64_t t = host_now_us();
+        if (t + ahead < g_audio_due_us[ch])
+            psp_threadman_sleep_real(g_audio_due_us[ch] - ahead - t);
     }
 #else
     psp_threadman_delay(play_us);
 #endif
+    psp_ret(samples);
+}
+
+static void hle_OutputPannedBlocking(void) {
+    uint32_t ch = psp_arg(0);
+    int leftvol = (int)psp_arg(1);
+    int rightvol = (int)psp_arg(2);
+    uint32_t buf_addr = psp_arg(3);
+    uint32_t samples = (ch < AUDIO_CHANNELS && g_audio[ch].samples) ? g_audio[ch].samples : 256;
+    const int16_t *buf = (const int16_t *)psp_mem_ptr(buf_addr, samples * 4);
+    if (buf) {
+        psp_audio_output((int)ch, leftvol, rightvol, buf, (int)samples);
+    }
+    g_audio_blocks++;
+    const uint64_t play_us = (uint64_t)samples * 1000000u / 44100u;
+#if PSPRECOMP_REAL_THREADS
+    if (ch < AUDIO_CHANNELS) {
+        uint64_t now = host_now_us();
+        if (g_audio_due_us[ch] < now) g_audio_due_us[ch] = now;
+        g_audio_due_us[ch] += play_us;
+        uint64_t ahead = audio_ahead_us();
+        uint64_t t = host_now_us();
+        if (t + ahead < g_audio_due_us[ch])
+            psp_threadman_sleep_real(g_audio_due_us[ch] - ahead - t);
+    }
+#else
+    psp_threadman_delay(play_us);
+#endif
+    psp_ret(samples);
+}
+
+static void hle_OutputPanned(void) {
+    uint32_t ch = psp_arg(0);
+    int leftvol = (int)psp_arg(1);
+    int rightvol = (int)psp_arg(2);
+    uint32_t buf_addr = psp_arg(3);
+    uint32_t samples = (ch < AUDIO_CHANNELS && g_audio[ch].samples) ? g_audio[ch].samples : 256;
+    const int16_t *buf = (const int16_t *)psp_mem_ptr(buf_addr, samples * 4);
+    if (buf) {
+        psp_audio_output((int)ch, leftvol, rightvol, buf, (int)samples);
+    }
+    g_audio_blocks++;
     psp_ret(samples);
 }
 
@@ -296,6 +378,7 @@ void psp_misc_register(void) {
     psp_hle_register(0x50F0C1EC, "ModuleMgrForUser", "sceKernelStartModule",          hle_ModuleOk);
     psp_hle_register(0xD1FF982A, "ModuleMgrForUser", "sceKernelStopModule",           hle_ModuleOk);
     psp_hle_register(0x2E0911AA, "ModuleMgrForUser", "sceKernelUnloadModule",         hle_ModuleOk);
+    psp_hle_register(0x8F2DF740, "ModuleMgrForUser", "sceKernelStopUnloadSelfModuleWithStatus", hle_ModuleOk);
 
     psp_hle_register(0x1F4011E6, "sceCtrl", "sceCtrlSetSamplingMode",     hle_CtrlSet);
     psp_hle_register(0x6A2774F3, "sceCtrl", "sceCtrlSetSamplingCycle",    hle_CtrlSet);
@@ -304,8 +387,8 @@ void psp_misc_register(void) {
     psp_hle_register(0x5EC81C55, "sceAudio", "sceAudioChReserve",            hle_ChReserve);
     psp_hle_register(0x6FC46853, "sceAudio", "sceAudioChRelease",            hle_ChRelease);
     psp_hle_register(0x136CAF51, "sceAudio", "sceAudioOutputBlocking",       hle_OutputBlocking);
-    psp_hle_register(0x13F592BC, "sceAudio", "sceAudioOutputPannedBlocking", hle_OutputBlocking);
-    psp_hle_register(0xE2D56B2D, "sceAudio", "sceAudioOutputPanned",         hle_Output);
+    psp_hle_register(0x13F592BC, "sceAudio", "sceAudioOutputPannedBlocking", hle_OutputPannedBlocking);
+    psp_hle_register(0xE2D56B2D, "sceAudio", "sceAudioOutputPanned",         hle_OutputPanned);
     psp_hle_register(0xB011922F, "sceAudio", "sceAudioGetChannelRestLength", hle_GetChannelRestLength);
     psp_hle_register(0xCB2E439E, "sceAudio", "sceAudioSetChannelDataLen",    hle_SetChannelDataLen);
     psp_hle_register(0x95FD0C2D, "sceAudio", "sceAudioChangeChannelConfig",  hle_ok);

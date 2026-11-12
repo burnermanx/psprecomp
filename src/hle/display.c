@@ -12,6 +12,8 @@
 
 #include "psprecomp/hle.h"
 #include "psprecomp/render.h"
+#include <stdlib.h>
+#include <stdio.h>
 
 #include <stdio.h>
 #include <string.h>
@@ -71,11 +73,24 @@ int psp_display_capture(const char *path) {
 int psp_display_read(uint32_t *out) {
     const uint32_t addr = g_fb_addr, stride = g_fb_width, fmt = g_fb_format;
     if (!addr) return -1;
-    const int bpp = (fmt == PSP_DISPLAY_PIXEL_FORMAT_8888) ? 4 : 2;
+    if (fmt == PSP_DISPLAY_PIXEL_FORMAT_8888) {
+        for (int y = 0; y < PSP_SCREEN_H; y++) {
+            uint32_t at = addr + (uint32_t)(y * (int)stride) * 4u;
+            const void *src = psp_mem_ptr(at, PSP_SCREEN_W * 4u);
+            if (src) {
+                memcpy(out + y * PSP_SCREEN_W, src, PSP_SCREEN_W * 4u);
+            } else {
+                for (int x = 0; x < PSP_SCREEN_W; x++)
+                    out[y * PSP_SCREEN_W + x] = psp_read32(at + (uint32_t)x * 4u);
+            }
+        }
+        return 0;
+    }
+    const int bpp = 2;
     for (int y = 0; y < PSP_SCREEN_H; y++) {
         for (int x = 0; x < PSP_SCREEN_W; x++) {
             uint32_t at = addr + (uint32_t)(y * (int)stride + x) * (uint32_t)bpp;
-            uint32_t px = (bpp == 4) ? psp_read32(at) : psp_read16(at);
+            uint32_t px = psp_read16(at);
             out[y * PSP_SCREEN_W + x] = psp_color_expand(px, (int)fmt);
         }
     }
@@ -93,10 +108,28 @@ static void hle_SetMode(void) {
 
 static void hle_SetFrameBuf(void) {
     /* (topaddr, bufferwidth, pixelformat, sync) */
+    if (getenv("EMOTIONALSENSE_DEBUG_FB")) {
+        static uint32_t last_fb;
+        if (psp_arg(0) != last_fb) {
+            fprintf(stderr, "SetFrameBuf changed: 0x%08X -> 0x%08X width=%u fmt=%u vb=%llu\n",
+                    last_fb, psp_arg(0), psp_arg(1), psp_arg(2), (unsigned long long)g_vblank_count);
+            last_fb = psp_arg(0);
+        }
+        if ((g_vblank_count >= 600 && g_vblank_count <= 1200 && (g_vblank_count % 50) == 0) ||
+            g_vblank_count == 301 || g_vblank_count == 302 || g_vblank_count == 335 ||
+            g_vblank_count == 350 || g_vblank_count == 550) {
+            char path[128];
+            snprintf(path, sizeof(path), "/tmp/frame_%llu.ppm", (unsigned long long)g_vblank_count);
+            if (psp_display_capture(path) == 0) {
+                fprintf(stderr, "Saved screenshot %s\n", path);
+            }
+        }
+    }
     g_fb_addr   = psp_arg(0);
     g_fb_width  = psp_arg(1);
     g_fb_format = psp_arg(2);
     if (!g_fb_width) g_fb_width = 512;
+    psp_render_current()->present();
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
@@ -108,6 +141,9 @@ static void hle_SetFrameBuf(void) {
  * threads that feed that loop run. */
 static void hle_WaitVblank(void) {
     g_vblank_count++;
+    if (getenv("EMOTIONALSENSE_DEBUG_FB") && (g_vblank_count % 100) == 0) {
+        fprintf(stderr, "vblank %llu\n", (unsigned long long)g_vblank_count);
+    }
     /* A frame boundary is the guest asking for time to pass, so it is the third
      * point where an interrupt is delivered (src/hle/intrman.c) -- and, on one
      * CPU, the most natural place to hand the CPU over. */

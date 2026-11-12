@@ -129,11 +129,22 @@ static uint64_t g_unimpl_total;
 static uint64_t g_unimpl_logged;
 
 void psp_hle_call(uint32_t nid) {
+    static int trace_uid = -2;
+    if (trace_uid == -2) {
+        const char *e = getenv("EMOTIONALSENSE_TRACE_HLE_THREAD");
+        trace_uid = e ? atoi(e) : -1;
+    }
     if (nid == 0x237DBD4Fu)
         fprintf(stderr, "psp_hle_call ENTERED for 0x237DBD4F (%d entries registered)\n", g_count);
     for (int i = 0; i < g_count; i++) {
         if (g_entry[i].nid == nid) {
             g_calls[i]++;
+            if (trace_uid >= 0 && (int)psp_threadman_current_uid() == trace_uid)
+                fprintf(stderr, "hle[%u@%llu]: %s(0x%08X,0x%08X,0x%08X,0x%08X) ra=0x%08X\n",
+                        psp_threadman_current_uid(), (unsigned long long)psp_display_vblanks(), g_entry[i].name,
+                        psp_cpu.r[PSP_REG_A0], psp_cpu.r[PSP_REG_A1],
+                        psp_cpu.r[PSP_REG_A2], psp_cpu.r[PSP_REG_A3],
+                        psp_cpu.r[PSP_REG_RA]);
             g_fn[i]();
             if (psp_cpu.r[PSP_REG_V0] == 0) note_zero(nid, g_entry[i].name);
             return;

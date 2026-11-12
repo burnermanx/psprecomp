@@ -119,9 +119,11 @@ const psp_render_backend *psp_render_current(void);
 /* Backends provided by the runtime. */
 extern const psp_render_backend psp_render_software;
 extern const psp_render_backend psp_render_null;
+extern const psp_render_backend psp_render_vulkan;
 
 /* Pixels written by the active backend -- the proof of life during bring-up. */
 uint64_t psp_render_pixels(void);
+void     psp_render_add_pixels(uint64_t n);
 void     psp_render_reset_pixels(void);
 
 /* One pixel in format 0-3 (565, 5551, 4444, 8888) as 0xAABBGGRR. The 16-bit

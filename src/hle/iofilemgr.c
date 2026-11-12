@@ -17,8 +17,12 @@
 
 #ifdef _WIN32
 #  include <io.h>
+#  include <direct.h>
+#  include <sys/stat.h>
 #else
 #  include <dirent.h>
+#  include <sys/stat.h>
+#  include <unistd.h>
 #endif
 
 #define MAX_FILES 64
@@ -47,6 +51,7 @@ typedef struct {
 } io_dir;
 
 static io_file g_file[MAX_FILES];
+static int64_t g_async_res[MAX_FILES];
 static io_dir  g_dir[MAX_DIRS];
 static char    g_root[512];
 static uint64_t g_bytes_read;
@@ -54,6 +59,8 @@ static uint64_t g_bytes_read;
 void psp_io_set_root(const char *root) {
     snprintf(g_root, sizeof g_root, "%s", root ? root : ".");
 }
+
+const char *psp_io_root(void) { return g_root; }
 
 void psp_io_reset(void) {
     for (int i = 0; i < MAX_FILES; i++) {
@@ -144,6 +151,7 @@ static void hle_Read(void) {
     io_file *h = fd_arg();
     uint32_t dst = psp_arg(1), size = psp_arg(2);
     if (!h) { psp_ret(0x80020323); return; }
+    if (!dst) { psp_ret(0x80020130); return; }
     if (!size) { psp_ret(0); return; }
 
     /* Read through a host buffer and then place it, so a read that straddles
@@ -217,6 +225,7 @@ static void hle_Dopen(void) {
     char guest[512], host[1024];
     psp_str(psp_arg(0), guest, sizeof guest);
     map_path(guest, host, sizeof host);
+    if (getenv("PSPRECOMP_TRACE_IO")) fprintf(stderr, "io: Dopen %s\n", guest);
 
     for (int i = 0; i < MAX_DIRS; i++) {
         if (g_dir[i].used) continue;
@@ -286,14 +295,172 @@ static void hle_Dclose(void) {
     psp_ret(0);
 }
 
+/* ---- async I/O and filesystem helpers ------------------------------------ */
+
+static void hle_OpenAsync(void) {
+    hle_Open();
+    int32_t fd = (int32_t)psp_cpu.r[PSP_REG_V0];
+    if (fd >= 3 && fd - 3 < MAX_FILES) {
+        g_async_res[fd - 3] = fd;
+        /* Return the file descriptor as an async handle */
+        psp_ret((uint32_t)fd);
+    }
+}
+
+static void hle_CloseAsync(void) {
+    int32_t idx = (int32_t)psp_arg(0) - 3;
+    hle_Close();
+    if (idx >= 0 && idx < MAX_FILES && psp_cpu.r[PSP_REG_V0] == 0) {
+        g_async_res[idx] = 0;
+        psp_ret(0);
+    }
+}
+
+static void hle_ReadAsync(void) {
+    int32_t idx = (int32_t)psp_arg(0) - 3;
+    hle_Read();
+    int32_t got = (int32_t)psp_cpu.r[PSP_REG_V0];
+    if (idx >= 0 && idx < MAX_FILES && got >= 0) {
+        g_async_res[idx] = got;
+        psp_ret(0);
+    }
+}
+
+static void hle_WriteAsync(void) {
+    int32_t idx = (int32_t)psp_arg(0) - 3;
+    hle_Write();
+    int32_t put = (int32_t)psp_cpu.r[PSP_REG_V0];
+    if (idx >= 0 && idx < MAX_FILES && put >= 0) {
+        g_async_res[idx] = put;
+        psp_ret(0);
+    }
+}
+
+static void hle_LseekAsync(void) {
+    int32_t idx = (int32_t)psp_arg(0) - 3;
+    hle_Lseek();
+    uint32_t lo = psp_cpu.r[PSP_REG_V0], hi = psp_cpu.r[PSP_REG_V1];
+    if (idx >= 0 && idx < MAX_FILES && lo != 0xFFFFFFFFu) {
+        g_async_res[idx] = (int64_t)((uint64_t)lo | ((uint64_t)hi << 32));
+        psp_ret(0);
+    }
+}
+
+static void hle_WaitAsync(void) {
+    int32_t idx = (int32_t)psp_arg(0) - 3;
+    uint32_t res_ptr = psp_arg(1);
+    if (idx < 0 || idx >= MAX_FILES) { psp_ret(0x80020323); return; }
+    uint64_t r = (uint64_t)g_async_res[idx];
+    if (res_ptr) {
+        psp_write32(res_ptr + 0, (uint32_t)r);
+        psp_write32(res_ptr + 4, (uint32_t)(r >> 32));
+    }
+    psp_ret(0);   /* 0 = operation completed */
+}
+
+static void hle_Getstat(void) {
+    char guest[512], host[1024];
+    psp_str(psp_arg(0), guest, sizeof guest);
+    uint32_t st_ptr = psp_arg(1);
+    map_path(guest, host, sizeof host);
+    struct stat st;
+    if (stat(host, &st) != 0) { psp_ret(0x80010002); return; }
+    if (st_ptr) {
+        for (uint32_t i = 0; i < 88; i += 4) psp_write32(st_ptr + i, 0);
+        int is_dir = S_ISDIR(st.st_mode);
+        psp_write32(st_ptr + 0, (is_dir ? 0x1000u : 0x2000u) | 0x01FFu);
+        psp_write32(st_ptr + 4, is_dir ? 0x10u : 0x20u);
+        uint64_t sz = is_dir ? 0 : (uint64_t)st.st_size;
+        psp_write32(st_ptr + 8,  (uint32_t)sz);
+        psp_write32(st_ptr + 12, (uint32_t)(sz >> 32));
+    }
+    psp_ret(0);
+}
+
+static void hle_Chstat(void) { psp_ret(0); }
+
+static void hle_Mkdir(void) {
+    char guest[512], host[1024];
+    psp_str(psp_arg(0), guest, sizeof guest);
+    map_path(guest, host, sizeof host);
+#ifdef _WIN32
+    _mkdir(host);
+#else
+    mkdir(host, 0755);
+#endif
+    psp_ret(0);
+}
+
+static void hle_Remove(void) {
+    char guest[512], host[1024];
+    psp_str(psp_arg(0), guest, sizeof guest);
+    map_path(guest, host, sizeof host);
+    psp_ret(remove(host) == 0 ? 0 : 0x80010002);
+}
+
+static void hle_Rmdir(void) {
+    char guest[512], host[1024];
+    psp_str(psp_arg(0), guest, sizeof guest);
+    map_path(guest, host, sizeof host);
+#ifdef _WIN32
+    psp_ret(_rmdir(host) == 0 ? 0 : 0x80010002);
+#else
+    psp_ret(rmdir(host) == 0 ? 0 : 0x80010002);
+#endif
+}
+
+static void hle_Devctl(void) {
+    /* (dev, cmd, indata, inlen, outdata, outlen) */
+    uint32_t cmd = psp_arg(1);
+    uint32_t indata = psp_arg(2);
+    uint32_t outdata = psp_arg(4);
+    /* 0x02425818: get free space on ms0: (writes SceDevInf via pointer at indata). */
+    if (cmd == 0x02425818u && indata) {
+        uint32_t buf = psp_read32(indata);
+        if (buf) {
+            psp_write32(buf + 0,  65536);  /* max clusters */
+            psp_write32(buf + 4,  32768);  /* free clusters (~1 GiB) */
+            psp_write32(buf + 8,  32768);  /* max sectors */
+            psp_write32(buf + 12, 512);    /* sector size */
+            psp_write32(buf + 16, 64);     /* sectors per cluster */
+        }
+    } else if (outdata) {
+        psp_write32(outdata, 1);
+    }
+    psp_ret(0);
+}
+
+static void hle_Ioctl(void) { psp_ret(0); }
+
+static void hle_Chdir(void) {
+    /* DJMAX uses Chdir to point to directory context; our map_path handles absolute paths */
+    psp_ret(0);
+}
+
 void psp_io_register(void) {
-    psp_hle_register(0x109F50BC, "IoFileMgrForUser", "sceIoOpen",   hle_Open);
-    psp_hle_register(0x810C4BC3, "IoFileMgrForUser", "sceIoClose",  hle_Close);
-    psp_hle_register(0x6A638D83, "IoFileMgrForUser", "sceIoRead",   hle_Read);
-    psp_hle_register(0x42EC03AC, "IoFileMgrForUser", "sceIoWrite",  hle_Write);
-    psp_hle_register(0x27EB27B8, "IoFileMgrForUser", "sceIoLseek",  hle_Lseek);
-    psp_hle_register(0x779103A0, "IoFileMgrForUser", "sceIoRename", hle_Rename);
-    psp_hle_register(0xB29DDF9C, "IoFileMgrForUser", "sceIoDopen",  hle_Dopen);
-    psp_hle_register(0xE3EB004C, "IoFileMgrForUser", "sceIoDread",  hle_Dread);
-    psp_hle_register(0xEB092469, "IoFileMgrForUser", "sceIoDclose", hle_Dclose);
+    psp_hle_register(0x109F50BC, "IoFileMgrForUser", "sceIoOpen",        hle_Open);
+    psp_hle_register(0x89AA9906, "IoFileMgrForUser", "sceIoOpenAsync",   hle_OpenAsync);
+    psp_hle_register(0x810C4BC3, "IoFileMgrForUser", "sceIoClose",       hle_Close);
+    psp_hle_register(0xFF5940B6, "IoFileMgrForUser", "sceIoCloseAsync",  hle_CloseAsync);
+    psp_hle_register(0x6A638D83, "IoFileMgrForUser", "sceIoRead",        hle_Read);
+    psp_hle_register(0xA0B5A7C2, "IoFileMgrForUser", "sceIoReadAsync",   hle_ReadAsync);
+    psp_hle_register(0x42EC03AC, "IoFileMgrForUser", "sceIoWrite",       hle_Write);
+    psp_hle_register(0x0FACAB19, "IoFileMgrForUser", "sceIoWriteAsync",  hle_WriteAsync);
+    psp_hle_register(0x27EB27B8, "IoFileMgrForUser", "sceIoLseek",       hle_Lseek);
+    psp_hle_register(0x71B19E77, "IoFileMgrForUser", "sceIoLseekAsync",  hle_LseekAsync);
+    psp_hle_register(0xE23EEC33, "IoFileMgrForUser", "sceIoWaitAsync",   hle_WaitAsync);
+    psp_hle_register(0x35DBD746, "IoFileMgrForUser", "sceIoWaitAsyncCB", hle_WaitAsync);
+    psp_hle_register(0x3251EA56, "IoFileMgrForUser", "sceIoPollAsync",   hle_WaitAsync);
+    psp_hle_register(0xACE946E8, "IoFileMgrForUser", "sceIoGetstat",     hle_Getstat);
+    psp_hle_register(0xB8A740F4, "IoFileMgrForUser", "sceIoChstat",      hle_Chstat);
+    psp_hle_register(0x06A70004, "IoFileMgrForUser", "sceIoMkdir",       hle_Mkdir);
+    psp_hle_register(0xF27A9C51, "IoFileMgrForUser", "sceIoRemove",      hle_Remove);
+    psp_hle_register(0x1117C65F, "IoFileMgrForUser", "sceIoRmdir",       hle_Rmdir);
+    psp_hle_register(0x55F4717D, "IoFileMgrForUser", "sceIoChdir",       hle_Chdir);
+    psp_hle_register(0x54F5FB11, "IoFileMgrForUser", "sceIoDevctl",      hle_Devctl);
+    psp_hle_register(0x63632449, "IoFileMgrForUser", "sceIoIoctl",       hle_Ioctl);
+    psp_hle_register(0x779103A0, "IoFileMgrForUser", "sceIoRename",      hle_Rename);
+    psp_hle_register(0xB29DDF9C, "IoFileMgrForUser", "sceIoDopen",       hle_Dopen);
+    psp_hle_register(0xE3EB004C, "IoFileMgrForUser", "sceIoDread",       hle_Dread);
+    psp_hle_register(0xEB092469, "IoFileMgrForUser", "sceIoDclose",      hle_Dclose);
 }

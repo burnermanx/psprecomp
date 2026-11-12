@@ -198,7 +198,7 @@ typedef struct {
  * them. The blocks are tracked because FreeVpl has to give the right one back
  * and ReferVplStatus has to report a free size that is true. */
 #define MAX_VPLS       64
-#define MAX_VPL_BLOCKS 512
+#define MAX_VPL_BLOCKS 65536
 
 typedef struct {
     uint32_t uid;
@@ -268,7 +268,53 @@ static uint64_t g_switches;         /* baton handovers */
 static uint64_t g_parks;
 static uint64_t g_wait_gaveup;      /* unbounded waits that ran out of ticks */
 static uint64_t g_vtime_us;         /* see the clock note above */
-static uint64_t g_epoch_us;         /* wall clock at reset, so time never stops */
+static uint64_t g_epoch_us;         /* boot epoch; a PSP clock is uptime, not wall time */
+
+static int      g_fps_limit = 0;    /* 0 = default (from env or 30/60) */
+static int      g_fps_init = 0;
+static uint64_t g_frame_target_us = 33333ull; /* default 30 FPS */
+static uint64_t g_next_frame_dl_us = 0;
+
+void psp_threadman_set_fps_limit(int fps) {
+    g_fps_init = 1;
+    g_fps_limit = fps;
+    if (fps <= 0) {
+        g_frame_target_us = 0; /* uncap */
+    } else {
+        g_frame_target_us = 1000000ull / (uint64_t)fps;
+    }
+}
+
+int psp_threadman_get_fps_limit(void) {
+    return g_fps_limit;
+}
+
+static void frame_pacing_init_if_needed(void) {
+    if (g_fps_init) return;
+    g_fps_init = 1;
+    const char *uncap = getenv("EMOTIONALSENSE_UNCAP");
+    if (uncap && (uncap[0] == '1' || uncap[0] == 'y' || uncap[0] == 'Y')) {
+        g_fps_limit = 0;
+        g_frame_target_us = 0;
+        return;
+    }
+    const char *env_fps = getenv("EMOTIONALSENSE_FPS");
+    if (env_fps && *env_fps) {
+        int v = atoi(env_fps);
+        if (v > 0) {
+            g_fps_limit = v;
+            g_frame_target_us = 1000000ull / (uint64_t)v;
+            return;
+        } else if (v == 0) {
+            g_fps_limit = 0;
+            g_frame_target_us = 0;
+            return;
+        }
+    }
+    /* Default to 30 FPS (original PSP experience) */
+    g_fps_limit = 30;
+    g_frame_target_us = 33333ull;
+}
 
 static uint64_t host_now_us(void) {
 #if PSPRECOMP_REAL_THREADS
@@ -369,12 +415,11 @@ static int handover_wait_locked(void) {
     return 0;
 }
 
-/* Give the CPU away and wait to be woken, or for `timeout_us` of *virtual*
- * time. A zero timeout waits for a wakeup only; every caller inside the guest
- * passes a tick, so no wait can be unbounded in practice.
+/* Give the CPU away and wait to be woken, or for `real_us` of host time
+ * while advancing virtual time by `timeout_us`.
  *
  * Returns 1 if a wakeup arrived, 0 if the timeout expired. */
-static int park_us(uint64_t timeout_us) {
+static int park_us_timed(uint64_t timeout_us, uint64_t real_us) {
     psp_thread *t = g_tls_me;
     int depth = g_tls_depth;
 
@@ -400,10 +445,9 @@ static int park_us(uint64_t timeout_us) {
 
     int woken = 0;
     if (t) {
-        uint64_t real = timeout_us < REAL_TICK_US ? timeout_us : REAL_TICK_US;
         host_mutex_lock(&t->wlock);
-        if (!t->woken) {
-            uint64_t dl = host_deadline_us() + real;
+        if (!t->woken && real_us > 0) {
+            uint64_t dl = host_deadline_us() + real_us;
             while (!t->woken) {
                 if (host_cond_until(&t->wcv, &t->wlock, dl))
                     break;
@@ -441,6 +485,11 @@ static int park_us(uint64_t timeout_us) {
     if (t) { t->parks++; psp_cpu = t->ctx; g_current = t; }
     TRACE_SCHED("park done: %s woken=%d\n", t ? t->name : "(none)", woken);
     return woken;
+}
+
+static int park_us(uint64_t timeout_us) {
+    uint64_t real = timeout_us < REAL_TICK_US ? timeout_us : REAL_TICK_US;
+    return park_us_timed(timeout_us, real);
 }
 
 #else
@@ -551,7 +600,10 @@ void psp_threadman_reset(void) {
     g_handovers = 0;
     g_handovers_expired = 0;
     g_vtime_us = 0;
-    g_epoch_us = host_now_us();
+    /* A PSP reports microseconds since boot, not wall clock. A wall-clock
+     * sized value overflows the int32 truncation in games that convert it to
+     * float seconds (DJMAX P3's scene fade-in then never fires). */
+    g_epoch_us = 0;
 
 #if PSPRECOMP_REAL_THREADS
     /* The caller is running the module entry: it holds the CPU from here. */
@@ -603,14 +655,61 @@ static void boot_record(void) {
  * "let the others run". */
 void psp_threadman_yield(void) { park_for(W_DELAY, TICK_US); }
 
+/* Wait `us` of *host* time with the CPU handed to the other guest threads.
+ * Unlike psp_threadman_delay (virtual time, at most REAL_TICK_US of real wait
+ * per tick) this really lasts `us`, which is what paces blocking audio. */
+void psp_threadman_sleep_real(uint64_t us) {
+    if (!us) return;
+#if PSPRECOMP_REAL_THREADS
+    check_terminated();
+    park_us_timed(us, us);
+    check_terminated();
+#else
+    psp_threadman_delay(us);
+#endif
+}
+
 void psp_threadman_frame_wait(void) {
     deliver_tick();
-    park_for(W_DELAY, FRAME_US);
+    frame_pacing_init_if_needed();
+
+    uint64_t wait_real_us = 0;
+    if (g_frame_target_us > 0) {
+        uint64_t now = host_now_us();
+        if (g_next_frame_dl_us == 0 || now > g_next_frame_dl_us + 100000ull) {
+            /* First frame or severe lag: start fresh deadline */
+            g_next_frame_dl_us = now + g_frame_target_us;
+        } else {
+            g_next_frame_dl_us += g_frame_target_us;
+        }
+
+        if (g_next_frame_dl_us > now) {
+            wait_real_us = g_next_frame_dl_us - now;
+        }
+    } else {
+        wait_real_us = REAL_TICK_US;
+    }
+
+    check_terminated();
+    psp_thread *t = g_tls_me;
+#if PSPRECOMP_REAL_THREADS
+    if (t) {
+        host_mutex_lock(&t->wlock);
+        t->wait_kind = W_DELAY;
+        host_mutex_unlock(&t->wlock);
+        t->last_wait_kind = (uint32_t)W_DELAY;
+    }
+    park_us_timed(FRAME_US, wait_real_us);
+#else
+    park_us(FRAME_US);
+#endif
+    check_terminated();
 }
 
 uint64_t psp_threadman_switches(void) { return g_switches; }
 uint64_t psp_threadman_parks(void)    { return g_parks; }
 uint64_t psp_threadman_vtime_us(void) { return g_vtime_us; }
+uint32_t psp_threadman_current_uid(void) { return g_tls_me ? g_tls_me->uid : 0; }
 /* Parks after which another thread had run -- either it took the CPU while this
  * one was parked, or the park waited for it before taking the CPU back -- and
  * the parks that gave up before the thread they waited for was scheduled. The
@@ -806,7 +905,8 @@ static void *guest_thread_main(void *arg) {
     host_cond_broadcast(&g_baton_cv);
     host_mutex_unlock(&g_baton_m);
     g_started++;
-    fprintf(stderr, "thread %u started : entry 0x%08X\n", t->uid, t->entry);
+    if (getenv("EMOTIONALSENSE_DEBUG_THREADS"))
+        fprintf(stderr, "thread %u started : entry 0x%08X\n", t->uid, t->entry);
 
     if (setjmp(t->unwind) == 0) {
         t->unwind_set = 1;
@@ -823,8 +923,9 @@ static void *guest_thread_main(void *arg) {
     /* Where it ended, not just that it did. A thread body that returns early
      * leaves the flag it was supposed to arm unset, and the address is what
      * says whether it finished or simply fell out somewhere. */
-    fprintf(stderr, "thread %u ended   : status 0x%08X, last fn 0x%08X\n",
-            t->uid, t->exit_status, psp_trace_last());
+    if (getenv("EMOTIONALSENSE_DEBUG_THREADS"))
+        fprintf(stderr, "thread %u ended   : status 0x%08X, last fn 0x%08X\n",
+                t->uid, t->exit_status, psp_trace_last());
 
     if (t->delete_after && t->stack_base) {
         psp_sysmem_release(t->stack_base);
@@ -898,8 +999,9 @@ static void hle_CreateThread(void) {
     t->wlock_ready = 1;
 #endif
     g_created++;
-    fprintf(stderr, "thread %u created : entry 0x%08X stack %u  (%s)\n",
-            t->uid, t->entry, t->stack_size, t->name);
+    if (getenv("EMOTIONALSENSE_DEBUG_THREADS"))
+        fprintf(stderr, "thread %u created : entry 0x%08X stack %u  (%s)\n",
+                t->uid, t->entry, t->stack_size, t->name);
     psp_ret(t->uid);
 }
 
@@ -997,8 +1099,9 @@ static void hle_TerminateThread(void) {
         return;
     }
     t->terminated = 1;
-    fprintf(stderr, "thread %u terminated by %u\n", t->uid,
-            g_current ? g_current->uid : 0);
+    if (getenv("EMOTIONALSENSE_DEBUG_THREADS"))
+        fprintf(stderr, "thread %u terminated by %u\n", t->uid,
+                g_current ? g_current->uid : 0);
     wake_thread(t);
     wake_waiters(W_THREAD_END);
     psp_ret(SCE_KERNEL_ERROR_OK);
@@ -1090,17 +1193,17 @@ static int end_reached(void *p) {
 static void wait_thread_end(void) {
     psp_thread *t = find_thread(psp_arg(0));
     if (!t) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_THID); return; }
-    uint32_t out = psp_arg(1), timeout = psp_arg(2);
+    uint32_t timeout_arg = psp_arg(1);
+    uint32_t timeout = (timeout_arg >= 0x08000000u) ? psp_read32(timeout_arg) : timeout_arg;
     struct end_ctx c = { t, g_tls_me ? g_tls_me->end_waits : NULL };
 
     t->end_waiters++;
     if (g_tls_me) g_tls_me->end_waits = &c;
     uint32_t rc = wait_loop(end_reached, &c, timeout, W_THREAD_END,
                             "sceKernelWaitThreadEnd", t->name);
-    if (out) psp_write32(out, t->exit_status);
     t->end_waiters--;
     if (g_tls_me) g_tls_me->end_waits = c.prev;
-    psp_ret(rc);
+    psp_ret(rc == SCE_KERNEL_ERROR_OK ? t->exit_status : rc);
 }
 
 static void hle_WaitThreadEnd(void) { wait_thread_end(); }
@@ -1158,7 +1261,9 @@ static void hle_GetThreadStackFreeSize(void) {
 /* Kept ahead of the epoch the run started at, so a game that compares two
  * readings -- or against a value it stored at startup -- never sees time go
  * backwards, and so the value is in the same range a real clock would give. */
-static uint64_t now_us(void) { return g_epoch_us + g_vtime_us; }
+static uint64_t now_us(void) {
+    return g_epoch_us + g_vtime_us;
+}
 
 static void hle_GetSystemTime(void) {
     uint32_t out = psp_arg(0);
@@ -1174,6 +1279,10 @@ static void hle_GetSystemTimeWide(void) {
     uint64_t us = now_us();
     psp_cpu.r[PSP_REG_V0] = (uint32_t)us;
     psp_cpu.r[PSP_REG_V1] = (uint32_t)(us >> 32);
+}
+
+static void hle_GetSystemTimeLow(void) {
+    psp_ret((uint32_t)now_us());
 }
 
 /* ---- semaphores ---------------------------------------------------------- */
@@ -1221,11 +1330,12 @@ static int sema_ready(void *p) {
     return c->s->count >= c->need;
 }
 
-static uint32_t take_sema(uint32_t timeout) {
+static uint32_t take_sema(uint32_t timeout_arg) {
     psp_sema *s = find_sema(psp_arg(0));
     if (!s) return SCE_KERNEL_ERROR_UNKNOWN_UID;
     struct sema_ctx c = { s, (int32_t)psp_arg(1) };
     if (c.need < 1) c.need = 1;
+    uint32_t timeout = (timeout_arg >= 0x08000000u) ? psp_read32(timeout_arg) : timeout_arg;
 
     uint32_t rc = wait_loop(sema_ready, &c, timeout, W_SEMA,
                             "sceKernelWaitSema", s->name);
@@ -1317,13 +1427,14 @@ static int flag_ready(void *p) {
                                         : (c->f->pattern & c->bits) == c->bits;
 }
 
-static uint32_t wait_flag(uint32_t timeout) {
+static uint32_t wait_flag(uint32_t timeout_arg) {
     /* (evfid, bits, wait mode, outBits, timeout) */
     psp_evflag *f = find_flag(psp_arg(0));
     if (!f) return SCE_KERNEL_ERROR_UNKNOWN_UID;
 
     struct flag_ctx c = { f, psp_arg(1), psp_arg(2) };
     uint32_t out = psp_arg(3);
+    uint32_t timeout = (timeout_arg >= 0x08000000u) ? psp_read32(timeout_arg) : timeout_arg;
 
     uint32_t rc = wait_loop(flag_ready, &c, timeout, W_FLAG,
                             "sceKernelWaitEventFlag", f->name);
@@ -1343,6 +1454,109 @@ static void hle_PollEventFlag(void) {
     if (out) psp_write32(out, f->pattern);
     if (!flag_ready(&c)) { psp_ret(SCE_KERNEL_ERROR_EVF_COND); return; }
     if (c.mode & PSP_EVENT_WAITCLEAR) f->pattern &= ~c.bits;
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+static void hle_ReferEventFlagStatus(void) {
+    psp_evflag *f = find_flag(psp_arg(0));
+    uint32_t info = psp_arg(1);
+    if (!f) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_UID); return; }
+    if (info) {
+        /* SceKernelEventFlagInfo: size(0), name[32](4), attr(36), initPattern(40),
+         * currentPattern(44), numWaitThreads(48). */
+        psp_write32(info + 0, 52);
+        for (int i = 0; i < 32; i++) psp_write8(info + 4 + (uint32_t)i, (uint8_t)f->name[i]);
+        psp_write32(info + 36, 0);
+        psp_write32(info + 40, f->pattern);
+        psp_write32(info + 44, f->pattern);
+        psp_write32(info + 48, 0);
+    }
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+/* ---- mutexes ------------------------------------------------------------- */
+
+#define MAX_MUTEXES 128
+#define PSP_MUTEX_ATTR_RECURSIVE 0x0200u
+
+typedef struct {
+    uint32_t uid;
+    char     name[32];
+    uint32_t attr;
+    uint32_t owner;
+    int32_t  count;
+    int      used;
+} psp_mutex;
+
+static psp_mutex g_mutex[MAX_MUTEXES];
+
+static psp_mutex *find_mutex(uint32_t id) {
+    for (int i = 0; i < MAX_MUTEXES; i++)
+        if (g_mutex[i].used && g_mutex[i].uid == id) return &g_mutex[i];
+    return NULL;
+}
+
+static void hle_CreateMutex(void) {
+    /* (name, attr, initCount, option) */
+    psp_mutex *m = NULL;
+    for (int i = 0; i < MAX_MUTEXES; i++) if (!g_mutex[i].used) { m = &g_mutex[i]; break; }
+    if (!m) { psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
+    memset(m, 0, sizeof *m);
+    psp_str(psp_arg(0), m->name, sizeof m->name);
+    m->attr  = psp_arg(1);
+    m->count = (int32_t)psp_arg(2);
+    if (m->count > 0) m->owner = g_current ? g_current->uid : 1;
+    m->uid   = g_next_uid++;
+    m->used  = 1;
+    psp_ret(m->uid);
+}
+
+static void hle_DeleteMutex(void) {
+    psp_mutex *m = find_mutex(psp_arg(0));
+    if (!m) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_UID); return; }
+    m->used = 0;
+    wake_waiters(W_SEMA);
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+struct mutex_ctx { psp_mutex *m; uint32_t me; };
+static int mutex_ready(void *p) {
+    struct mutex_ctx *c = (struct mutex_ctx *)p;
+    if (c->m->count == 0) return 1;
+    if ((c->m->attr & PSP_MUTEX_ATTR_RECURSIVE) && c->m->owner == c->me) return 1;
+    return 0;
+}
+
+static void hle_LockMutex(void) {
+    /* (mutexid, lockCount, timeout_ptr) */
+    psp_mutex *m = find_mutex(psp_arg(0));
+    int32_t add = (int32_t)psp_arg(1);
+    uint32_t tptr = psp_arg(2);
+    uint32_t timeout = tptr ? psp_read32(tptr) : 0;
+    if (!m) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_UID); return; }
+    if (add < 1) add = 1;
+    uint32_t me = g_current ? g_current->uid : 1;
+    struct mutex_ctx c = { m, me };
+    uint32_t rc = wait_loop(mutex_ready, &c, timeout, W_SEMA, "sceKernelLockMutex", m->name);
+    if (rc == SCE_KERNEL_ERROR_OK) {
+        m->owner = me;
+        m->count += add;
+    }
+    psp_ret(rc);
+}
+
+static void hle_UnlockMutex(void) {
+    /* (mutexid, unlockCount) */
+    psp_mutex *m = find_mutex(psp_arg(0));
+    int32_t sub = (int32_t)psp_arg(1);
+    if (!m) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_UID); return; }
+    if (sub < 1) sub = 1;
+    m->count -= sub;
+    if (m->count <= 0) {
+        m->count = 0;
+        m->owner = 0;
+        wake_waiters(W_SEMA);
+    }
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
@@ -1438,13 +1652,26 @@ static uint32_t take_vpl_block(int blocking) {
     if (blocking) {
         uint32_t rc = wait_loop(vpl_room, &c, timeout, W_VPL,
                                 "sceKernelAllocateVpl", v->name);
-        if (rc != SCE_KERNEL_ERROR_OK) return rc;
+        if (rc != SCE_KERNEL_ERROR_OK) {
+            if (getenv("EMOTIONALSENSE_DEBUG_VPL"))
+                fprintf(stderr, "[VPL] AllocateVpl(uid=0x%X '%s', size=%u) failed wait: free_size=%u pool_size=%u\n",
+                        v->uid, v->name, size, v->free_size, v->pool_size);
+            return rc;
+        }
     } else if (!vpl_room(&c)) {
+        if (getenv("EMOTIONALSENSE_DEBUG_VPL"))
+            fprintf(stderr, "[VPL] TryAllocateVpl(uid=0x%X '%s', size=%u) NO ROOM: free_size=%u pool_size=%u sysmem_free=%u\n",
+                    v->uid, v->name, size, v->free_size, v->pool_size, psp_sysmem_free());
         return SCE_KERNEL_ERROR_WAIT_TIMEOUT;   /* the try variant never blocks */
     }
 
     uint32_t addr = psp_sysmem_alloc(size, 0);
-    if (!addr) return SCE_KERNEL_ERROR_NO_MEMORY;
+    if (!addr) {
+        if (getenv("EMOTIONALSENSE_DEBUG_VPL"))
+            fprintf(stderr, "[VPL] TryAllocateVpl(uid=0x%X '%s', size=%u) SYSMEM FULL: free_size=%u pool_size=%u sysmem_free=%u\n",
+                    v->uid, v->name, size, v->free_size, v->pool_size, psp_sysmem_free());
+        return SCE_KERNEL_ERROR_NO_MEMORY;
+    }
 
     for (int i = 0; i < MAX_VPL_BLOCKS; i++) {
         if (!g_vplblk[i].used) {
@@ -1453,6 +1680,9 @@ static uint32_t take_vpl_block(int blocking) {
             g_vplblk[i].size = size;
             g_vplblk[i].used = 1;
             v->free_size -= size;
+            if (getenv("EMOTIONALSENSE_TRACE_VPL"))
+                fprintf(stderr, "[VPL] uid=0x%X size=%u outp=%08X -> %08X\n",
+                        v->uid, size, outp, addr);
             psp_write32(outp, addr);
             return SCE_KERNEL_ERROR_OK;
         }
@@ -1563,10 +1793,11 @@ static int deliver_callbacks(void) {
         /* A real callback does not disturb what it interrupted, so the whole
          * register file is saved and restored around it -- the same contract as
          * an interrupt handler, and the same one a thread body gets on entry. */
-        psp_cpu_state saved = psp_cpu;
-        psp_cpu.r[PSP_REG_A0] = c->arg;      /* what the guest passed at create time */
+        psp_cpu_state saved = psp_cpu;        psp_cpu.r[PSP_REG_A0] = c->arg;      /* what the guest passed at create time */
         psp_cpu.r[PSP_REG_A1] = arg;         /* and what the notification carried */
         psp_cpu.r[PSP_REG_RA] = 0;
+        if (getenv("EMOTIONALSENSE_TRACE_CB"))
+            fprintf(stderr, "cbr: uid=%u func=%08X arg=%08X\n", c->uid, c->func, arg);
         psp_call_from_host(c->func);
         c->delivery_status = (int32_t)psp_cpu.r[PSP_REG_V0];
         psp_cpu = saved;
@@ -1625,6 +1856,26 @@ static void hle_NotifyCallback(void) {
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
+/* Queue a notification from another subsystem (sceUmdUser's drive callback).
+ * Same contract as sceKernelNotifyCallback, but callable from C. */
+int psp_callback_notify(uint32_t uid, uint32_t arg) {
+    psp_callback *c = find_callback(uid);
+    if (getenv("EMOTIONALSENSE_TRACE_CB"))
+        fprintf(stderr, "cbn: uid=%u arg=%08X found=%d owner=%u me=%u\n", uid, arg,
+                c != NULL, c ? c->owner : 0, g_tls_me ? g_tls_me->uid : 0);
+    if (!c) return 0;
+    c->notify_arg = arg;
+    if (c->notify_count < 0x7FFFFFFF) c->notify_count++;
+    return 1;
+}
+
+static void hle_CancelCallback(void) {
+    psp_callback *c = find_callback(psp_arg(0));
+    if (!c) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_UID); return; }
+    c->notify_count = 0;
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
 static void hle_CheckCallback(void) {
     /* The explicit check point, and the one a game uses to decide whether to
      * keep polling: 1 if a callback ran, 0 if none was pending. */
@@ -1666,11 +1917,13 @@ void psp_threadman_register(void) {
 
     psp_hle_register(0xDB738F35, "ThreadManForUser", "sceKernelGetSystemTime",           hle_GetSystemTime);
     psp_hle_register(0x82BC5777, "ThreadManForUser", "sceKernelGetSystemTimeWide",       hle_GetSystemTimeWide);
+    psp_hle_register(0x369ED59D, "ThreadManForUser", "sceKernelGetSystemTimeLow",        hle_GetSystemTimeLow);
 
     psp_hle_register(0xD6DA4BA1, "ThreadManForUser", "sceKernelCreateSema",              hle_CreateSema);
     psp_hle_register(0x28B6489C, "ThreadManForUser", "sceKernelDeleteSema",              hle_DeleteSema);
     psp_hle_register(0x3F53E640, "ThreadManForUser", "sceKernelSignalSema",              hle_SignalSema);
     psp_hle_register(0x4E3A1105, "ThreadManForUser", "sceKernelWaitSema",                hle_WaitSema);
+    psp_hle_register(0x6D212BAC, "ThreadManForUser", "sceKernelWaitSemaCB",              hle_WaitSema);
     psp_hle_register(0x58B1F937, "ThreadManForUser", "sceKernelPollSema",                hle_PollSema);
     psp_hle_register(0x8FFDF9A2, "ThreadManForUser", "sceKernelCancelSema",              hle_CancelSema);
 
@@ -1679,7 +1932,14 @@ void psp_threadman_register(void) {
     psp_hle_register(0x1FB15A32, "ThreadManForUser", "sceKernelSetEventFlag",            hle_SetEventFlag);
     psp_hle_register(0x812346E4, "ThreadManForUser", "sceKernelClearEventFlag",          hle_ClearEventFlag);
     psp_hle_register(0x402FCF22, "ThreadManForUser", "sceKernelWaitEventFlag",           hle_WaitEventFlag);
+    psp_hle_register(0x328C546A, "ThreadManForUser", "sceKernelWaitEventFlagCB",         hle_WaitEventFlag);
     psp_hle_register(0x30FD48F0, "ThreadManForUser", "sceKernelPollEventFlag",           hle_PollEventFlag);
+    psp_hle_register(0xA66B0120, "ThreadManForUser", "sceKernelReferEventFlagStatus",    hle_ReferEventFlagStatus);
+
+    psp_hle_register(0xB7D098C6, "ThreadManForUser", "sceKernelCreateMutex",             hle_CreateMutex);
+    psp_hle_register(0xF8170FBE, "ThreadManForUser", "sceKernelDeleteMutex",             hle_DeleteMutex);
+    psp_hle_register(0xB011B11F, "ThreadManForUser", "sceKernelLockMutex",               hle_LockMutex);
+    psp_hle_register(0x6B30100F, "ThreadManForUser", "sceKernelUnlockMutex",             hle_UnlockMutex);
 
     psp_hle_register(0x56C039B5, "ThreadManForUser", "sceKernelCreateVpl",               hle_CreateVpl);
     psp_hle_register(0x89B3D48C, "ThreadManForUser", "sceKernelDeleteVpl",               hle_DeleteVpl);
@@ -1693,5 +1953,6 @@ void psp_threadman_register(void) {
     psp_hle_register(0xE81CAF8F, "ThreadManForUser", "sceKernelCreateCallback",          hle_CreateCallback);
     psp_hle_register(0xEDBA5844, "ThreadManForUser", "sceKernelDeleteCallback",          hle_DeleteCallback);
     psp_hle_register(0xC11BA8C4, "ThreadManForUser", "sceKernelNotifyCallback",          hle_NotifyCallback);
+    psp_hle_register(0xBA4051D6, "ThreadManForUser", "sceKernelCancelCallback",          hle_CancelCallback);
     psp_hle_register(0x349D6D6C, "ThreadManForUser", "sceKernelCheckCallback",           hle_CheckCallback);
 }

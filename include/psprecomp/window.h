@@ -15,9 +15,11 @@
  *   Q / W               LB, LT / RB, RT         L / R
  *   Enter               Start                   Start
  *   Backspace           Back                    Select
+ *   F11                                         fullscreen
+ *   F9                                          dump GE/HLE census
+ *   F12                                         capture a PPM (EMOTIONALSENSE_SHOT_DIR)
  *
- * Windows only for now (Win32 + GDI + XInput: no dependencies). Elsewhere
- * psp_window_start() returns -1. */
+ * SDL2 on Linux, Win32 + GDI + XInput on Windows. */
 #ifndef PSPRECOMP_WINDOW_H
 #define PSPRECOMP_WINDOW_H
 

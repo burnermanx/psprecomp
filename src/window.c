@@ -178,6 +178,7 @@ int psp_window_closed(void) { return g_closed != 0; }
 #include <SDL.h>
 #include <stdatomic.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 #define W 480
 #define H 272
@@ -295,6 +296,16 @@ static int window_main(void *arg) {
                 if (ev.key.keysym.sym == SDLK_F11) {
                     Uint32 fs = SDL_GetWindowFlags(win) & SDL_WINDOW_FULLSCREEN_DESKTOP;
                     SDL_SetWindowFullscreen(win, fs ? 0 : SDL_WINDOW_FULLSCREEN_DESKTOP);
+                } else if (ev.key.keysym.sym == SDLK_F9) {
+                    psp_ge_dump_stats(stderr);
+                    psp_hle_dump_counts(stderr, 40);
+                } else if (ev.key.keysym.sym == SDLK_F12) {
+                    const char *dir = getenv("EMOTIONALSENSE_SHOT_DIR");
+                    char path[512];
+                    snprintf(path, sizeof path, "%s/f12_%llu.ppm", dir ? dir : "/tmp",
+                             (unsigned long long)psp_display_vblanks());
+                    psp_display_capture(path);
+                    fprintf(stderr, "window: captured %s\n", path);
                 }
                 break;
             }

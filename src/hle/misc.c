@@ -286,7 +286,11 @@ static void hle_OutputBlocking(void) {
     g_audio_blocks++;
     const uint64_t play_us = (uint64_t)samples * 1000000u / 44100u;
 #if PSPRECOMP_REAL_THREADS
-    if (ch < AUDIO_CHANNELS) {
+    if (psp_threadman_clock_virtual()) {
+        /* Deterministic runs cannot pace against the host clock: how much audio
+         * is queued would differ from run to run. */
+        psp_threadman_delay(play_us);
+    } else if (ch < AUDIO_CHANNELS) {
         uint64_t now = host_now_us();
         if (g_audio_due_us[ch] < now) g_audio_due_us[ch] = now;
         g_audio_due_us[ch] += play_us;
@@ -314,7 +318,11 @@ static void hle_OutputPannedBlocking(void) {
     g_audio_blocks++;
     const uint64_t play_us = (uint64_t)samples * 1000000u / 44100u;
 #if PSPRECOMP_REAL_THREADS
-    if (ch < AUDIO_CHANNELS) {
+    if (psp_threadman_clock_virtual()) {
+        /* Deterministic runs cannot pace against the host clock: how much audio
+         * is queued would differ from run to run. */
+        psp_threadman_delay(play_us);
+    } else if (ch < AUDIO_CHANNELS) {
         uint64_t now = host_now_us();
         if (g_audio_due_us[ch] < now) g_audio_due_us[ch] = now;
         g_audio_due_us[ch] += play_us;

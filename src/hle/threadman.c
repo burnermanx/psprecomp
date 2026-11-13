@@ -340,7 +340,11 @@ static uint64_t mono_us(void) {
 /* The clock the guest reads: uptime in microseconds. g_vtime_us stays internal
  * scheduler accounting and is no longer visible to the game. */
 uint64_t psp_clock_us(void) {
-    if (g_clock_virtual) return g_frame_index * 16683ull;
+    /* Virtual mode has to advance on every wait, not only on frame waits: the
+     * video player blocks on its vblank event flag before it ever reaches
+     * sceDisplayWaitVblankStart, so a clock tied to the frame counter would
+     * never move and the vblank interrupt would never be delivered. */
+    if (g_clock_virtual) return g_vtime_us;
     return mono_us() - g_boot_mono_us;
 }
 
@@ -348,7 +352,8 @@ uint64_t psp_clock_us(void) {
  * the video player's interrupt handler has to fire even while the main thread
  * is blocked on something else. */
 uint64_t psp_vblank_index(void) {
-    if (g_clock_virtual || !g_frame_num || !g_frame_t0_us) return g_frame_index;
+    if (g_clock_virtual) return g_vtime_us / 16683ull;
+    if (!g_frame_num || !g_frame_t0_us) return g_frame_index;
     return (mono_us() - g_frame_t0_us) * g_frame_den / g_frame_num;
 }
 
@@ -744,6 +749,7 @@ void psp_threadman_frame_wait(void) {
 uint64_t psp_threadman_switches(void) { return g_switches; }
 uint64_t psp_threadman_parks(void)    { return g_parks; }
 uint64_t psp_threadman_vtime_us(void) { return g_vtime_us; }
+int psp_threadman_clock_virtual(void) { return g_clock_virtual; }
 uint32_t psp_threadman_current_uid(void) { return g_tls_me ? g_tls_me->uid : 0; }
 /* Parks after which another thread had run -- either it took the CPU while this
  * one was parked, or the park waited for it before taking the CPU back -- and

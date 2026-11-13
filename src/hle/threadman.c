@@ -521,7 +521,10 @@ static int park_us_timed(uint64_t timeout_us, uint64_t real_us) {
 }
 
 static int park_us(uint64_t timeout_us) {
-    uint64_t real = timeout_us < REAL_TICK_US ? timeout_us : REAL_TICK_US;
+    /* Virtual mode must not wait on the host clock: a real 400 us per park is
+     * what made two runs differ by a frame. */
+    uint64_t real = g_clock_virtual ? 0
+                   : (timeout_us < REAL_TICK_US ? timeout_us : REAL_TICK_US);
     return park_us_timed(timeout_us, real);
 }
 
@@ -1174,6 +1177,15 @@ static void hle_DeleteThread(void) {
  * same shape with a wakeup as its exit. */
 static void park_ticks(uint64_t us, int kind) {
     uint64_t left = us ? us : TICK_US;
+    if (g_clock_virtual) {
+        /* One park for the whole delay. A per-tick park costs a full baton
+         * round each, and in virtual time the audio thread was getting a turn
+         * only every few hundred frames -- its 23 ms block took seconds of
+         * guest time, so the video player waited on it forever. */
+        park_for(kind, left);
+        deliver_tick();
+        return;
+    }
     while (left) {
         uint64_t step = left < TICK_US ? left : TICK_US;
         park_for(kind, step);

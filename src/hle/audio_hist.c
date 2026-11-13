@@ -157,21 +157,22 @@ void psp_audio_output(int channel, int leftvol, int rightvol,
     if (g_ch_blocks[ci] > 8 && SDL_GetQueuedAudioSize(dev) == 0)
         g_underruns[ci]++;
 
-    /* The guest runs at hardware pace now, so the queue can drain between
-     * blocks. Prefill silence when it is empty: the cushion against crackle is
-     * latency here, not a head start for the guest. */
-    if (SDL_GetQueuedAudioSize(dev) == 0) {
-        static int16_t *silence;
-        static int silence_samples = -1;
-        if (silence_samples < 0) {
-            const char *e = getenv("EMOTIONALSENSE_AUDIO_LATENCY_MS");
-            int ms = e ? atoi(e) : 70;
-            silence_samples = ms > 0 ? ms * AUDIO_OUT_FREQ / 1000 : 0;
-            if (silence_samples > 0)
-                silence = calloc((size_t)silence_samples * AUDIO_OUT_CH, sizeof(int16_t));
-        }
-        if (silence)
-            SDL_QueueAudio(dev, silence, (uint32_t)silence_samples * 4);
+    /* Keep a stable cushion instead of refilling a whole 70 ms whenever the
+     * queue happens to be empty: a full refill after every underrun pushes an
+     * intermittent channel (keysounds, voices) further behind the music. Top up
+     * only the missing part, so the queue level - and the latency - stays put.
+     * The floor is one block plus 10 ms: a 2048-sample block is 46 ms, so a
+     * 40 ms target alone would leave no cushion and underrun every block. */
+    static int16_t *silence;
+    static int configured_samples = -1;
+    static int silence_cap;
+    if (configured_samples < 0) {
+        const char *e = getenv("EMOTIONALSENSE_AUDIO_LATENCY_MS");
+        int ms = e ? atoi(e) : 40;
+        configured_samples = ms > 0 ? ms * AUDIO_OUT_FREQ / 1000 : 0;
+        silence_cap = AUDIO_OUT_FREQ / 2;   /* 500 ms, enough for any block */
+        if (configured_samples > 0)
+            silence = calloc((size_t)silence_cap * AUDIO_OUT_CH, sizeof(int16_t));
     }
     int16_t stack_buf[4096 * 2];
     int16_t *tmp = samples <= 4096 ? stack_buf : (int16_t *)malloc((size_t)bytes);
@@ -189,6 +190,17 @@ void psp_audio_output(int channel, int leftvol, int rightvol,
     }
     SDL_QueueAudio(dev, tmp, (uint32_t)bytes);
     if (tmp != stack_buf) free(tmp);
+
+    /* Queue the block first, then top up the cushion: if the queue was empty,
+     * the block starts immediately instead of waiting behind the silence. */
+    int floor = samples + AUDIO_OUT_FREQ / 100;   /* one block + 10 ms */
+    int target = configured_samples > floor ? configured_samples : floor;
+    int queued_samples = (int)(SDL_GetQueuedAudioSize(dev) / 4);
+    if (silence && queued_samples < target) {
+        int add = target - queued_samples;
+        if (add > silence_cap) add = silence_cap;
+        SDL_QueueAudio(dev, silence, (uint32_t)add * 4);
+    }
 
     /* Histogram (diagnostic only; racy counters are fine across two threads). */
     g_mag_sum += sum;

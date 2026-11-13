@@ -705,11 +705,30 @@ void psp_threadman_sleep_real(uint64_t us) {
     if (!us) return;
 #if PSPRECOMP_REAL_THREADS
     check_terminated();
+    if (g_clock_virtual) {
+        /* The frame wait owns the virtual clock: a sleep only hands the CPU
+         * over. Advancing it here too made the audio thread and the frame
+         * wait both add time, so the guest clock ran several times too fast. */
+        park_us_timed(0, 0);
+        check_terminated();
+        return;
+    }
     park_us_timed(us, us);
     check_terminated();
 #else
     psp_threadman_delay(us);
 #endif
+}
+
+/* A wait the guest times itself: in virtual mode advance the clock by exactly
+ * `us` without a handover, so the other threads' waits cannot inflate the
+ * measurement. Used by the UMD ioctls the disc check times. */
+void psp_threadman_sleep_exact(uint64_t us) {
+    if (!us) return;
+#if PSPRECOMP_REAL_THREADS
+    if (g_clock_virtual) { g_vtime_us += us; return; }
+#endif
+    psp_threadman_sleep_real(us);
 }
 
 void psp_threadman_frame_wait(void) {

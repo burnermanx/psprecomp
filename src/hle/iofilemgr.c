@@ -528,7 +528,7 @@ static void hle_Ioctl(void) {
         if (cmd == 0x01F100A6u && indata) {
             /* Seek to a 64-bit LBA (input is {u64 lba, u64 pad}). */
             h->lba = (uint64_t)psp_read32(indata) | ((uint64_t)psp_read32(indata + 4) << 32);
-            psp_threadman_sleep_real(UMD_SEEK_US);
+            psp_threadman_sleep_exact(UMD_SEEK_US);
             if (trace)
                 fprintf(stderr, "io: ioctl raw seek lba=%llu dt=%llums\n",
                         (unsigned long long)h->lba,
@@ -543,7 +543,7 @@ static void hle_Ioctl(void) {
             if (bytes > outlen) bytes = outlen;
             uint8_t *tmp = (uint8_t *)malloc(bytes ? bytes : 1);
             if (!tmp) { psp_ret(0x80020190); return; }
-            psp_threadman_sleep_real(UMD_READ_US);
+            psp_threadman_sleep_exact(UMD_READ_US);
             int got = raw_read(h, tmp, bytes);
             for (int i = 0; i < got; i++) psp_write8(outdata + (uint32_t)i, tmp[i]);
             free(tmp);

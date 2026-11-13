@@ -200,6 +200,7 @@ void psp_threadman_yield(void);
 void psp_threadman_delay(uint64_t us);
 void psp_threadman_frame_wait(void);
 void psp_threadman_sleep_real(uint64_t us);   /* real host time, CPU handed over */
+void psp_threadman_sleep_exact(uint64_t us);  /* virtual time exact, no handover */
 void psp_threadman_set_fps_limit(int fps);
 int  psp_threadman_get_fps_limit(void);
 

@@ -131,42 +131,89 @@ void psp_ctrl_set(uint32_t buttons, uint8_t ax, uint8_t ay) {
 
 static void hle_CtrlSet(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
 
+/* EMOTIONALSENSE_SCRIPT presses buttons on a schedule, so a headless run can
+ * walk through menus. Entries are "vblank:hexmask:frames" or, relative to a
+ * scene, "@scene+N:hexmask:frames": N frames after the first time the scene
+ * word holds `scene`. The relative form survives a change in how long the
+ * opening runs; the absolute form does not. A value starting with '@' names a
+ * file with one entry per line ('#' comments). */
+#define SCRIPT_MAX 64
+typedef struct {
+    int relative;
+    uint32_t scene;
+    uint64_t delta;                 /* vblank, or frames after the scene */
+    uint32_t mask, frames;
+    int seen;
+    uint64_t start;
+} script_entry;
+static script_entry g_script[SCRIPT_MAX];
+static int g_script_n;
+
+/* The scene machine object is a fixed heap allocation; its id is at +4.
+ * 0x0805E870 is app, so the id is the word below. */
+#define SCENE_WORD 0x0805E874u
+
+static void script_load(void) {
+    const char *s = getenv("EMOTIONALSENSE_SCRIPT");
+    static char buf[4096];
+    if (s && *s == '@') {
+        FILE *f = fopen(s + 1, "r");
+        if (!f) return;
+        size_t n = fread(buf, 1, sizeof buf - 1, f);
+        fclose(f);
+        buf[n] = 0;
+        for (char *p = buf; *p; p++)
+            if (*p == '#') while (*p && *p != '\n') *p++ = ' ';
+        s = buf;
+    }
+    if (!s) return;
+    while (*s && g_script_n < SCRIPT_MAX) {
+        script_entry *e = &g_script[g_script_n];
+        unsigned long scene = 0, delta = 0, mask = 0, frames = 0, at = 0;
+        int ok;
+        memset(e, 0, sizeof *e);
+        if (*s == '@')
+            ok = sscanf(s, "@%lu+%lu:%lx:%lu", &scene, &delta, &mask, &frames) == 4;
+        else
+            ok = sscanf(s, "%lu:%lx:%lu", &at, &mask, &frames) == 3;
+        if (ok) {
+            e->relative = (*s == '@');
+            e->scene = (uint32_t)scene;
+            e->delta = e->relative ? delta : at;
+            e->mask = (uint32_t)mask;
+            e->frames = (uint32_t)frames;
+            g_script_n++;
+        }
+        while (*s && *s != ',' && *s != '\n') s++;
+        if (*s == ',' || *s == '\n') s++;
+        else break;
+    }
+}
+
 /* SceCtrlData: u32 timestamp, u32 buttons, u8 lx, u8 ly, then padding to 16. */
 static void hle_ReadBufferPositive(void) {
     uint32_t buf = psp_arg(0), count = psp_arg(1);
     if (!count) count = 1;
     uint32_t btns = g_buttons;
-    /* EMOTIONALSENSE_SCRIPT="vblank:hexmask:frames,..." presses buttons at
-     * given vblanks, so a headless run can walk through menus. A value
-     * starting with '@' names a file with one entry per line ('#' comments). */
-    static char script_buf[4096];
-    static const char *script; static int script_init;
-    if (!script_init) {
-        script_init = 1;
-        const char *s = getenv("EMOTIONALSENSE_SCRIPT");
-        if (s && *s == '@') {
-            FILE *f = fopen(s + 1, "r");
-            if (f) {
-                size_t n = fread(script_buf, 1, sizeof script_buf - 1, f);
-                fclose(f);
-                script_buf[n] = 0;
-                for (char *p = script_buf; *p; p++) {
-                    if (*p == '#') while (*p && *p != '\n') *p++ = ' ';
-                    if (*p == '\n') *p = ',';
-                }
-                script = script_buf;
-            }
-        } else {
-            script = s;
-        }
-    }
-    if (script) {
+    static int script_init;
+    if (!script_init) { script_init = 1; script_load(); }
+    if (g_script_n) {
         uint64_t vb = psp_display_vblanks();
-        for (const char *q = script; q && *q; ) {
-            unsigned long at = 0, mask = 0, len = 0;
-            if (sscanf(q, "%lu:%lx:%lu", &at, &mask, &len) == 3 &&
-                vb >= at && vb < at + len) btns |= (uint32_t)mask;
-            q = strchr(q, ','); if (q) q++;
+        uint32_t scene = psp_read32(SCENE_WORD);
+        for (int i = 0; i < g_script_n; i++) {
+            script_entry *e = &g_script[i];
+            uint64_t at;
+            if (e->relative) {
+                if (!e->seen) {
+                    if (scene != e->scene) continue;
+                    e->seen = 1;
+                    e->start = vb;
+                }
+                at = e->start + e->delta;
+            } else {
+                at = e->delta;
+            }
+            if (vb >= at && vb < at + e->frames) btns |= e->mask;
         }
         static int in_trace = -1;
         if (in_trace < 0) in_trace = getenv("EMOTIONALSENSE_TRACE_INPUT") != NULL;
@@ -248,13 +295,20 @@ static void hle_ChRelease(void) {
  * loop spin forever and starve every other guest thread.
  *
  * Under real threads the hardware queue is modelled on the host clock: a
- * buffer is due one play time after the last, and the call only waits while
- * the queue is more than a buffer ahead. Waiting a fixed play time per call
- * did not work there. The scheduler is cooperative, each tick of the wait
- * handed the CPU to the game's main thread for a whole frame, and WTF's audio
- * ran at about 10 buffers a second instead of 172; its title waits for a
- * jingle that, by its own sample count, never finished. A thread that falls
- * behind now catches up without waiting, as it would against a real queue.
+ * buffer is due one play time after the last, and the call returns when that
+ * buffer has finished. The guest therefore runs at the hardware rate, which is
+ * what the video player synchronises against. Giving the guest a head start
+ * made the player believe it was late on every frame and decode in recovery
+ * mode: 21.5 fps against PPSSPP's 59.94, with a quarter of the decoded frames
+ * never shown. The cushion against crackle now lives in psp_audio_output,
+ * where it is latency in the device queue instead of a lie to the guest.
+ *
+ * Waiting a fixed play time per call did not work there. The scheduler is
+ * cooperative, each tick of the wait handed the CPU to the game's main thread
+ * for a whole frame, and WTF's audio ran at about 10 buffers a second instead
+ * of 172; its title waits for a jingle that, by its own sample count, never
+ * finished. A thread that falls behind now catches up without waiting, as it
+ * would against a real queue.
  * Inline mode keeps the virtual-time wait. */
 #if PSPRECOMP_REAL_THREADS
 static uint64_t host_now_us(void) {
@@ -264,13 +318,35 @@ static uint64_t host_now_us(void) {
 }
 static uint64_t g_audio_due_us[AUDIO_CHANNELS];
 
+/* EMOTIONALSENSE_AUDIO_AHEAD_MS is an A/B override for the old behaviour; the
+ * default is 0, no head start. */
 static uint64_t audio_ahead_us(void) {
+    static int init;
     static uint64_t ahead_us;
-    if (!ahead_us) {
+    if (!init) {
+        init = 1;
         const char *e = getenv("EMOTIONALSENSE_AUDIO_AHEAD_MS");
-        ahead_us = (uint64_t)(e && atoi(e) > 0 ? atoi(e) : 150) * 1000u;
+        int ms = e ? atoi(e) : 0;
+        ahead_us = (uint64_t)(ms > 0 ? ms : 0) * 1000u;
     }
     return ahead_us;
+}
+
+static void audio_pace(int ch, uint64_t play_us) {
+    if (psp_threadman_clock_virtual()) {
+        /* Deterministic runs cannot pace against the host clock: how much audio
+         * is queued would differ from run to run. */
+        psp_threadman_delay(play_us);
+        return;
+    }
+    if (ch < 0 || ch >= AUDIO_CHANNELS) return;
+    uint64_t now = host_now_us();
+    if (g_audio_due_us[ch] < now) g_audio_due_us[ch] = now;   /* underrun */
+    g_audio_due_us[ch] += play_us;
+    uint64_t ahead = audio_ahead_us();
+    uint64_t t = host_now_us();
+    if (t + ahead < g_audio_due_us[ch])
+        psp_threadman_sleep_real(g_audio_due_us[ch] - ahead - t);
 }
 #endif
 
@@ -286,19 +362,7 @@ static void hle_OutputBlocking(void) {
     g_audio_blocks++;
     const uint64_t play_us = (uint64_t)samples * 1000000u / 44100u;
 #if PSPRECOMP_REAL_THREADS
-    if (psp_threadman_clock_virtual()) {
-        /* Deterministic runs cannot pace against the host clock: how much audio
-         * is queued would differ from run to run. */
-        psp_threadman_delay(play_us);
-    } else if (ch < AUDIO_CHANNELS) {
-        uint64_t now = host_now_us();
-        if (g_audio_due_us[ch] < now) g_audio_due_us[ch] = now;
-        g_audio_due_us[ch] += play_us;
-        uint64_t ahead = audio_ahead_us();
-        uint64_t t = host_now_us();
-        if (t + ahead < g_audio_due_us[ch])
-            psp_threadman_sleep_real(g_audio_due_us[ch] - ahead - t);
-    }
+    audio_pace((int)ch, play_us);
 #else
     psp_threadman_delay(play_us);
 #endif
@@ -318,19 +382,7 @@ static void hle_OutputPannedBlocking(void) {
     g_audio_blocks++;
     const uint64_t play_us = (uint64_t)samples * 1000000u / 44100u;
 #if PSPRECOMP_REAL_THREADS
-    if (psp_threadman_clock_virtual()) {
-        /* Deterministic runs cannot pace against the host clock: how much audio
-         * is queued would differ from run to run. */
-        psp_threadman_delay(play_us);
-    } else if (ch < AUDIO_CHANNELS) {
-        uint64_t now = host_now_us();
-        if (g_audio_due_us[ch] < now) g_audio_due_us[ch] = now;
-        g_audio_due_us[ch] += play_us;
-        uint64_t ahead = audio_ahead_us();
-        uint64_t t = host_now_us();
-        if (t + ahead < g_audio_due_us[ch])
-            psp_threadman_sleep_real(g_audio_due_us[ch] - ahead - t);
-    }
+    audio_pace((int)ch, play_us);
 #else
     psp_threadman_delay(play_us);
 #endif

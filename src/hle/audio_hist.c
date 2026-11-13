@@ -156,6 +156,23 @@ void psp_audio_output(int channel, int leftvol, int rightvol,
     g_ch_blocks[ci]++; g_ch_samples[ci] = (uint32_t)samples;
     if (g_ch_blocks[ci] > 8 && SDL_GetQueuedAudioSize(dev) == 0)
         g_underruns[ci]++;
+
+    /* The guest runs at hardware pace now, so the queue can drain between
+     * blocks. Prefill silence when it is empty: the cushion against crackle is
+     * latency here, not a head start for the guest. */
+    if (SDL_GetQueuedAudioSize(dev) == 0) {
+        static int16_t *silence;
+        static int silence_samples = -1;
+        if (silence_samples < 0) {
+            const char *e = getenv("EMOTIONALSENSE_AUDIO_LATENCY_MS");
+            int ms = e ? atoi(e) : 70;
+            silence_samples = ms > 0 ? ms * AUDIO_OUT_FREQ / 1000 : 0;
+            if (silence_samples > 0)
+                silence = calloc((size_t)silence_samples * AUDIO_OUT_CH, sizeof(int16_t));
+        }
+        if (silence)
+            SDL_QueueAudio(dev, silence, (uint32_t)silence_samples * 4);
+    }
     int16_t stack_buf[4096 * 2];
     int16_t *tmp = samples <= 4096 ? stack_buf : (int16_t *)malloc((size_t)bytes);
     if (!tmp) return;

@@ -215,6 +215,9 @@ int  psp_threadman_intr_disabled(void);
 uint64_t psp_threadman_switches(void);
 uint64_t psp_threadman_parks(void);
 uint64_t psp_threadman_vtime_us(void);
+/* True when the guest clock is the deterministic one (EMOTIONALSENSE_CLOCK=virtual).
+ * Anything that would otherwise pace itself against the host clock has to ask. */
+int  psp_threadman_clock_virtual(void);
 /* The guest-visible clock: microseconds since boot, real time unless
  * EMOTIONALSENSE_CLOCK=virtual, which makes it one frame per frame. */
 uint64_t psp_clock_us(void);
@@ -274,6 +277,7 @@ void psp_intr_tick(void);
 int      psp_intr_handlers(void);      /* registered */
 int      psp_intr_enabled(void);       /* registered *and* enabled */
 uint64_t psp_intr_deliveries(void);
+uint64_t psp_intr_vblanks(void);
 uint64_t psp_intr_unresolved(void);    /* handler address that is not recompiled */
 
 /* How many threads were created and how many were actually started. The gap

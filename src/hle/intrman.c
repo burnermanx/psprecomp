@@ -51,6 +51,7 @@ typedef struct {
 
 static psp_subintr g_sub[MAX_SUBINTR];
 static uint64_t   g_deliveries;
+static uint64_t   g_vblanks;      /* vblank source events, for the clock trace */
 static uint64_t   g_unresolved;
 static int        g_unresolved_logged;
 static int        g_delivering;   /* reentrancy guard: see psp_intr_tick */
@@ -60,6 +61,7 @@ void psp_intrman_init(void) { psp_intrman_reset(); }
 void psp_intrman_reset(void) {
     memset(g_sub, 0, sizeof g_sub);
     g_deliveries = 0;
+    g_vblanks = 0;
     g_unresolved = 0;
     g_unresolved_logged = 0;
     g_delivering = 0;
@@ -141,6 +143,7 @@ void psp_intr_tick(void) {
     static uint64_t last_vblank;
     uint64_t vb = psp_vblank_index();
     int vblank_new = vb != last_vblank;
+    if (vblank_new) g_vblanks += (vb > last_vblank) ? (vb - last_vblank) : 1;
     last_vblank = vb;
 
     for (int i = 0; i < MAX_SUBINTR; i++) {
@@ -190,6 +193,7 @@ int psp_intr_enabled(void) {
 }
 
 uint64_t psp_intr_deliveries(void) { return g_deliveries; }
+uint64_t psp_intr_vblanks(void) { return g_vblanks; }
 uint64_t psp_intr_unresolved(void) { return g_unresolved; }
 
 void psp_intrman_register(void) {

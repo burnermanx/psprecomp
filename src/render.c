@@ -115,19 +115,29 @@ static int wrap(int c, int size, int clamp) {
     return c & (size - 1);                      /* sizes are powers of two */
 }
 
+/* DXT endpoints are 565 with red in the high bits, like desktop DXT and unlike
+ * the PSP's native 565 (red low). Expanding them with psp_color_expand swaps
+ * red and blue: yellow came out cyan, gold came out blue. */
+static uint32_t dxt_color(uint32_t px) {
+    const uint32_t r = (px >> 11) & 0x1F, g = (px >> 5) & 0x3F, b = px & 0x1F;
+    return rgba((int)((r << 3) | (r >> 2)), (int)((g << 2) | (g >> 4)),
+                (int)((b << 3) | (b >> 2)), 255);
+}
+
 /* DXT1/3/5. The PSP lays a block out with its colour indices first -- one
  * byte per row, two bits per texel -- then the two 565 endpoint colours, the
  * reverse of the desktop order. DXT3 and DXT5 follow the colour half with
- * their alpha half. Blocks run left to right in rows of tex_bw / 4.
- * ponytail: DXT1 is checked against WTF's backgrounds; the DXT5 alpha layout
- * (endpoints in the last two bytes) is not yet seen in a game. */
+ * their alpha half; DXT5's 48 alpha index bits are the low 32 then the high
+ * 16, and its two endpoints are the last two bytes. Blocks run left to right
+ * in rows of tex_bw / 4. The Vulkan backend has no decoder of its own: it
+ * uploads through psp_tex_fetch, so this is the only copy. */
 static uint32_t dxt_texel(const psp_draw_state *st, uint32_t x, uint32_t y) {
     const uint32_t size = st->tex_fmt == PSP_TPSM_DXT1 ? 8u : 16u;
     const uint32_t blk = st->tex_addr + ((y >> 2) * ((uint32_t)st->tex_bw / 4) + (x >> 2)) * size;
     const uint32_t i = (y & 3) * 4 + (x & 3);
 
     const uint32_t c0 = psp_read16(blk + 4), c1 = psp_read16(blk + 6);
-    const uint32_t a = psp_color_expand(c0, 0), b = psp_color_expand(c1, 0);
+    const uint32_t a = dxt_color(c0), b = dxt_color(c1);
     uint32_t out;
     switch ((psp_read32(blk) >> (2 * i)) & 3) {
     case 0:  out = a; break;
@@ -147,7 +157,7 @@ static uint32_t dxt_texel(const psp_draw_state *st, uint32_t x, uint32_t y) {
         const uint32_t al = (psp_read16(blk + 8 + (y & 3) * 2) >> ((x & 3) * 4)) & 0xF;
         out = (out & 0x00FFFFFFu) | ((al * 17) << 24);
     } else if (st->tex_fmt == PSP_TPSM_DXT5) {
-        const uint64_t bits = (uint64_t)psp_read16(blk + 12) | ((uint64_t)psp_read32(blk + 8) << 16);
+        const uint64_t bits = (uint64_t)psp_read32(blk + 8) | ((uint64_t)psp_read16(blk + 12) << 32);
         const int a0 = psp_read8(blk + 14), a1 = psp_read8(blk + 15);
         const int k = (int)(bits >> (3 * i)) & 7;
         int al;

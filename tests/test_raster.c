@@ -583,25 +583,93 @@ static void test_framebuffer_is_vram_relative(void) {
 
 /* ---- DXT, depth, sampling, vertex flow, lighting ------------------------ */
 
-/* One DXT1 block, PSP layout: the 2-bit indices first (a byte per row), then
- * the two 565 endpoints. Endpoint 0 > endpoint 1 selects four-colour mode, so
- * indices 2 and 3 are the 2/3 and 1/3 blends. */
-static void test_dxt1(void) {
-    psp_write32(TEX, 0xE4E4E4E4u);                 /* every row: 0, 1, 2, 3 */
-    psp_write16(TEX + 4, 0xF800);                  /* endpoint 0: blue */
-    psp_write16(TEX + 6, 0x001F);                  /* endpoint 1: red */
+/* One DXT block, PSP layout: the 2-bit indices first (a byte per row), then
+ * the two 565 endpoints with red in the high bits. Endpoint 0 > endpoint 1
+ * selects four-colour mode, so indices 2 and 3 are the 2/3 and 1/3 blends. */
+static void draw_dxt_block(int fmt) {
     psp_ge_reset();
     clear_fb();
-    begin_tex_list(8, 2, 2, 0);                    /* DXT1, 4x4 */
+    begin_tex_list(fmt, 2, 2, 0);                  /* 4x4 */
     tvertex(0, 0, 0, 0, 0, 0xFFFFFFFFu);
     tvertex(1, 4, 4, 4, 4, 0xFFFFFFFFu);
     cmd(0x04, (6u << 16) | 2);
     end_list();
-    CHECK(pixel(0, 0) == 0xFFFF0000u, "DXT1 index 0 is endpoint 0 (blue): 0x%08X", pixel(0, 0));
-    CHECK(pixel(1, 0) == 0xFF0000FFu, "DXT1 index 1 is endpoint 1 (red): 0x%08X", pixel(1, 0));
-    CHECK(pixel(2, 0) == 0xFFAA0055u, "DXT1 index 2 is 2/3 endpoint 0: 0x%08X", pixel(2, 0));
-    CHECK(pixel(3, 3) == 0xFF5500AAu, "DXT1 index 3 is 1/3 endpoint 0: 0x%08X", pixel(3, 3));
+}
+
+static void test_dxt1(void) {
+    psp_write32(TEX, 0xE4E4E4E4u);                 /* every row: 0, 1, 2, 3 */
+    psp_write16(TEX + 4, 0xF800);                  /* endpoint 0: red (R high) */
+    psp_write16(TEX + 6, 0x001F);                  /* endpoint 1: blue */
+    draw_dxt_block(PSP_TPSM_DXT1);
+    CHECK(pixel(0, 0) == 0xFF0000FFu, "DXT1 index 0 is endpoint 0 (red): 0x%08X", pixel(0, 0));
+    CHECK(pixel(1, 0) == 0xFFFF0000u, "DXT1 index 1 is endpoint 1 (blue): 0x%08X", pixel(1, 0));
+    CHECK(pixel(2, 0) == 0xFF5500AAu, "DXT1 index 2 is 2/3 endpoint 0: 0x%08X", pixel(2, 0));
+    CHECK(pixel(3, 3) == 0xFFAA0055u, "DXT1 index 3 is 1/3 endpoint 0: 0x%08X", pixel(3, 3));
+
+    /* Three-colour mode: endpoint 0 <= endpoint 1; index 3 is transparent. */
+    psp_write16(TEX + 4, 0x001F);                  /* blue */
+    psp_write16(TEX + 6, 0xF800);                  /* red */
+    draw_dxt_block(PSP_TPSM_DXT1);
+    CHECK(pixel(0, 0) == 0xFFFF0000u, "DXT1 three-colour index 0 (blue): 0x%08X", pixel(0, 0));
+    CHECK(pixel(1, 0) == 0xFF0000FFu, "DXT1 three-colour index 1 (red): 0x%08X", pixel(1, 0));
+    CHECK(pixel(2, 0) == 0xFF7F007Fu, "DXT1 three-colour index 2 is the average: 0x%08X", pixel(2, 0));
+    CHECK(pixel(3, 3) == 0u, "DXT1 three-colour index 3 is transparent: 0x%08X", pixel(3, 3));
     CHECK(psp_render_unsupported_texels() == 0, "no texel was undecodable");
+}
+
+/* DXT3: 4 bits of explicit alpha per texel, two bytes per row after the
+ * colour half. Colour indices are all 0, so every texel keeps endpoint 0. */
+static void test_dxt3(void) {
+    psp_write32(TEX, 0u);
+    psp_write16(TEX + 4, 0xF800);                  /* red */
+    psp_write16(TEX + 6, 0x001F);                  /* blue */
+    for (int y = 0; y < 4; y++) {
+        uint16_t row = 0;
+        for (int x = 0; x < 4; x++) row |= (uint16_t)((y * 4 + x) << (4 * x));
+        psp_write16(TEX + 8 + (uint32_t)y * 2, row);
+    }
+    draw_dxt_block(PSP_TPSM_DXT3);
+    int bad = 0;
+    for (int y = 0; y < 4; y++)
+        for (int x = 0; x < 4; x++) {
+            const uint32_t want = 0x000000FFu | ((uint32_t)(y * 4 + x) * 17u << 24);
+            if (pixel(x, y) != want) bad++;
+        }
+    CHECK(bad == 0, "DXT3 alpha nibbles: %d of 16 texels wrong", bad);
+}
+
+/* DXT5: 3-bit alpha indices in 48 bits (low 32, then high 16), endpoints in
+ * the last two bytes. Colour indices are all 0, so every texel is red. */
+static void test_dxt5(void) {
+    psp_write32(TEX, 0u);
+    psp_write16(TEX + 4, 0xF800);                  /* red */
+    psp_write16(TEX + 6, 0x001F);                  /* blue */
+    uint64_t bits = 0;
+    for (int i = 0; i < 16; i++) bits |= (uint64_t)(i & 7) << (3 * i);
+    psp_write32(TEX + 8, (uint32_t)bits);
+    psp_write16(TEX + 12, (uint16_t)(bits >> 32));
+
+    psp_write8(TEX + 14, 255);                     /* a0 > a1: eight values */
+    psp_write8(TEX + 15, 0);
+    draw_dxt_block(PSP_TPSM_DXT5);
+    int bad = 0;
+    for (int i = 0; i < 16; i++) {
+        const int k = i & 7;
+        const int al = k == 0 ? 255 : k == 1 ? 0 : ((8 - k) * 255) / 7;
+        if (pixel(i & 3, i >> 2) != (0x000000FFu | ((uint32_t)al << 24))) bad++;
+    }
+    CHECK(bad == 0, "DXT5 eight-value alpha: %d of 16 texels wrong", bad);
+
+    psp_write8(TEX + 14, 0);                       /* a0 <= a1: six values */
+    psp_write8(TEX + 15, 255);
+    draw_dxt_block(PSP_TPSM_DXT5);
+    bad = 0;
+    for (int i = 0; i < 16; i++) {
+        const int k = i & 7;
+        const int al = k == 0 ? 0 : k == 1 ? 255 : k < 6 ? (k - 1) * 51 : k == 6 ? 0 : 255;
+        if (pixel(i & 3, i >> 2) != (0x000000FFu | ((uint32_t)al << 24))) bad++;
+    }
+    CHECK(bad == 0, "DXT5 six-value alpha: %d of 16 texels wrong", bad);
 }
 
 /* Through-mode sprites with a depth: GEQUAL keeps the nearer (larger) one,
@@ -773,6 +841,8 @@ int main(void) {
     test_alpha_test_and_blend();
     test_clear_mode_and_scissor();
     test_dxt1();
+    test_dxt3();
+    test_dxt5();
     test_depth();
     test_samples_at_pixel_centres();
     test_coverage_is_at_pixel_centres();
@@ -795,6 +865,8 @@ int main(void) {
         test_alpha_test_and_blend();
         test_clear_mode_and_scissor();
         test_dxt1();
+        test_dxt3();
+        test_dxt5();
         test_depth();
         test_samples_at_pixel_centres();
         test_coverage_is_at_pixel_centres();

@@ -134,20 +134,26 @@ static void hle_CtrlSet(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
 /* EMOTIONALSENSE_SCRIPT presses buttons on a schedule, so a headless run can
  * walk through menus. Entries are "vblank:hexmask:frames" or, relative to a
  * scene, "@scene+N:hexmask:frames": N frames after the first time the scene
- * word holds `scene`. The relative form survives a change in how long the
- * opening runs; the absolute form does not. A value starting with '@' names a
- * file with one entry per line ('#' comments). */
-#define SCRIPT_MAX 64
+ * word holds `scene`. "@scene#k+N:..." waits for the k-th entry into the
+ * scene (k=0 re-arms on every entry), which is what a multi-song run needs.
+ * The relative form survives a change in how long the opening runs; the
+ * absolute form does not. A value starting with '@' names a file with one
+ * entry per line ('#' comments). */
+#define SCRIPT_MAX 256
 typedef struct {
     int relative;
     uint32_t scene;
+    int nth;                        /* 1-based scene entry, 0 = every entry */
     uint64_t delta;                 /* vblank, or frames after the scene */
     uint32_t mask, frames;
     int seen;
+    uint32_t start_count;           /* scene entry this start belongs to */
     uint64_t start;
 } script_entry;
 static script_entry g_script[SCRIPT_MAX];
 static int g_script_n;
+static uint32_t g_scene_last;
+static uint32_t g_scene_count[256];
 
 /* The scene machine object is a fixed heap allocation; its id is at +4.
  * 0x0805E870 is app, so the id is the word below. */
@@ -155,7 +161,7 @@ static int g_script_n;
 
 static void script_load(void) {
     const char *s = getenv("EMOTIONALSENSE_SCRIPT");
-    static char buf[4096];
+    static char buf[16384];
     if (s && *s == '@') {
         FILE *f = fopen(s + 1, "r");
         if (!f) return;
@@ -163,22 +169,27 @@ static void script_load(void) {
         fclose(f);
         buf[n] = 0;
         for (char *p = buf; *p; p++)
-            if (*p == '#') while (*p && *p != '\n') *p++ = ' ';
+            if (*p == '#' && (p == buf || p[-1] == '\n'))
+                while (*p && *p != '\n') *p++ = ' ';
         s = buf;
     }
     if (!s) return;
     while (*s && g_script_n < SCRIPT_MAX) {
         script_entry *e = &g_script[g_script_n];
         unsigned long scene = 0, delta = 0, mask = 0, frames = 0, at = 0;
-        int ok;
+        int nth = 1, ok;
         memset(e, 0, sizeof *e);
-        if (*s == '@')
-            ok = sscanf(s, "@%lu+%lu:%lx:%lu", &scene, &delta, &mask, &frames) == 4;
-        else
+        if (*s == '@') {
+            ok = sscanf(s, "@%lu#%d+%lu:%lx:%lu", &scene, &nth, &delta, &mask, &frames) == 5;
+            if (!ok)
+                ok = sscanf(s, "@%lu+%lu:%lx:%lu", &scene, &delta, &mask, &frames) == 4;
+        } else {
             ok = sscanf(s, "%lu:%lx:%lu", &at, &mask, &frames) == 3;
+        }
         if (ok) {
             e->relative = (*s == '@');
             e->scene = (uint32_t)scene;
+            e->nth = nth;
             e->delta = e->relative ? delta : at;
             e->mask = (uint32_t)mask;
             e->frames = (uint32_t)frames;
@@ -200,14 +211,23 @@ static void hle_ReadBufferPositive(void) {
     if (g_script_n) {
         uint64_t vb = psp_display_vblanks();
         uint32_t scene = psp_read32(SCENE_WORD);
+        if (scene && scene != g_scene_last) g_scene_count[scene & 0xFFu]++;
+        g_scene_last = scene;
         for (int i = 0; i < g_script_n; i++) {
             script_entry *e = &g_script[i];
             uint64_t at;
             if (e->relative) {
-                if (!e->seen) {
-                    if (scene != e->scene) continue;
-                    e->seen = 1;
-                    e->start = vb;
+                if (scene != e->scene) continue;
+                uint32_t cnt = g_scene_count[scene & 0xFFu];
+                if (e->nth > 0) {
+                    if (cnt != (uint32_t)e->nth) continue;
+                    if (!e->seen) { e->seen = 1; e->start = vb; }
+                } else {
+                    if (!e->seen || e->start_count != cnt) {
+                        e->seen = 1;
+                        e->start_count = cnt;
+                        e->start = vb;
+                    }
                 }
                 at = e->start + e->delta;
             } else {
@@ -335,8 +355,9 @@ static uint64_t audio_ahead_us(void) {
 static void audio_pace(int ch, uint64_t play_us) {
     if (psp_threadman_clock_virtual()) {
         /* Deterministic runs cannot pace against the host clock: how much audio
-         * is queued would differ from run to run. */
-        psp_threadman_delay(play_us);
+         * is queued would differ from run to run. The frame wait owns the
+         * virtual clock, so only hand over here. */
+        psp_threadman_sleep_real(play_us);
         return;
     }
     if (ch < 0 || ch >= AUDIO_CHANNELS) return;

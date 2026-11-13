@@ -332,6 +332,19 @@ static uint64_t audio_ahead_us(void) {
     return ahead_us;
 }
 
+/* U1: the opening movie's channel keeps the old deadline until U2 explains
+ * why the player cannot leave recovery when its audio runs at the exact rate.
+ * The mixer and the BGM follow the ideal grid. Remove this with U2. */
+static int audio_legacy_ch(void) {
+    static int init, ch = 1;
+    if (!init) {
+        init = 1;
+        const char *e = getenv("EMOTIONALSENSE_AUDIO_LEGACY_CH");
+        if (e) ch = atoi(e);
+    }
+    return ch;
+}
+
 static void audio_pace(int ch, uint64_t play_us) {
     if (psp_threadman_clock_virtual()) {
         /* Deterministic runs cannot pace against the host clock: how much audio
@@ -341,7 +354,15 @@ static void audio_pace(int ch, uint64_t play_us) {
     }
     if (ch < 0 || ch >= AUDIO_CHANNELS) return;
     uint64_t now = host_now_us();
-    if (g_audio_due_us[ch] < now) g_audio_due_us[ch] = now;   /* underrun */
+    if (ch == audio_legacy_ch()) {
+        if (g_audio_due_us[ch] < now) g_audio_due_us[ch] = now;
+    } else if (g_audio_due_us[ch] + play_us < now) {
+        /* A small lateness is made up on the next block: the deadline follows
+         * the ideal grid. Only a real stall (more than one block behind)
+         * restarts it; otherwise every late call becomes a permanent rate
+         * loss, because the next call always arrives after the deadline. */
+        g_audio_due_us[ch] = now;
+    }
     g_audio_due_us[ch] += play_us;
     uint64_t ahead = audio_ahead_us();
     uint64_t t = host_now_us();

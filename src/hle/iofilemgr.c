@@ -510,6 +510,12 @@ static void hle_Devctl(void) {
     psp_ret(0);
 }
 
+/* The anti-copy check at 0x14868 times two raw UMD reads. It requires >=20 ms
+ * for read 1, >=30 ms for read 2, and >=50 ms from the end of CRC 1 through
+ * seek 2 + read 2. Seek 25 + read 35 gives 35/35/60. */
+#define UMD_SEEK_US 25000
+#define UMD_READ_US 35000
+
 static void hle_Ioctl(void) {
     io_file *h = fd_arg();
     uint32_t cmd = psp_arg(1);
@@ -517,12 +523,16 @@ static void hle_Ioctl(void) {
     uint32_t outdata = psp_arg(4), outlen = psp_arg(5);
 
     if (h && h->raw) {
-        if (getenv("PSPRECOMP_TRACE_IO"))
-            fprintf(stderr, "io: ioctl raw cmd 0x%08X in=0x%08X out=0x%08X/%u lba=%llu\n",
-                    cmd, indata, outdata, outlen, (unsigned long long)h->lba);
+        int trace = getenv("PSPRECOMP_TRACE_IO") != NULL;
+        uint64_t t0 = trace ? psp_clock_us() : 0;
         if (cmd == 0x01F100A6u && indata) {
             /* Seek to a 64-bit LBA (input is {u64 lba, u64 pad}). */
             h->lba = (uint64_t)psp_read32(indata) | ((uint64_t)psp_read32(indata + 4) << 32);
+            psp_threadman_sleep_real(UMD_SEEK_US);
+            if (trace)
+                fprintf(stderr, "io: ioctl raw seek lba=%llu dt=%llums\n",
+                        (unsigned long long)h->lba,
+                        (unsigned long long)(psp_clock_us() - t0) / 1000);
             psp_ret(0);
             return;
         }
@@ -533,15 +543,20 @@ static void hle_Ioctl(void) {
             if (bytes > outlen) bytes = outlen;
             uint8_t *tmp = (uint8_t *)malloc(bytes ? bytes : 1);
             if (!tmp) { psp_ret(0x80020190); return; }
-            /* A real UMD seek+read takes tens of ms, and the game rejects a
-             * read that finishes in under 20 ms. */
-            psp_threadman_sleep_real(25000);
+            psp_threadman_sleep_real(UMD_READ_US);
             int got = raw_read(h, tmp, bytes);
             for (int i = 0; i < got; i++) psp_write8(outdata + (uint32_t)i, tmp[i]);
             free(tmp);
+            if (trace)
+                fprintf(stderr, "io: ioctl raw read lba=%llu sectors=%u dt=%llums\n",
+                        (unsigned long long)h->lba, sectors,
+                        (unsigned long long)(psp_clock_us() - t0) / 1000);
             psp_ret((uint32_t)((got + 2047) / 2048));
             return;
         }
+        if (trace)
+            fprintf(stderr, "io: ioctl raw cmd 0x%08X in=0x%08X out=0x%08X/%u lba=%llu (no-op)\n",
+                    cmd, indata, outdata, outlen, (unsigned long long)h->lba);
     }
     psp_ret(0);
 }

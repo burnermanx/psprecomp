@@ -11,20 +11,20 @@
  *   2. Is the sample rate / block pacing in sync? Compare the bucket spacing
  *      (frames) against the rate the game expects: 44100 Hz here.
  *
- * psp_audio_output is the one host sink every guest audio path funnels into, so
- * the histogram and the guest's own block scheduler can both leave the transport
- * here. It owns an SDL2 stream device at 44.1 kHz / int16 / stereo (the PSP's
- * 2-channel 44.1 kHz, int16 output). Self-initialised on the first call. Non
- * blocking: on a full device SDL_QueueAudio simply drops the frame, so the guest
- * can never stall on a silent host.
+ * psp_audio_output is the one host sink every guest audio path funnels into.
+ * It owns ONE SDL2 device at 44.1 kHz / int16 / stereo and a ring per guest
+ * channel; the device callback sums the rings and saturates to int16. That is
+ * what lets two guest threads (keysounds and BGM) mix instead of queueing one
+ * after the other, and what keeps the host from inserting silence between two
+ * blocks of sound: silence only leaves the callback when a ring is empty.
  *
  * The histogram is deliberate dead weight on the hot path: sascore.c already
  * counts liveness via g_samples_nonzero. This is a separate, opt-in
- * proof-of-content hook. Only the two histogram functions do work; each returns
- * 0 on the common path so callers simply fall through.
+ * proof-of-content hook.
  */
 #include "psprecomp/audio_hist.h"
 #include "psprecomp/mem.h"
+#include "psprecomp/hle.h"
 
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_audio.h>
@@ -32,7 +32,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stddef.h>
+#include <string.h>
 #include <pthread.h>
+#include <time.h>
 
 #define HIST_BINS   512        /* magnitude buckets */
 #define FULL_SCALE 32767u       /* int16 peak; dBFS reference */
@@ -43,94 +45,179 @@
 #define AUDIO_OUT_FREQ 44100    /* the PSP's 44.1 kHz soundtrack rate */
 #define AUDIO_OUT_CH   2        /* the PSP output is stereo */
 #define AUDIO_OUT_FMT  AUDIO_S16SYS
+#define AUDIO_CHANNELS 9        /* sceAudio 0-7 plus sceVaudio's channel 8 */
+#define RING_SAMPLES   AUDIO_OUT_FREQ   /* 1 s per channel; the guest paces */
+#define JITTER_SAMPLES (AUDIO_OUT_FREQ * 8 / 1000)   /* measured thread jitter */
+#define MARGIN_SAMPLES (AUDIO_OUT_FREQ * 10 / 1000)  /* safety margin */
+#define END_TIMEOUT_US 100000u  /* a silent channel is considered finished */
 
-static uint64_t g_audio_blocks;   /* guest frames handed to SDL via psp_audio_output */
+typedef struct {
+    int16_t *buf;               /* RING_SAMPLES stereo frames */
+    uint32_t head, tail, count;
+    int active;                 /* prefill done, callback may consume */
+    int stopping;               /* released; drain, then stop */
+    uint32_t target;            /* prefill level in frames */
+    uint32_t block;             /* last block size in frames */
+    uint64_t last_fill_us;
+    uint64_t blocks, underruns, silence, dropped;
+    uint64_t level_sum, level_n;
+    uint32_t level_min, level_max;
+} audio_ring;
+
+static audio_ring g_ring[AUDIO_CHANNELS];
+static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
+static SDL_AudioDeviceID g_dev;
+static int g_dev_state;         /* 0 untried, 1 ok, -1 failed */
+static int g_dev_samples = 1024;
+
+static uint64_t g_audio_blocks;   /* guest frames handed to the sink */
 static uint64_t g_audio_maxblocks;
+static uint64_t g_mag_min = FULL_SCALE;
+static uint64_t g_mag_max;
+static uint64_t g_mag_sum;
+static uint64_t g_calls;
 
-static uint64_t g_mag_min = FULL_SCALE;  /* smallest peak magnitude we have seen */
-static uint64_t g_mag_max;        /* largest peak magnitude we have seen */
-static uint64_t g_mag_sum;        /* summed per-frame peak magnitudes, for a mean */
-static uint64_t g_calls;          /* sample frames folded into the histo */
-static uint64_t g_dropped;        /* blocks dropped because the host queue was full */
-static uint64_t g_underruns[9];   /* per channel: blocks that found the host queue empty */
-static uint64_t g_ch_blocks[9];   /* per channel: blocks written */
-static uint32_t g_ch_samples[9];  /* per channel: last block size in samples */
+static uint64_t host_now_us(void) {
+    struct timespec ts;
+    timespec_get(&ts, TIME_UTC);
+    return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u;
+}
 
-/* Two independent host streams so the guest's two audio threads never
- * interleave blocks in one queue: [0] = sceAudio channels 0-7 (SasCore effects,
- * keysounds), [1] = channel 8 (sceVaudio / BGM). SDL mixes them on the host. */
-#define NSTREAMS 9   /* one host queue per guest channel: the SDL mixes them */
-#define TARGET_QUEUED_BYTES (AUDIO_OUT_FREQ * 4 / 10)  /* ~100 ms target latency */
-#define MAX_QUEUED_BYTES    (AUDIO_OUT_FREQ * 4 * 1)   /* 1.0s maximum queue headroom before drop */
+static int16_t clamp16(int32_t v) {
+    return v > 32767 ? 32767 : v < -32768 ? -32768 : (int16_t)v;
+}
 
-static SDL_AudioDeviceID audio_dev[NSTREAMS];
-static int audio_state;                         /* 0 untried, 1 ok, -1 failed */
-static int audio_dev_failed[NSTREAMS];
-static pthread_mutex_t g_init_lock = PTHREAD_MUTEX_INITIALIZER;
+/* The device callback: sum every active ring into the output, saturating.
+ * A ring is consumed only after its prefill target; if it runs dry while the
+ * guest is still feeding it, that is a real underrun and the channel re-arms.
+ * A ring that stops receiving blocks drains silently and is then retired. */
+static void audio_callback(void *userdata, Uint8 *stream, int len) {
+    (void)userdata;
+    int16_t *out = (int16_t *)stream;
+    int frames = len / 4;
+    memset(out, 0, (size_t)len);
+    uint64_t now = host_now_us();
+
+    pthread_mutex_lock(&g_lock);
+    for (int ch = 0; ch < AUDIO_CHANNELS; ch++) {
+        audio_ring *r = &g_ring[ch];
+        if (!r->active) continue;
+        for (int i = 0; i < frames; i++) {
+            if (r->count == 0) {
+                if (r->stopping || now - r->last_fill_us > END_TIMEOUT_US) {
+                    r->active = 0;
+                    r->stopping = 0;
+                } else {
+                    r->underruns++;
+                    r->silence += (uint64_t)(frames - i);
+                    r->active = 0;      /* re-arm: wait for the target again */
+                }
+                break;
+            }
+            int32_t l = (int32_t)out[2 * i] + r->buf[2 * r->tail];
+            int32_t rr = (int32_t)out[2 * i + 1] + r->buf[2 * r->tail + 1];
+            out[2 * i] = clamp16(l);
+            out[2 * i + 1] = clamp16(rr);
+            r->tail = (r->tail + 1) % RING_SAMPLES;
+            r->count--;
+        }
+        if (r->level_n == 0 || r->count < r->level_min) r->level_min = r->count;
+        if (r->count > r->level_max) r->level_max = r->count;
+        r->level_sum += r->count;
+        r->level_n++;
+    }
+    pthread_mutex_unlock(&g_lock);
+}
+
+static int audio_open(void) {
+    pthread_mutex_lock(&g_lock);
+    if (g_dev_state == 0) {
+        g_dev_state = -1;
+        if (SDL_InitSubSystem(SDL_INIT_AUDIO) != 0) {
+            fprintf(stderr, "psprecomp: SDL_InitSubSystem(AUDIO) failed (%s)\n", SDL_GetError());
+        } else {
+            SDL_AudioSpec want = {
+                .freq = AUDIO_OUT_FREQ,
+                .format = AUDIO_OUT_FMT,
+                .channels = AUDIO_OUT_CH,
+                .samples = 1024,
+                .callback = audio_callback,
+            };
+            SDL_AudioSpec got = { 0 };
+            g_dev = SDL_OpenAudioDevice(NULL, 0, &want, &got, 0);
+            if (!g_dev) {
+                fprintf(stderr, "psprecomp: SDL_OpenAudioDevice failed (%s)\n", SDL_GetError());
+            } else {
+                g_dev_samples = got.samples > 0 ? got.samples : want.samples;
+                SDL_PauseAudioDevice(g_dev, 0);   /* devices open paused */
+                g_dev_state = 1;
+            }
+        }
+    }
+    int ok = g_dev_state == 1;
+    pthread_mutex_unlock(&g_lock);
+    return ok;
+}
+
+void psp_audio_channel_stop(int channel) {
+    if (channel < 0 || channel >= AUDIO_CHANNELS) return;
+    pthread_mutex_lock(&g_lock);
+    audio_ring *r = &g_ring[channel];
+    r->stopping = 1;
+    if (r->count == 0) {
+        r->active = 0;
+        r->stopping = 0;
+    }
+    pthread_mutex_unlock(&g_lock);
+}
 
 void psprecomp_audio_reset(void) {
+    pthread_mutex_lock(&g_lock);
+    for (int c = 0; c < AUDIO_CHANNELS; c++) {
+        audio_ring *r = &g_ring[c];
+        r->head = r->tail = r->count = 0;
+        r->active = r->stopping = 0;
+        r->target = r->block = 0;
+        r->last_fill_us = 0;
+        r->blocks = r->underruns = r->silence = r->dropped = 0;
+        r->level_sum = r->level_n = 0;
+        r->level_min = UINT32_MAX;
+        r->level_max = 0;
+    }
     g_audio_blocks = 0;
     g_audio_maxblocks = 0;
     g_mag_min = FULL_SCALE;
     g_mag_max = 0;
     g_mag_sum = 0;
     g_calls = 0;
-    g_dropped = 0;
-    for (int c = 0; c < 9; c++) g_underruns[c] = g_ch_blocks[c] = g_ch_samples[c] = 0;
+    pthread_mutex_unlock(&g_lock);
 }
 
 void psprecomp_audio_report(void) {
     double mean = g_calls ? (double)g_mag_sum / (double)g_calls : 0.0;
-    for (int c = 0; c < 9; c++)
-        if (g_ch_blocks[c])
-            fprintf(stderr, "psprecomp_audio_report: ch%d blocks=%llu samples/block=%u underruns=%llu\n",
-                    c, (unsigned long long)g_ch_blocks[c], g_ch_samples[c],
-                    (unsigned long long)g_underruns[c]);
-    fprintf(stderr, "psprecomp_audio_report: blocks=%llu dropped=%llu maxblocks=%llu frames=%llu "
+    pthread_mutex_lock(&g_lock);
+    for (int c = 0; c < AUDIO_CHANNELS; c++) {
+        audio_ring *r = &g_ring[c];
+        if (!r->blocks) continue;
+        double avg = r->level_n ? (double)r->level_sum / (double)r->level_n : 0.0;
+        fprintf(stderr,
+                "psprecomp_audio_report: ch%d blocks=%llu samples/block=%u underruns=%llu "
+                "silence=%llu dropped=%llu ring_min=%u ring_avg=%.0f ring_max=%u avg_ms=%.1f\n",
+                c, (unsigned long long)r->blocks, r->block,
+                (unsigned long long)r->underruns, (unsigned long long)r->silence,
+                (unsigned long long)r->dropped,
+                r->level_min == UINT32_MAX ? 0 : r->level_min, avg, r->level_max,
+                avg * 1000.0 / AUDIO_OUT_FREQ);
+    }
+    pthread_mutex_unlock(&g_lock);
+    fprintf(stderr, "psprecomp_audio_report: blocks=%llu maxblocks=%llu frames=%llu "
                 "mean_dBFS=%.1f max_dBFS=%.1f min_dBFS=%.1f\n",
             (unsigned long long)g_audio_blocks,
-            (unsigned long long)g_dropped,
             (unsigned long long)g_audio_maxblocks,
             (unsigned long long)g_calls,
             mean > 0.0 ? 20.0 * log10(mean / (double)FULL_SCALE) : -INFINITY,
             g_mag_max ? 20.0 * log10((double)g_mag_max / (double)FULL_SCALE) : -INFINITY,
             g_mag_min ? 20.0 * log10((double)g_mag_min / (double)FULL_SCALE) : -INFINITY);
-}
-
-/* Open the SDL audio subsystem once, and one device per guest channel on first
- * use. Blocks from two channels must not share a queue: SDL_QueueAudio only
- * appends, so channels sharing a queue play one after the other (silence from
- * a mixer thread interleaved into a video's audio) instead of being mixed. */
-static int audio_dev_open(int idx) {
-    pthread_mutex_lock(&g_init_lock);
-    if (audio_state == 0) {
-        audio_state = -1;
-        if (SDL_InitSubSystem(SDL_INIT_AUDIO) != 0) {
-            fprintf(stderr, "psprecomp: SDL_InitSubSystem(AUDIO) failed (%s)\n", SDL_GetError());
-        } else {
-            audio_state = 1;
-        }
-    }
-    int ok = audio_state == 1;
-    if (ok && !audio_dev[idx]) {
-        SDL_AudioSpec want = {
-            .freq = AUDIO_OUT_FREQ,
-            .format = AUDIO_OUT_FMT,
-            .channels = AUDIO_OUT_CH,
-            .samples = 1024,
-        };
-        SDL_AudioSpec got = { 0 };
-        audio_dev[idx] = SDL_OpenAudioDevice(NULL, 0, &want, &got, 0);
-        if (!audio_dev[idx]) {
-            fprintf(stderr, "psprecomp: SDL_OpenAudioDevice(ch %d) failed (%s)\n", idx, SDL_GetError());
-            audio_dev_failed[idx] = 1;
-        } else {
-            SDL_PauseAudioDevice(audio_dev[idx], 0);   /* devices open paused */
-        }
-    }
-    ok = audio_dev[idx] != 0;
-    pthread_mutex_unlock(&g_init_lock);
-    return ok;
 }
 
 /* PSP volumes run 0..0x8000 (unity). */
@@ -139,70 +226,62 @@ static int scale_vol(int v) { return v < 0 ? 0 : v > 0x8000 ? 0x8000 : v; }
 void psp_audio_output(int channel, int leftvol, int rightvol,
                       const int16_t *buf, int samples) {
     if (!buf || samples <= 0) return;
+    if (!audio_open()) return;
 
-    const int di = channel < 0 ? 0 : channel >= NSTREAMS ? NSTREAMS - 1 : channel;
-    if (audio_dev_failed[di]) return;
-    if (!audio_dev[di] && !audio_dev_open(di)) return;
-
-    const SDL_AudioDeviceID dev = audio_dev[di];
+    const int ci = channel < 0 ? 0 : channel >= AUDIO_CHANNELS ? AUDIO_CHANNELS - 1 : channel;
     const int lv = scale_vol(leftvol), rv = scale_vol(rightvol);
-    const uint64_t bytes = (uint64_t)samples * 4;
-
-    /* Never stall the guest on a slow host, but give generous buffer (1.0s)
-     * so that thread scheduling fluctuations never cause crackling or dropped blocks. */
-    if (SDL_GetQueuedAudioSize(dev) > MAX_QUEUED_BYTES) { g_dropped++; return; }
-
-    const int ci = channel < 0 ? 0 : channel > 8 ? 8 : channel;
-    g_ch_blocks[ci]++; g_ch_samples[ci] = (uint32_t)samples;
-    if (g_ch_blocks[ci] > 8 && SDL_GetQueuedAudioSize(dev) == 0)
-        g_underruns[ci]++;
-
-    /* Keep a stable cushion instead of refilling a whole 70 ms whenever the
-     * queue happens to be empty: a full refill after every underrun pushes an
-     * intermittent channel (keysounds, voices) further behind the music. Top up
-     * only the missing part, so the queue level - and the latency - stays put.
-     * The floor is one block plus 10 ms: a 2048-sample block is 46 ms, so a
-     * 40 ms target alone would leave no cushion and underrun every block. */
-    static int16_t *silence;
-    static int configured_samples = -1;
-    static int silence_cap;
-    if (configured_samples < 0) {
-        const char *e = getenv("EMOTIONALSENSE_AUDIO_LATENCY_MS");
-        int ms = e ? atoi(e) : 40;
-        configured_samples = ms > 0 ? ms * AUDIO_OUT_FREQ / 1000 : 0;
-        silence_cap = AUDIO_OUT_FREQ / 2;   /* 500 ms, enough for any block */
-        if (configured_samples > 0)
-            silence = calloc((size_t)silence_cap * AUDIO_OUT_CH, sizeof(int16_t));
-    }
-    int16_t stack_buf[4096 * 2];
-    int16_t *tmp = samples <= 4096 ? stack_buf : (int16_t *)malloc((size_t)bytes);
-    if (!tmp) return;
     uint64_t peak = 0, sum = 0;
+
+    pthread_mutex_lock(&g_lock);
+    audio_ring *r = &g_ring[ci];
+    if (!r->buf) r->buf = calloc((size_t)RING_SAMPLES * 2, sizeof(int16_t));
+    if (!r->buf) { pthread_mutex_unlock(&g_lock); return; }
+
+    if ((uint32_t)samples > RING_SAMPLES - r->count) {
+        r->dropped++;
+        pthread_mutex_unlock(&g_lock);
+        return;
+    }
+
     for (int i = 0; i < samples; i++) {
         int l = ((int)buf[2 * i]     * lv) >> 15;
-        int r = ((int)buf[2 * i + 1] * rv) >> 15;
-        tmp[2 * i]     = (int16_t)l;
-        tmp[2 * i + 1] = (int16_t)r;
-        uint64_t m = (uint64_t)abs(l), mr = (uint64_t)abs(r);
+        int rr = ((int)buf[2 * i + 1] * rv) >> 15;
+        r->buf[2 * r->head]     = (int16_t)l;
+        r->buf[2 * r->head + 1] = (int16_t)rr;
+        r->head = (r->head + 1) % RING_SAMPLES;
+        uint64_t m = (uint64_t)abs(l), mr = (uint64_t)abs(rr);
         if (mr > m) m = mr;
         sum += m;
         if (m > peak) peak = m;
     }
-    SDL_QueueAudio(dev, tmp, (uint32_t)bytes);
-    if (tmp != stack_buf) free(tmp);
+    r->count += (uint32_t)samples;
+    r->block = (uint32_t)samples;
+    r->last_fill_us = host_now_us();
+    r->blocks++;
 
-    /* Queue the block first, then top up the cushion: if the queue was empty,
-     * the block starts immediately instead of waiting behind the silence. */
-    int floor = samples + AUDIO_OUT_FREQ / 100;   /* one block + 10 ms */
-    int target = configured_samples > floor ? configured_samples : floor;
-    int queued_samples = (int)(SDL_GetQueuedAudioSize(dev) / 4);
-    if (silence && queued_samples < target) {
-        int add = target - queued_samples;
-        if (add > silence_cap) add = silence_cap;
-        SDL_QueueAudio(dev, silence, (uint32_t)add * 4);
+    /* Prefill: the callback only starts consuming once the ring holds the
+     * target. The target is the device period plus the measured thread jitter
+     * and a margin, never less than one guest block, with the configured
+     * latency as a floor. */
+    if (!r->target) {
+        const char *e = getenv("EMOTIONALSENSE_AUDIO_LATENCY_MS");
+        int ms = e ? atoi(e) : 40;
+        uint32_t cfg = ms > 0 ? (uint32_t)ms * AUDIO_OUT_FREQ / 1000 : 0;
+        uint32_t base = (uint32_t)g_dev_samples + JITTER_SAMPLES + MARGIN_SAMPLES;
+        uint32_t target = base > cfg ? base : cfg;
+        /* One guest block is the unit the guest writes; the ring needs that
+         * block plus the same jitter and margin, or the callback drains it
+         * before the next block arrives (the 2048-sample BGM block is 46 ms,
+         * longer than the device period). */
+        uint32_t floor = r->block + JITTER_SAMPLES + MARGIN_SAMPLES;
+        if (target < floor) target = floor;
+        if (target > RING_SAMPLES / 2) target = RING_SAMPLES / 2;
+        r->target = target;
     }
+    if (!r->active && !r->stopping && r->count >= r->target) r->active = 1;
+    pthread_mutex_unlock(&g_lock);
 
-    /* Histogram (diagnostic only; racy counters are fine across two threads). */
+    /* Histogram (diagnostic only; racy counters are fine across threads). */
     g_mag_sum += sum;
     g_calls += (uint64_t)samples;
     if (peak > g_mag_max) g_mag_max = peak;

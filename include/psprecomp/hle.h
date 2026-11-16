@@ -176,6 +176,9 @@ int  psp_exit_requested(void);
 void psp_ctrl_set(uint32_t buttons, uint8_t ax, uint8_t ay);
 uint64_t psp_audio_blocks(void);
 void psp_audio_output(int channel, int leftvol, int rightvol, const int16_t *buf, int samples);
+/* The guest released a channel: let its ring drain and retire it without
+ * counting the tail as an underrun. */
+void psp_audio_channel_stop(int channel);
 
 void psp_threadman_init(void);
 void psp_threadman_register(void);

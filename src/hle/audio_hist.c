@@ -69,6 +69,7 @@ static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static SDL_AudioDeviceID g_dev;
 static int g_dev_state;         /* 0 untried, 1 ok, -1 failed */
 static int g_dev_samples = 1024;
+static uint32_t g_target;       /* common prefill for every channel, frames */
 
 static uint64_t g_audio_blocks;   /* guest frames handed to the sink */
 static uint64_t g_audio_maxblocks;
@@ -186,6 +187,7 @@ void psprecomp_audio_reset(void) {
     }
     g_audio_blocks = 0;
     g_audio_maxblocks = 0;
+    g_target = 0;
     g_mag_min = FULL_SCALE;
     g_mag_max = 0;
     g_mag_sum = 0;
@@ -259,25 +261,29 @@ void psp_audio_output(int channel, int leftvol, int rightvol,
     r->last_fill_us = host_now_us();
     r->blocks++;
 
-    /* Prefill: the callback only starts consuming once the ring holds the
-     * target. The target is the device period plus the measured thread jitter
-     * and a margin, never less than one guest block, with the configured
-     * latency as a floor. */
-    if (!r->target) {
+    /* Prefill: one target for every channel, so keysounds and BGM have the
+     * same latency. The largest guest block sets the floor (2048 frames =
+     * 46 ms), plus the device period, measured jitter and margin. */
+    if (!g_target) {
         const char *e = getenv("EMOTIONALSENSE_AUDIO_LATENCY_MS");
         int ms = e ? atoi(e) : 40;
         uint32_t cfg = ms > 0 ? (uint32_t)ms * AUDIO_OUT_FREQ / 1000 : 0;
         uint32_t base = (uint32_t)g_dev_samples + JITTER_SAMPLES + MARGIN_SAMPLES;
-        uint32_t target = base > cfg ? base : cfg;
-        /* One guest block is the unit the guest writes; the ring needs that
-         * block plus the same jitter and margin, or the callback drains it
-         * before the next block arrives (the 2048-sample BGM block is 46 ms,
-         * longer than the device period). */
-        uint32_t floor = r->block + JITTER_SAMPLES + MARGIN_SAMPLES;
-        if (target < floor) target = floor;
-        if (target > RING_SAMPLES / 2) target = RING_SAMPLES / 2;
-        r->target = target;
+        g_target = base > cfg ? base : cfg;
     }
+    uint32_t floor = r->block + JITTER_SAMPLES + MARGIN_SAMPLES;
+    if (floor > g_target) {
+        g_target = floor;
+        for (int c = 0; c < AUDIO_CHANNELS; c++) {
+            audio_ring *o = &g_ring[c];
+            if (o->target && o->target < g_target) {
+                o->target = g_target;
+                o->active = 0;   /* re-prefill to the new common target */
+            }
+        }
+    }
+    if (g_target > RING_SAMPLES / 2) g_target = RING_SAMPLES / 2;
+    if (!r->target) r->target = g_target;
     if (!r->active && !r->stopping && r->count >= r->target) r->active = 1;
     pthread_mutex_unlock(&g_lock);
 

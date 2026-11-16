@@ -3,7 +3,7 @@
 #include "psprecomp/window.h"
 #include "psprecomp/hle.h"
 
-#ifdef _WIN32
+#if defined(_WIN32) && !defined(PSPRECOMP_SDL2)
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -256,6 +256,9 @@ static uint32_t pad(SDL_GameController *gc, uint8_t *ax, uint8_t *ay) {
 
 static int window_main(void *arg) {
     (void)arg;
+    /* Without this Windows reports a scaled size and blurs the nearest-neighbour
+     * pixels; the hint is ignored off Windows. */
+    SDL_SetHint(SDL_HINT_WINDOWS_DPI_AWARENESS, "permonitorv2");
     if (SDL_InitSubSystem(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER) != 0) {
         fprintf(stderr, "psprecomp: SDL_Init: %s\n", SDL_GetError());
         atomic_store(&g_closed, 1); atomic_store(&g_ready, -1);
@@ -286,6 +289,7 @@ static int window_main(void *arg) {
     }
     SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "0");          /* nearest: crisp pixels */
     SDL_RenderSetLogicalSize(ren, W, H);                       /* keep the aspect, black bars */
+    SDL_RenderSetIntegerScale(ren, SDL_TRUE);                  /* whole pixels only */
     atomic_store(&g_ready, 1);
 
     SDL_GameController *gc = NULL;
@@ -318,7 +322,8 @@ static int window_main(void *arg) {
                 } else if (ev.key.keysym.sym == SDLK_F12) {
                     const char *dir = getenv("EMOTIONALSENSE_SHOT_DIR");
                     char path[512];
-                    snprintf(path, sizeof path, "%s/f12_%llu.ppm", dir ? dir : "/tmp",
+                    snprintf(path, sizeof path, "%s/f12_%llu.ppm",
+                             dir ? dir : psp_host_temp_dir(),
                              (unsigned long long)psp_display_vblanks());
                     psp_display_capture(path);
                     fprintf(stderr, "window: captured %s\n", path);

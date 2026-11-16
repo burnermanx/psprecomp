@@ -136,14 +136,20 @@ static void hle_SetMode(void) {
 
 /* EMOTIONALSENSE_SHOT=<vb,vb,...> and EMOTIONALSENSE_SHOT_EVERY=N capture the
  * presented frame at those vblanks into EMOTIONALSENSE_SHOT_DIR (default
- * /tmp) as frame_<vb>.ppm. */
+ * %TEMP% on Windows, /tmp elsewhere) as frame_<vb>.ppm. */
+const char *psp_host_temp_dir(void) {
+    const char *d = getenv("TEMP");
+    return d && *d ? d : "/tmp";
+}
+
 static void shot_if_wanted(void) {
     static int init;
     static char spec[512];
     static long every;
-    static char dir[512] = "/tmp";
+    static char dir[512];
     if (!init) {
         init = 1;
+        snprintf(dir, sizeof dir, "%s", psp_host_temp_dir());
         const char *s = getenv("EMOTIONALSENSE_SHOT");
         if (s) snprintf(spec, sizeof spec, "%s", s);
         const char *e = getenv("EMOTIONALSENSE_SHOT_EVERY");

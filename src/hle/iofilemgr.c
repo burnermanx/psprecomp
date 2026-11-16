@@ -15,6 +15,23 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* ISO offsets pass 2 GB, where Windows' 32-bit long truncates. */
+static int io_seek(FILE *f, int64_t off, int whence) {
+#if defined(_WIN32)
+    return _fseeki64(f, off, whence);
+#else
+    return fseeko(f, (off_t)off, whence);
+#endif
+}
+
+static int64_t io_tell(FILE *f) {
+#if defined(_WIN32)
+    return _ftelli64(f);
+#else
+    return (int64_t)ftello(f);
+#endif
+}
+
 #ifdef _WIN32
 #  include <io.h>
 #  include <direct.h>
@@ -72,7 +89,10 @@ void psp_io_set_root(const char *root) {
     snprintf(g_root, sizeof g_root, "%s", root ? root : ".");
 }
 
+static void escape_name(const char *in, char *out, size_t cap);
+
 const char *psp_io_root(void) { return g_root; }
+void psp_io_escape_name(const char *in, char *out, size_t cap) { escape_name(in, out, cap); }
 
 void psp_io_reset(void) {
     for (int i = 0; i < MAX_FILES; i++) {
@@ -90,6 +110,55 @@ void psp_io_init(void) { g_root[0] = '\0'; psp_io_reset(); }
 
 uint64_t psp_io_bytes_read(void) { return g_bytes_read; }
 
+/* Windows cannot create `<`, `>`, `:`, `"`, `|`, `?` or `*` in a file name.
+ * The game's save folder is ULKS46236<>, so escape those bytes as %XX on the
+ * host and decode them again in Dread. */
+static void escape_name(const char *in, char *out, size_t cap) {
+#ifdef _WIN32
+    static const char hex[] = "0123456789ABCDEF";
+    size_t o = 0;
+    for (const char *p = in; *p && o + 4 < cap; p++) {
+        unsigned char c = (unsigned char)*p;
+        if (c == '<' || c == '>' || c == ':' || c == '"' ||
+            c == '|' || c == '?' || c == '*') {
+            out[o++] = '%';
+            out[o++] = hex[c >> 4];
+            out[o++] = hex[c & 15];
+        } else {
+            out[o++] = (char)c;
+        }
+    }
+    out[o] = 0;
+#else
+    snprintf(out, cap, "%s", in);
+#endif
+}
+
+static void unescape_name(const char *in, char *out, size_t cap) {
+#ifdef _WIN32
+    size_t o = 0;
+    for (const char *p = in; *p && o + 1 < cap; p++) {
+        if (p[0] == '%' && p[1] && p[2]) {
+            int hi = p[1] >= '0' && p[1] <= '9' ? p[1] - '0' :
+                     p[1] >= 'A' && p[1] <= 'F' ? p[1] - 'A' + 10 :
+                     p[1] >= 'a' && p[1] <= 'f' ? p[1] - 'a' + 10 : -1;
+            int lo = p[2] >= '0' && p[2] <= '9' ? p[2] - '0' :
+                     p[2] >= 'A' && p[2] <= 'F' ? p[2] - 'A' + 10 :
+                     p[2] >= 'a' && p[2] <= 'f' ? p[2] - 'a' + 10 : -1;
+            if (hi >= 0 && lo >= 0) {
+                out[o++] = (char)(hi * 16 + lo);
+                p += 2;
+                continue;
+            }
+        }
+        out[o++] = *p;
+    }
+    out[o] = 0;
+#else
+    snprintf(out, cap, "%s", in);
+#endif
+}
+
 /* Rewrite a PSP path into a host path. The device prefix becomes a
  * subdirectory so a disc image and a memory-stick image can coexist under one
  * root without colliding. */
@@ -104,7 +173,9 @@ static void map_path(const char *guest, char *out, size_t cap) {
     else if (!strncmp(p, "host0:", 6)) { p += 6; sub = "host"; }
 
     while (*p == '/' || *p == '\\') p++;
-    snprintf(out, cap, "%s/%s/%s", g_root, sub, p);
+    char esc[1024];
+    escape_name(p, esc, sizeof esc);
+    snprintf(out, cap, "%s/%s/%s", g_root, sub, esc);
 }
 
 static void hle_Open(void) {
@@ -192,7 +263,7 @@ static int raw_read(io_file *h, uint8_t *dst, uint32_t bytes) {
     map_path(guest, host, sizeof host);
     FILE *f = fopen(host, "rb");
     if (!f) return 0;
-    fseek(f, (long)((h->lba - base) * 2048), SEEK_SET);
+    io_seek(f, (int64_t)(h->lba - base) * 2048, SEEK_SET);
     size_t got = fread(dst, 1, bytes, f);
     fclose(f);
     h->lba += (got + 2047) / 2048;
@@ -275,11 +346,11 @@ static void hle_Lseek(void) {
     }
 
     int w = (whence == 1) ? SEEK_CUR : (whence == 2) ? SEEK_END : SEEK_SET;
-    if (fseek(h->f, (long)(int64_t)off, w) != 0) { psp_ret(0xFFFFFFFFu); return; }
+    if (io_seek(h->f, (int64_t)off, w) != 0) { psp_ret(0xFFFFFFFFu); return; }
 
-    long pos = ftell(h->f);
+    int64_t pos = io_tell(h->f);
     psp_cpu.r[PSP_REG_V0] = (uint32_t)pos;
-    psp_cpu.r[PSP_REG_V1] = 0;
+    psp_cpu.r[PSP_REG_V1] = (uint32_t)(pos >> 32);
 }
 
 static void hle_Rename(void) {
@@ -347,10 +418,12 @@ static void hle_Dread(void) {
 #endif
 
     /* SceIoDirent: a 52-byte SceIoStat, then char d_name[256]. */
+    char guest_name[256];
+    unescape_name(name, guest_name, sizeof guest_name);
     for (int i = 0; i < 52; i++) psp_write8(dirent + (uint32_t)i, 0);
     uint32_t at = dirent + 52;
-    for (uint32_t i = 0; i < 255 && name[i]; i++) psp_write8(at + i, (uint8_t)name[i]);
-    psp_write8(at + (uint32_t)strlen(name), 0);
+    for (uint32_t i = 0; i < 255 && guest_name[i]; i++) psp_write8(at + i, (uint8_t)guest_name[i]);
+    psp_write8(at + (uint32_t)strlen(guest_name), 0);
 
     psp_ret(1);                       /* more entries may follow */
 }

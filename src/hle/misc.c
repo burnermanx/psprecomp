@@ -166,7 +166,7 @@ static void script_load(void) {
     static char buf[16384];
     if (s && *s == '@') {
         FILE *f = fopen(s + 1, "r");
-        if (!f) return;
+        if (!f) { fprintf(stderr, "script: cannot open %s\n", s + 1); return; }
         size_t n = fread(buf, 1, sizeof buf - 1, f);
         fclose(f);
         buf[n] = 0;

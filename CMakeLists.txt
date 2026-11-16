@@ -74,10 +74,11 @@ if(WIN32)
     target_link_libraries(psprecomp PUBLIC xinput9_1_0)   # the window's controller input
 endif()
 
-# SDL2 window/input backend for non-Windows hosts. Opt-in so the core keeps
-# building with nothing installed.
-option(PSPRECOMP_SDL2 "Build the SDL2 window backend (Linux, macOS)" OFF)
-if(PSPRECOMP_SDL2 AND NOT WIN32)
+# SDL2 window/input backend. Opt-in so the core keeps building with nothing
+# installed. Windows uses it too: audio already goes through SDL2 there, and
+# one window/input path is less to get wrong.
+option(PSPRECOMP_SDL2 "Build the SDL2 window backend (Linux, macOS, Windows)" OFF)
+if(PSPRECOMP_SDL2)
     find_package(SDL2 REQUIRED)
     target_compile_definitions(psprecomp PUBLIC PSPRECOMP_SDL2=1)
     if(TARGET SDL2::SDL2)
@@ -104,7 +105,11 @@ endif()
 
 # --- the recompiler -----------------------------------------------------------
 
-add_subdirectory(tools/allegrexrecomp)
+# The recompiler runs on the build machine. A cross build reuses the C that a
+# native build already generated (EMOTIONALSENSE_GEN_DIR).
+if(NOT CMAKE_CROSSCOMPILING)
+    add_subdirectory(tools/allegrexrecomp)
+endif()
 
 # --- tests (only when psprecomp is the top-level project, not a submodule) -----
 

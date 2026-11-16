@@ -20,7 +20,14 @@ static void host_thread_error(void) {
 #include <process.h>
 #include <mmsystem.h>
 
+/* MinGW's GCC ignores __declspec(thread) (it warns "thread attribute
+ * directive ignored" and leaves a plain global). __thread emits the PE TLS
+ * directory. MSVC keeps __declspec(thread). */
+#if defined(_MSC_VER)
 #define HOST_TLS __declspec(thread)
+#else
+#define HOST_TLS __thread
+#endif
 typedef HANDLE host_thread;
 typedef SRWLOCK host_mutex;
 typedef CONDITION_VARIABLE host_cond;

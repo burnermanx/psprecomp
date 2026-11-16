@@ -134,14 +134,16 @@ static void hle_CtrlSet(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
 /* EMOTIONALSENSE_SCRIPT presses buttons on a schedule, so a headless run can
  * walk through menus. Entries are "vblank:hexmask:frames" or, relative to a
  * scene, "@scene+N:hexmask:frames": N frames after the first time the scene
- * word holds `scene`. "@scene#k+N:..." waits for the k-th entry into the
- * scene (k=0 re-arms on every entry), which is what a multi-song run needs.
- * The relative form survives a change in how long the opening runs; the
- * absolute form does not. A value starting with '@' names a file with one
- * entry per line ('#' comments). */
+ * word holds `scene`, whatever the current scene is by then. "@scene#k+N:..."
+ * is the stricter form: it only fires while the current scene is still that
+ * scene, and only on the k-th entry (k=0 re-arms on every entry), which is
+ * what a multi-song run needs. The relative form survives a change in how long
+ * the opening runs; the absolute form does not. A value starting with '@'
+ * names a file with one entry per line ('#' comments). */
 #define SCRIPT_MAX 256
 typedef struct {
     int relative;
+    int has_nth;                    /* @scene#k+N: restrict to the k-th entry */
     uint32_t scene;
     int nth;                        /* 1-based scene entry, 0 = every entry */
     uint64_t delta;                 /* vblank, or frames after the scene */
@@ -181,7 +183,8 @@ static void script_load(void) {
         memset(e, 0, sizeof *e);
         if (*s == '@') {
             ok = sscanf(s, "@%lu#%d+%lu:%lx:%lu", &scene, &nth, &delta, &mask, &frames) == 5;
-            if (!ok)
+            if (ok) e->has_nth = 1;
+            else
                 ok = sscanf(s, "@%lu+%lu:%lx:%lu", &scene, &delta, &mask, &frames) == 4;
         } else {
             ok = sscanf(s, "%lu:%lx:%lu", &at, &mask, &frames) == 3;
@@ -217,19 +220,32 @@ static void hle_ReadBufferPositive(void) {
             script_entry *e = &g_script[i];
             uint64_t at;
             if (e->relative) {
-                if (scene != e->scene) continue;
-                uint32_t cnt = g_scene_count[scene & 0xFFu];
-                if (e->nth > 0) {
-                    if (cnt != (uint32_t)e->nth) continue;
-                    if (!e->seen) { e->seen = 1; e->start = vb; }
-                } else {
-                    if (!e->seen || e->start_count != cnt) {
+                uint32_t cnt = g_scene_count[e->scene & 0xFFu];
+                if (!e->has_nth) {
+                    /* @scene+N: N frames after the first time the scene
+                     * appeared, whatever the current scene is. */
+                    if (!e->seen && scene == e->scene) {
                         e->seen = 1;
-                        e->start_count = cnt;
                         e->start = vb;
                     }
+                    if (!e->seen) continue;
+                    at = e->start + e->delta;
+                } else {
+                    /* @scene#k+N: only while the current scene is that scene,
+                     * and only on the k-th entry (k=0 re-arms every entry). */
+                    if (scene != e->scene) continue;
+                    if (e->nth > 0) {
+                        if (cnt != (uint32_t)e->nth) continue;
+                        if (!e->seen) { e->seen = 1; e->start = vb; }
+                    } else {
+                        if (!e->seen || e->start_count != cnt) {
+                            e->seen = 1;
+                            e->start_count = cnt;
+                            e->start = vb;
+                        }
+                    }
+                    at = e->start + e->delta;
                 }
-                at = e->start + e->delta;
             } else {
                 at = e->delta;
             }
@@ -307,6 +323,7 @@ static void hle_ChRelease(void) {
     int32_t ch = (int32_t)psp_arg(0);
     if (ch < 0 || ch >= AUDIO_CHANNELS) { psp_ret(0x80000001); return; }
     g_audio[ch].reserved = 0;
+    psp_audio_channel_stop(ch);
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
@@ -352,6 +369,15 @@ static uint64_t audio_ahead_us(void) {
     return ahead_us;
 }
 
+/* A late block is made up on the next one. The grid only restarts after a
+ * real stall. The tolerance is time, not one block: the keysound channel
+ * (256 samples) plays a block in 5.8 ms, and in gameplay the mixer thread
+ * often waits 10-18 ms for the CPU, so "one block late" restarted the grid
+ * several times a second and lost 11% of the audio. 100 ms is longer than
+ * any scheduler gap measured and still short enough to recover from a real
+ * stall without replaying old audio. */
+#define AUDIO_GRID_TOLERANCE_US 100000u
+
 static void audio_pace(int ch, uint64_t play_us) {
     if (psp_threadman_clock_virtual()) {
         /* Deterministic runs cannot pace against the host clock: how much audio
@@ -362,11 +388,7 @@ static void audio_pace(int ch, uint64_t play_us) {
     }
     if (ch < 0 || ch >= AUDIO_CHANNELS) return;
     uint64_t now = host_now_us();
-    /* A small lateness is made up on the next block: the deadline follows the
-     * ideal grid. Only a real stall (more than one block behind) restarts it;
-     * otherwise every late call becomes a permanent rate loss, because the next
-     * call always arrives after the deadline. */
-    if (g_audio_due_us[ch] + play_us < now) g_audio_due_us[ch] = now;
+    if (g_audio_due_us[ch] + AUDIO_GRID_TOLERANCE_US < now) g_audio_due_us[ch] = now;
     g_audio_due_us[ch] += play_us;
     uint64_t ahead = audio_ahead_us();
     uint64_t t = host_now_us();

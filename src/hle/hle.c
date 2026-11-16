@@ -6,8 +6,18 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #define HLE_MAX 512
+
+/* Host microseconds on the trace line. The vblank alone is 16.7 ms, too
+ * coarse to measure a 5.8 ms keysound block; audio_rate.py uses this stamp
+ * to compare each block with the ideal grid. */
+static uint64_t trace_now_us(void) {
+    struct timespec ts;
+    timespec_get(&ts, TIME_UTC);
+    return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u;
+}
 
 static psp_hle_entry g_entry[HLE_MAX];
 static psp_hle_fn    g_fn[HLE_MAX];
@@ -140,11 +150,11 @@ void psp_hle_call(uint32_t nid) {
         if (g_entry[i].nid == nid) {
             g_calls[i]++;
             if (trace_uid >= 0 && (int)psp_threadman_current_uid() == trace_uid)
-                fprintf(stderr, "hle[%u@%llu]: %s(0x%08X,0x%08X,0x%08X,0x%08X) ra=0x%08X\n",
+                fprintf(stderr, "hle[%u@%llu]: %s(0x%08X,0x%08X,0x%08X,0x%08X) ra=0x%08X t=%llu\n",
                         psp_threadman_current_uid(), (unsigned long long)psp_display_vblanks(), g_entry[i].name,
                         psp_cpu.r[PSP_REG_A0], psp_cpu.r[PSP_REG_A1],
                         psp_cpu.r[PSP_REG_A2], psp_cpu.r[PSP_REG_A3],
-                        psp_cpu.r[PSP_REG_RA]);
+                        psp_cpu.r[PSP_REG_RA], (unsigned long long)trace_now_us());
             g_fn[i]();
             if (psp_cpu.r[PSP_REG_V0] == 0) note_zero(nid, g_entry[i].name);
             return;

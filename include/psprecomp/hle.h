@@ -144,8 +144,12 @@ const char *psp_host_temp_dir(void);
  * set a framebuffer. */
 int      psp_display_read(uint32_t *out);
 /* Copy the last completed frame if it is newer than *seq. Returns 1 and
- * updates *seq when a new frame was copied. */
+ * updates *seq when a new frame was copied. `out` must hold w*h pixels of
+ * 0xAABBGGRR, with w and h from psp_display_size(). */
 int      psp_display_snapshot(uint32_t *out, uint32_t *seq);
+/* Size of the last completed frame: 480x272, or the backend's internal
+ * resolution when it keeps the frame itself. */
+void     psp_display_size(int *w, int *h);
 uint64_t psp_display_vblanks(void);
 uint32_t psp_display_framebuffer(void);
 

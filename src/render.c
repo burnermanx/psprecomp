@@ -490,7 +490,7 @@ static void sw_draw(int prim, const psp_vertex *v, int count, const psp_draw_sta
 static void sw_noop(void) { }
 
 const psp_render_backend psp_render_software = {
-    "software", sw_init, sw_shutdown, sw_target, sw_draw, sw_noop, sw_noop
+    "software", sw_init, sw_shutdown, sw_target, sw_draw, sw_noop, sw_noop, NULL
 };
 
 /* ---- null backend -------------------------------------------------------- */
@@ -507,8 +507,15 @@ static void null_draw(int p, const psp_vertex *v, int n, const psp_draw_state *s
 static void null_noop(void) { }
 
 const psp_render_backend psp_render_null = {
-    "null", null_init, null_noop, null_target, null_draw, null_noop, null_noop
+    "null", null_init, null_noop, null_target, null_draw, null_noop, null_noop, NULL
 };
+
+int psp_render_scale = 1;
+
+int psp_render_frame(const uint32_t **px, int *w, int *h) {
+    const psp_render_backend *b = psp_render_current();
+    return b->frame ? b->frame(px, w, h) : -1;
+}
 
 /* ---- selection ----------------------------------------------------------- */
 

@@ -108,7 +108,22 @@ typedef struct {
 
     /* sceDisplaySetFrameBuf -- show what has accumulated. */
     void (*present)(void);
+
+    /* Optional: the frame just presented, at the backend's internal
+     * resolution. Returns 0 and fills px, w and h, or -1 when the frame only
+     * exists in guest VRAM (the software renderer draws straight into it).
+     * The buffer stays valid until the next present. */
+    int (*frame)(const uint32_t **px, int *w, int *h);
 } psp_render_backend;
+
+/* Internal resolution multiplier, 1..4. Set before the first draw; the
+ * software renderer ignores it and stays at 1x, because it is the oracle the
+ * others are checked against. */
+extern int psp_render_scale;
+
+/* The presented frame at internal resolution, or -1 if the backend has none
+ * (then psp_display_read() is the way to get the 480x272 frame). */
+int psp_render_frame(const uint32_t **px, int *w, int *h);
 
 /* Select a backend by name ("software", "null", ...). Returns 0 on success,
  * -1 if the name is unknown, leaving the current backend in place. */

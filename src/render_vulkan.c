@@ -25,6 +25,13 @@
 #define FB_W 480
 #define FB_H 272
 
+/* Internal resolution: the target is FB_W*N x FB_H*N and every vertex and
+ * scissor is multiplied by N on the way in. Geometry is re-rasterized at that
+ * size, which is the whole point; a 1x image blown up would not be. */
+static int g_scale = 1;
+#define VW (FB_W * g_scale)
+#define VH (FB_H * g_scale)
+
 #define MAX_VBO_VERTS     262144
 #define MAX_DRAW_CMDS     16384
 #define MAX_TEX_CACHE     512
@@ -202,7 +209,8 @@ static int create_buffer(VkDeviceSize size, VkBufferUsageFlags usage,
 
     VkMemoryRequirements req;
     vkGetBufferMemoryRequirements(g_dev, *out_buf, &req);
-    int mt = find_mem_type(req.memoryTypeBits, props);
+    int mt = find_mem_type(req.memoryTypeBits, props | VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+    if (mt < 0) mt = find_mem_type(req.memoryTypeBits, props);
     if (mt < 0) return -1;
 
     VkMemoryAllocateInfo mai = {
@@ -939,10 +947,11 @@ static int vk_init(int width, int height) {
     vkCreateQueryPool(g_dev, &qpci, NULL, &g_query_pool);
 
     /* Attachments */
-    if (create_image(FB_W, FB_H, VK_FORMAT_R8G8B8A8_UNORM,
+    g_scale = psp_render_scale < 1 ? 1 : psp_render_scale > 4 ? 4 : psp_render_scale;
+    if (create_image((uint32_t)VW, (uint32_t)VH, VK_FORMAT_R8G8B8A8_UNORM,
                      VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                      VK_IMAGE_ASPECT_COLOR_BIT, &g_color_img, &g_color_mem, &g_color_view) != 0 ||
-        create_image(FB_W, FB_H, VK_FORMAT_D16_UNORM,
+        create_image((uint32_t)VW, (uint32_t)VH, VK_FORMAT_D16_UNORM,
                      VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                      VK_IMAGE_ASPECT_DEPTH_BIT, &g_depth_img, &g_depth_mem, &g_depth_view) != 0) {
         g_vk_failed = 1;
@@ -998,8 +1007,8 @@ static int vk_init(int width, int height) {
         .renderPass = g_render_pass,
         .attachmentCount = 2,
         .pAttachments = fb_views,
-        .width = FB_W,
-        .height = FB_H,
+        .width = (uint32_t)VW,
+        .height = (uint32_t)VH,
         .layers = 1
     };
     if (vkCreateFramebuffer(g_dev, &fbci, NULL, &g_framebuffer) != VK_SUCCESS) {
@@ -1009,10 +1018,10 @@ static int vk_init(int width, int height) {
 
     /* Buffers */
     VkMemoryPropertyFlags host_props = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-    if (create_buffer(FB_W * FB_H * 4u,
+    if (create_buffer((uint32_t)(VW * VH) * 4u,
                       VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                       host_props, &g_fb_staging_buf, &g_fb_staging_mem, (void **)&g_fb_staging_ptr) != 0 ||
-        create_buffer(FB_W * FB_H * 2u,
+        create_buffer((uint32_t)(VW * VH) * 2u,
                       VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                       host_props, &g_zb_staging_buf, &g_zb_staging_mem, (void **)&g_zb_staging_ptr) != 0 ||
         create_buffer(MAX_VBO_VERTS * sizeof(vk_vertex),
@@ -1114,6 +1123,51 @@ static int vk_init(int width, int height) {
     g_dummy_white_slot = queue_solid_texture(0, 0xFFFFFFFFu);
     g_dummy_magenta_slot = queue_solid_texture(1, 0xFFFF00FFu);
 
+    if (g_scale > 1) {
+        /* At N > 1 the target is never re-uploaded, so it enters the render
+         * pass in COLOR_ATTACHMENT_OPTIMAL from the first frame on. */
+        VkCommandBufferBeginInfo cbbi = {
+            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+            .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
+        };
+        vkResetCommandBuffer(g_cmd, 0);
+        vkBeginCommandBuffer(g_cmd, &cbbi);
+        VkImageMemoryBarrier b[2] = {
+            {
+                .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+                .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .image = g_color_img,
+                .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 }
+            },
+            {
+                .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                .dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+                .newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .image = g_depth_img,
+                .subresourceRange = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1 }
+            }
+        };
+        vkCmdPipelineBarrier(g_cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                             VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT,
+                             0, 0, NULL, 0, NULL, 2, b);
+        vkEndCommandBuffer(g_cmd);
+        vkResetFences(g_dev, 1, &g_fence);
+        VkSubmitInfo si = {
+            .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+            .commandBufferCount = 1,
+            .pCommandBuffers = &g_cmd
+        };
+        vkQueueSubmit(g_queue, 1, &si, g_fence);
+        vkWaitForFences(g_dev, 1, &g_fence, VK_TRUE, UINT64_MAX);
+    }
+
     g_vk_inited = 1;
     fprintf(stderr, "render: Vulkan backend initialized on %s\n", chosen_props.deviceName);
     return 0;
@@ -1142,14 +1196,20 @@ static void vk_flush(void) {
         return;
     }
 
-    /* 1. Upload the guest framebuffer region this batch touches */
+    /* 1. Upload the guest framebuffer region this batch touches. At N > 1 the
+     * target is the only copy of the frame: guest VRAM is never read back
+     * (G0 measured zero guest reads of it) and never written to, so the
+     * scaled image simply persists between batches and the guest's two
+     * framebuffers both map to it. */
     int dx0 = g_dirty_x0, dy0 = g_dirty_y0, dx1 = g_dirty_x1, dy1 = g_dirty_y1;
     if (dx0 < 0) dx0 = 0;
     if (dy0 < 0) dy0 = 0;
     if (dx1 > FB_W) dx1 = FB_W;
     if (dy1 > FB_H) dy1 = FB_H;
     if (dx0 >= dx1 || dy0 >= dy1) { dx0 = dy0 = dx1 = dy1 = 0; }
-    if (g_fb_fmt == 3) {
+    if (g_scale > 1) {
+        dx0 = dy0 = dx1 = dy1 = 0;
+    } else if (g_fb_fmt == 3) {
         for (int y = dy0; y < dy1; y++) {
             uint32_t row_addr = g_fb_addr + (uint32_t)(y * (int)g_fb_stride + dx0) * 4u;
             const void *src = psp_mem_ptr(row_addr, (uint32_t)(dx1 - dx0) * 4u);
@@ -1169,7 +1229,7 @@ static void vk_flush(void) {
     }
 
     /* 2. Upload current guest VRAM depth buffer if used */
-    if (g_batch_has_z && g_batch_zaddr && g_batch_zbw > 0) {
+    if (g_scale == 1 && g_batch_has_z && g_batch_zaddr && g_batch_zbw > 0) {
         for (int y = dy0; y < dy1; y++) {
             uint32_t row_addr = g_batch_zaddr + (uint32_t)(y * g_batch_zbw + dx0) * 2u;
             const void *src = psp_mem_ptr(row_addr, (uint32_t)(dx1 - dx0) * 2u);
@@ -1226,7 +1286,15 @@ static void vk_flush(void) {
         }
     }
 
-    /* 3b. Copy staging framebuffer (and depth buffer) into attachments */
+    /* 3b. Copy staging framebuffer (and depth buffer) into attachments. At
+     * N > 1 the target is persistent (see step 1), so it is already in
+     * COLOR_ATTACHMENT_OPTIMAL and the render pass loads it as is. */
+    VkBufferImageCopy col_copy = {
+        .bufferOffset = 0,
+        .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+        .imageExtent = { (uint32_t)VW, (uint32_t)VH, 1 }
+    };
+    if (g_scale == 1) {
     VkImageMemoryBarrier pre_barriers[2] = {
         {
             .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
@@ -1254,11 +1322,6 @@ static void vk_flush(void) {
     vkCmdPipelineBarrier(g_cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                          VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 2, pre_barriers);
 
-    VkBufferImageCopy col_copy = {
-        .bufferOffset = 0,
-        .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
-        .imageExtent = { FB_W, FB_H, 1 }
-    };
     vkCmdCopyBufferToImage(g_cmd, g_fb_staging_buf, g_color_img,
                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &col_copy);
 
@@ -1266,7 +1329,7 @@ static void vk_flush(void) {
         VkBufferImageCopy dep_copy = {
             .bufferOffset = 0,
             .imageSubresource = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1 },
-            .imageExtent = { FB_W, FB_H, 1 }
+            .imageExtent = { (uint32_t)VW, (uint32_t)VH, 1 }
         };
         vkCmdCopyBufferToImage(g_cmd, g_zb_staging_buf, g_depth_img,
                                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &dep_copy);
@@ -1299,6 +1362,7 @@ static void vk_flush(void) {
     vkCmdPipelineBarrier(g_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
                          VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT,
                          0, 0, NULL, 0, NULL, 2, to_att);
+    }
 
     if (g_query_pool) {
         vkCmdResetQueryPool(g_cmd, g_query_pool, 0, 1);
@@ -1309,11 +1373,11 @@ static void vk_flush(void) {
         .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
         .renderPass = g_render_pass,
         .framebuffer = g_framebuffer,
-        .renderArea = { { 0, 0 }, { FB_W, FB_H } }
+        .renderArea = { { 0, 0 }, { (uint32_t)VW, (uint32_t)VH } }
     };
     vkCmdBeginRenderPass(g_cmd, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
 
-    VkViewport vp = { 0.0f, 0.0f, (float)FB_W, (float)FB_H, 0.0f, 1.0f };
+    VkViewport vp = { 0.0f, 0.0f, (float)VW, (float)VH, 0.0f, 1.0f };
     vkCmdSetViewport(g_cmd, 0, 1, &vp);
 
     VkDeviceSize vbo_off = 0;
@@ -1353,7 +1417,8 @@ static void vk_flush(void) {
         }
         if (dc->sc_x != last_sc[0] || dc->sc_y != last_sc[1] ||
             dc->sc_w != last_sc[2] || dc->sc_h != last_sc[3]) {
-            VkRect2D sc = { { dc->sc_x, dc->sc_y }, { (uint32_t)dc->sc_w, (uint32_t)dc->sc_h } };
+            VkRect2D sc = { { dc->sc_x * g_scale, dc->sc_y * g_scale },
+                            { (uint32_t)(dc->sc_w * g_scale), (uint32_t)(dc->sc_h * g_scale) } };
             vkCmdSetScissor(g_cmd, 0, 1, &sc);
             last_sc[0] = dc->sc_x; last_sc[1] = dc->sc_y;
             last_sc[2] = dc->sc_w; last_sc[3] = dc->sc_h;
@@ -1369,7 +1434,9 @@ static void vk_flush(void) {
     }
     vkCmdEndRenderPass(g_cmd);
 
-    /* 3d. Copy attachments back to staging */
+    /* 3d. Copy attachments back to staging. Only at 1x: at N > 1 the frame
+     * reaches the window through vk_copy_frame() at present time. */
+    if (g_scale == 1) {
     VkImageMemoryBarrier post_barriers[2] = {
         {
             .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
@@ -1404,7 +1471,7 @@ static void vk_flush(void) {
         VkBufferImageCopy dep_copy = {
             .bufferOffset = 0,
             .imageSubresource = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1 },
-            .imageExtent = { FB_W, FB_H, 1 }
+            .imageExtent = { (uint32_t)VW, (uint32_t)VH, 1 }
         };
         vkCmdCopyImageToBuffer(g_cmd, g_depth_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                                g_zb_staging_buf, 1, &dep_copy);
@@ -1417,6 +1484,7 @@ static void vk_flush(void) {
     };
     vkCmdPipelineBarrier(g_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
                          VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &host_mb, 0, NULL, 0, NULL);
+    }
 
     vkEndCommandBuffer(g_cmd);
 
@@ -1438,8 +1506,12 @@ static void vk_flush(void) {
         }
     }
 
-    /* 5. Write the touched region back to guest VRAM */
-    if (g_fb_fmt == 3) {
+    /* 5. Write the touched region back to guest VRAM. Only at 1x: at N > 1
+     * the frame stays in the scaled target and reaches the window through
+     * vk_frame() instead of a downsampled copy in guest memory. */
+    if (g_scale > 1) {
+        /* nothing to write back */
+    } else if (g_fb_fmt == 3) {
         for (int y = dy0; y < dy1; y++) {
             uint32_t row_addr = g_fb_addr + (uint32_t)(y * (int)g_fb_stride + dx0) * 4u;
             void *dst = psp_mem_ptr(row_addr, (uint32_t)(dx1 - dx0) * 4u);
@@ -1459,7 +1531,7 @@ static void vk_flush(void) {
         }
     }
 
-    if (g_batch_has_z && g_batch_zaddr && g_batch_zbw > 0) {
+    if (g_scale == 1 && g_batch_has_z && g_batch_zaddr && g_batch_zbw > 0) {
         for (int y = dy0; y < dy1; y++) {
             uint32_t row_addr = g_batch_zaddr + (uint32_t)(y * g_batch_zbw + dx0) * 2u;
             void *dst = psp_mem_ptr(row_addr, (uint32_t)(dx1 - dx0) * 2u);
@@ -1504,6 +1576,9 @@ static void emit_tri(const psp_vertex *a, const psp_vertex *b, const psp_vertex 
     uint32_t col_b = gouraud ? b->rgba : c->rgba;
     uint32_t col_c = c->rgba;
 
+    /* Positions stay in guest pixels: the viewport already maps the 480x272
+     * clip space onto the scaled target, so the triangles are rasterized at
+     * N times the resolution without touching the geometry. */
     g_vbo_ptr[g_vbo_count++] = (vk_vertex){ (float)a->x, (float)a->y, a->z, col_a, a->u, a->v };
     g_vbo_ptr[g_vbo_count++] = (vk_vertex){ (float)b->x, (float)b->y, b->z, col_b, b->u, b->v };
     g_vbo_ptr[g_vbo_count++] = (vk_vertex){ (float)c->x, (float)c->y, c->z, col_c, c->u, c->v };
@@ -1660,12 +1735,78 @@ static void vk_finish(void) {
     vk_flush();
 }
 
+/* Copy the scaled target to the host-visible staging buffer, once per
+ * presented frame. Only the window and captures read it. */
+static void vk_copy_frame(void) {
+    if (!g_vk_inited || g_scale <= 1) return;
+    VkCommandBufferBeginInfo cbbi = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
+    };
+    vkResetCommandBuffer(g_cmd, 0);
+    vkBeginCommandBuffer(g_cmd, &cbbi);
+    VkImageMemoryBarrier b = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+        .oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = g_color_img,
+        .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 }
+    };
+    vkCmdPipelineBarrier(g_cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &b);
+    VkBufferImageCopy c = {
+        .bufferOffset = 0,
+        .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+        .imageExtent = { (uint32_t)VW, (uint32_t)VH, 1 }
+    };
+    vkCmdCopyImageToBuffer(g_cmd, g_color_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                           g_fb_staging_buf, 1, &c);
+    b.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    b.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    b.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    vkCmdPipelineBarrier(g_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, NULL, 0, NULL, 1, &b);
+    VkMemoryBarrier hb = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_HOST_READ_BIT
+    };
+    vkCmdPipelineBarrier(g_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &hb, 0, NULL, 0, NULL);
+    vkEndCommandBuffer(g_cmd);
+    vkResetFences(g_dev, 1, &g_fence);
+    VkSubmitInfo si = {
+        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .commandBufferCount = 1,
+        .pCommandBuffers = &g_cmd
+    };
+    vkQueueSubmit(g_queue, 1, &si, g_fence);
+    vkWaitForFences(g_dev, 1, &g_fence, VK_TRUE, UINT64_MAX);
+}
+
 static void vk_present(void) {
     vk_flush();
+    vk_copy_frame();
+}
+
+/* The frame at internal resolution, for the window and for captures. At 1x
+ * the frame also lives in guest VRAM, so the caller can use either. */
+static int vk_frame(const uint32_t **px, int *w, int *h) {
+    if (!g_vk_inited || g_scale <= 1) return -1;
+    *px = g_fb_staging_ptr;
+    *w = VW;
+    *h = VH;
+    return 0;
 }
 
 const psp_render_backend psp_render_vulkan = {
-    "vulkan", vk_init, vk_shutdown, vk_set_target, vk_draw, vk_finish, vk_present
+    "vulkan", vk_init, vk_shutdown, vk_set_target, vk_draw, vk_finish, vk_present,
+    vk_frame
 };
 
 #endif /* PSPRECOMP_VULKAN */

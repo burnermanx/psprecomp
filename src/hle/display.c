@@ -35,11 +35,37 @@ static uint32_t g_mode, g_mode_w, g_mode_h;
 static uint64_t g_vblank_count;
 
 /* A completed frame, copied at the flip point so the window never reads a
- * buffer the guest is drawing into. Seqlock: odd means a copy is in progress. */
-static uint32_t g_snap[PSP_SCREEN_W * PSP_SCREEN_H];
+ * buffer the guest is drawing into. Seqlock: odd means a copy is in progress.
+ *
+ * The frame is either the backend's own image at internal resolution (when it
+ * has one: the Vulkan backend at N > 1 keeps the frame there and never writes
+ * it back to guest VRAM) or the 480x272 guest framebuffer. */
+static uint32_t *g_snap;
+static int g_snap_w = PSP_SCREEN_W, g_snap_h = PSP_SCREEN_H;
 static _Atomic uint32_t g_snap_seq;
 
 static void snap_capture(void) {
+    const uint32_t *fpx;
+    int fw, fh;
+    if (psp_render_frame(&fpx, &fw, &fh) == 0) {
+        if (fw != g_snap_w || fh != g_snap_h) {
+            uint32_t *n = realloc(g_snap, (size_t)fw * (size_t)fh * 4u);
+            if (!n) return;
+            g_snap = n;
+            g_snap_w = fw;
+            g_snap_h = fh;
+        }
+        uint32_t s = atomic_load_explicit(&g_snap_seq, memory_order_relaxed);
+        atomic_store_explicit(&g_snap_seq, s + 1, memory_order_relaxed);
+        atomic_thread_fence(memory_order_release);
+        memcpy(g_snap, fpx, (size_t)fw * (size_t)fh * 4u);
+        atomic_store_explicit(&g_snap_seq, s + 2, memory_order_release);
+        return;
+    }
+    if (!g_snap) {
+        g_snap = malloc((size_t)g_snap_w * (size_t)g_snap_h * 4u);
+        if (!g_snap) return;
+    }
     uint32_t s = atomic_load_explicit(&g_snap_seq, memory_order_relaxed);
     atomic_store_explicit(&g_snap_seq, s + 1, memory_order_relaxed);
     atomic_thread_fence(memory_order_release);
@@ -47,12 +73,15 @@ static void snap_capture(void) {
     atomic_store_explicit(&g_snap_seq, s + 2, memory_order_release);
 }
 
+void psp_display_size(int *w, int *h) { *w = g_snap_w; *h = g_snap_h; }
+
 int psp_display_snapshot(uint32_t *out, uint32_t *seq) {
     for (;;) {
         uint32_t s1 = atomic_load_explicit(&g_snap_seq, memory_order_acquire);
         if (s1 == *seq) return 0;
         if (s1 & 1) return 0;          /* copy in progress; try next loop */
-        memcpy(out, g_snap, sizeof g_snap);
+        if (!g_snap) return 0;
+        memcpy(out, g_snap, (size_t)g_snap_w * (size_t)g_snap_h * 4u);
         atomic_thread_fence(memory_order_acquire);
         uint32_t s2 = atomic_load_explicit(&g_snap_seq, memory_order_acquire);
         if (s1 == s2) { *seq = s1; return 1; }
@@ -68,7 +97,10 @@ void psp_display_reset(void) {
     g_mode_h = PSP_SCREEN_H;
     g_vblank_count = 0;
     atomic_store(&g_snap_seq, 0);
-    memset(g_snap, 0, sizeof g_snap);
+    g_snap_w = PSP_SCREEN_W;
+    g_snap_h = PSP_SCREEN_H;
+    if (!g_snap) g_snap = calloc((size_t)g_snap_w * (size_t)g_snap_h, 4u);
+    else memset(g_snap, 0, (size_t)g_snap_w * (size_t)g_snap_h * 4u);
 }
 
 void psp_display_init(void) { psp_display_reset(); }
@@ -81,13 +113,20 @@ uint32_t psp_display_framebuffer(void) { return g_fb_addr; }
  * bring-up: the game never got as far as showing anything). */
 int psp_display_capture(const char *path) {
     static uint32_t px[PSP_SCREEN_W * PSP_SCREEN_H];
-    if (psp_display_read(px) != 0) return -1;
+    const uint32_t *src;
+    int w = PSP_SCREEN_W, h = PSP_SCREEN_H;
+    /* A capture is the frame at internal resolution when the backend has one:
+     * at N > 1 guest VRAM holds no frame at all. */
+    if (psp_render_frame(&src, &w, &h) != 0) {
+        if (psp_display_read(px) != 0) return -1;
+        src = px;
+    }
 
     FILE *f = fopen(path, "wb");
     if (!f) return -1;
-    fprintf(f, "P6\n%d %d\n255\n", PSP_SCREEN_W, PSP_SCREEN_H);
-    for (int i = 0; i < PSP_SCREEN_W * PSP_SCREEN_H; i++) {
-        const uint32_t c = px[i];
+    fprintf(f, "P6\n%d %d\n255\n", w, h);
+    for (int i = 0; i < w * h; i++) {
+        const uint32_t c = src[i];
         uint8_t rgb[3] = { (uint8_t)c, (uint8_t)(c >> 8), (uint8_t)(c >> 16) };
         fwrite(rgb, 1, 3, f);            /* PPM is RGB; alpha is dropped */
     }
@@ -180,11 +219,11 @@ static void hle_SetFrameBuf(void) {
             last_fb = psp_arg(0);
         }
     }
-    shot_if_wanted();
     /* Finish the frame the guest just drew and snapshot it before the new
      * buffer is published; the window reads the snapshot, not live VRAM. */
     psp_render_current()->present();
     if (g_fb_addr) snap_capture();
+    shot_if_wanted();
     g_fb_addr   = psp_arg(0);
     g_fb_width  = psp_arg(1);
     g_fb_format = psp_arg(2);

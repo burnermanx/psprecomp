@@ -194,7 +194,8 @@ static atomic_int g_closed;
 static atomic_int g_ready;          /* 0 pending, 1 open, -1 failed */
 static int g_scale;
 static const char *g_title = "psprecomp";
-static uint32_t g_px[W * H];
+/* Max internal resolution is 4x (see psp_render_scale). */
+static uint32_t g_px[W * H * 16];
 
 /* Host keyboard and gamepad are a convenience when someone is playing, and a
  * source of non-determinism when a script is driving: a connected pad with a
@@ -280,15 +281,17 @@ static int window_main(void *arg) {
     if (!(vsync && vsync[0] == '0')) rflags |= SDL_RENDERER_PRESENTVSYNC;
     SDL_Renderer *ren = win ? SDL_CreateRenderer(win, -1, rflags) : NULL;
     if (win && !ren) ren = SDL_CreateRenderer(win, -1, SDL_RENDERER_SOFTWARE);
+    int tex_w = W, tex_h = H;
+    psp_display_size(&tex_w, &tex_h);
     SDL_Texture *tex = ren ? SDL_CreateTexture(ren, SDL_PIXELFORMAT_ABGR8888,
-                                               SDL_TEXTUREACCESS_STREAMING, W, H) : NULL;
+                                               SDL_TEXTUREACCESS_STREAMING, tex_w, tex_h) : NULL;
     if (!tex) {
         fprintf(stderr, "psprecomp: cannot open a window: %s\n", SDL_GetError());
         atomic_store(&g_closed, 1); atomic_store(&g_ready, -1);
         return 1;
     }
     SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "0");          /* nearest: crisp pixels */
-    SDL_RenderSetLogicalSize(ren, W, H);                       /* keep the aspect, black bars */
+    SDL_RenderSetLogicalSize(ren, tex_w, tex_h);               /* keep the aspect, black bars */
     SDL_RenderSetIntegerScale(ren, SDL_TRUE);                  /* whole pixels only */
     atomic_store(&g_ready, 1);
 
@@ -353,9 +356,22 @@ static int window_main(void *arg) {
          * so the screen rate never paces the game. */
         if (psp_display_snapshot(g_px, &snap_seq)) dirty = 1;
         if (dirty) {
+            int fw, fh;
+            psp_display_size(&fw, &fh);
+            if (fw != tex_w || fh != tex_h) {
+                /* The frame size only changes when --internal-scale does. */
+                SDL_Texture *nt = SDL_CreateTexture(ren, SDL_PIXELFORMAT_ABGR8888,
+                                                    SDL_TEXTUREACCESS_STREAMING, fw, fh);
+                if (nt) {
+                    SDL_DestroyTexture(tex);
+                    tex = nt;
+                    tex_w = fw; tex_h = fh;
+                    SDL_RenderSetLogicalSize(ren, fw, fh);
+                }
+            }
             SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
             SDL_RenderClear(ren);
-            SDL_UpdateTexture(tex, NULL, g_px, W * 4);   /* 0xAABBGGRR == ABGR8888 */
+            SDL_UpdateTexture(tex, NULL, g_px, tex_w * 4);   /* 0xAABBGGRR == ABGR8888 */
             SDL_RenderCopy(ren, tex, NULL, NULL);
             SDL_RenderPresent(ren);
             dirty = 0;

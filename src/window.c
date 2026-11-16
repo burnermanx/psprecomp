@@ -255,6 +255,17 @@ static uint32_t pad(SDL_GameController *gc, uint8_t *ax, uint8_t *ay) {
     return b;
 }
 
+/* Whole pixels only when the window is an exact multiple of the frame, which
+ * is the case at 1x and at 2x on a 1440p screen. At 4x the frame is 1088 tall
+ * and a 1080p window cannot hold it whole, so let SDL scale by aspect instead
+ * of cropping the bottom rows. */
+static void fit_scale(SDL_Renderer *ren, int w, int h) {
+    int dw = 0, dh = 0;
+    SDL_GetRendererOutputSize(ren, &dw, &dh);
+    SDL_RenderSetIntegerScale(ren, (dw > 0 && dh > 0 && dw % w == 0 && dh % h == 0)
+                                   ? SDL_TRUE : SDL_FALSE);
+}
+
 static int window_main(void *arg) {
     (void)arg;
     /* Without this Windows reports a scaled size and blurs the nearest-neighbour
@@ -292,7 +303,7 @@ static int window_main(void *arg) {
     }
     SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "0");          /* nearest: crisp pixels */
     SDL_RenderSetLogicalSize(ren, tex_w, tex_h);               /* keep the aspect, black bars */
-    SDL_RenderSetIntegerScale(ren, SDL_TRUE);                  /* whole pixels only */
+    fit_scale(ren, tex_w, tex_h);
     atomic_store(&g_ready, 1);
 
     SDL_GameController *gc = NULL;
@@ -305,7 +316,11 @@ static int window_main(void *arg) {
             case SDL_QUIT: atomic_store(&g_closed, 1); break;
             case SDL_WINDOWEVENT:
                 if (ev.window.event == SDL_WINDOWEVENT_SIZE_CHANGED ||
-                    ev.window.event == SDL_WINDOWEVENT_EXPOSED) dirty = 1;
+                    ev.window.event == SDL_WINDOWEVENT_EXPOSED) {
+                    if (ev.window.event == SDL_WINDOWEVENT_SIZE_CHANGED)
+                        fit_scale(ren, tex_w, tex_h);
+                    dirty = 1;
+                }
                 break;
             case SDL_CONTROLLERDEVICEADDED:
                 if (!gc && host_input_enabled()) gc = SDL_GameControllerOpen(ev.cdevice.which);
@@ -367,6 +382,7 @@ static int window_main(void *arg) {
                     tex = nt;
                     tex_w = fw; tex_h = fh;
                     SDL_RenderSetLogicalSize(ren, fw, fh);
+                    fit_scale(ren, fw, fh);
                 }
             }
             SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);

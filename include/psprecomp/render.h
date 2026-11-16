@@ -121,6 +121,10 @@ typedef struct {
  * others are checked against. */
 extern int psp_render_scale;
 
+/* --tex-filter: -1 keeps the game's TEXFILTER bit, 0 forces nearest, 1 forces
+ * bilinear. For comparing the two, and for looking for seams at 2x and up. */
+extern int psp_render_tex_filter;
+
 /* The presented frame at internal resolution, or -1 if the backend has none
  * (then psp_display_read() is the way to get the 480x272 frame). */
 int psp_render_frame(const uint32_t **px, int *w, int *h);

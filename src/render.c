@@ -203,7 +203,7 @@ static int lerp8(int a, int b, float t) { return (int)((float)a + ((float)b - (f
 /* TEXFILTER: nearest is floor() in texel units, bilinear averages the four
  * texels around the sample point (texel centres at i+0.5). */
 static uint32_t tex_sample(const psp_draw_state *st, float u, float v) {
-    if (!st->tex_filter) {
+    if (!(psp_render_tex_filter < 0 ? st->tex_filter : psp_render_tex_filter)) {
         int tx = (int)u, ty = (int)v;
         if (u < 0 && (float)tx != u) tx--;  /* floor, for negative wraps */
         if (v < 0 && (float)ty != v) ty--;
@@ -511,6 +511,7 @@ const psp_render_backend psp_render_null = {
 };
 
 int psp_render_scale = 1;
+int psp_render_tex_filter = -1;
 
 int psp_render_frame(const uint32_t **px, int *w, int *h) {
     const psp_render_backend *b = psp_render_current();

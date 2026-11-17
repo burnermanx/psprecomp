@@ -277,10 +277,17 @@ static int window_main(void *arg) {
         return 1;
     }
     if (g_scale <= 0) {
+        /* A window smaller than the frame would downscale it by nearest and
+         * lose pixels, so never go below the internal resolution. */
         SDL_Rect usable;
-        g_scale = 2;
+        int fw = W, fh = H;
+        psp_display_size(&fw, &fh);
+        g_scale = fw / W;
         if (SDL_GetDisplayUsableBounds(0, &usable) == 0) {
-            g_scale = usable.h * 7 / 10 / H;
+            int fit = usable.h * 7 / 10 / H;
+            if (fit < 1) fit = 1;
+            if (g_scale < fit) g_scale = fit;
+            if (g_scale * H > usable.h) g_scale = usable.h / H;
             if (g_scale < 1) g_scale = 1;
         }
     }

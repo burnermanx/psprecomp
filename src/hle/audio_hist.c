@@ -85,7 +85,6 @@ static int g_trace = -1;                    /* -1 unread, 0 off, 1 on */
 static uint64_t g_last_cb_us;               /* last device callback */
 static uint64_t g_last_report_us;
 static uint64_t g_start_us;
-static uint32_t g_scene_addr;               /* guest scene word, 0 = none */
 static uint32_t g_cb_min[AUDIO_CHANNELS], g_cb_max[AUDIO_CHANNELS];
 static uint32_t g_cb_n[AUDIO_CHANNELS];
 static uint64_t g_underruns_play[AUDIO_CHANNELS], g_underruns_other[AUDIO_CHANNELS];
@@ -105,18 +104,13 @@ static int trace_on(void) {
     return g_trace;
 }
 
-/* The game's scene word, so an underrun can be attributed to gameplay or to a
- * scene change (where a gap is expected). */
-void psp_audio_set_scene_source(uint32_t addr) { g_scene_addr = addr; }
-
 static uint32_t g_scene_last;
 static uint64_t g_scene_changed_us;
 
 /* Reads the scene word and remembers when it changed: an underrun in the
  * first second of a scene is the scene starting, not the song losing audio. */
 static uint32_t scene_now(uint64_t now) {
-    if (!g_scene_addr) return 0;
-    uint32_t s = psp_read32(g_scene_addr);
+    uint32_t s = psp_scene_now();
     if (s != g_scene_last) {
         g_scene_last = s;
         g_scene_changed_us = now;

@@ -14,6 +14,7 @@
 #define PSPRECOMP_RENDER_H
 
 #include <stdint.h>
+#include <stdio.h>
 
 /* A vertex after format decoding: screen space, colour resolved, texture
  * coordinates in texels (through mode addresses texels directly). Colours
@@ -128,6 +129,10 @@ extern int psp_render_tex_filter;
 /* The presented frame at internal resolution, or -1 if the backend has none
  * (then psp_display_read() is the way to get the 480x272 frame). */
 int psp_render_frame(const uint32_t **px, int *w, int *h);
+
+/* Texture dump (EMOTIONALSENSE_TEX_DUMP). Writes RGBA8 PNGs, no dependency. */
+int  psp_tex_png_write(const char *path, const uint32_t *rgba, int w, int h);
+void psp_tex_dump_report(FILE *f);
 
 /* Select a backend by name ("software", "null", ...). Returns 0 on success,
  * -1 if the name is unknown, leaving the current backend in place. */

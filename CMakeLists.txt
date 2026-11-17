@@ -39,6 +39,7 @@ add_library(psprecomp STATIC
     src/ctors.c
     src/render.c
     src/render_vulkan.c
+    src/tex_png.c
     src/vfpu.c
     src/traps.c
     src/window.c

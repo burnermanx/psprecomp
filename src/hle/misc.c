@@ -420,6 +420,16 @@ static void hle_SetChannelDataLen(void) {
 /* Zero remaining means "ready for more", so a game's audio loop keeps going. */
 static void hle_GetChannelRestLength(void) { psp_ret(0); }
 
+static uint32_t g_scene_addr;
+
+/* Where the game keeps the word that names the current scene. Registered by
+ * the host, read by the audio trace and the texture dump. */
+void psp_set_scene_source(uint32_t addr) { g_scene_addr = addr; }
+
+uint32_t psp_scene_now(void) {
+    return g_scene_addr ? psp_read32(g_scene_addr) : 0;
+}
+
 void psp_misc_reset(void) {
     /* The interrupt mask is per thread and lives in the scheduler; a reset
      * here cannot reach another thread's bracket, and should not. */

@@ -12,6 +12,7 @@
 
 #include "psprecomp/render.h"
 #include "psprecomp/mem.h"
+#include "psprecomp/hle.h"
 
 #ifdef PSPRECOMP_VULKAN
 
@@ -380,6 +381,158 @@ static uint64_t hash_texture_data(const psp_draw_state *st) {
     return hash_full(ptr, total_bytes);
 }
 
+
+/* ---- Texture dump -------------------------------------------------------
+ *
+ * EMOTIONALSENSE_TEX_DUMP=dir writes every texture that repeats, once, as
+ * <key>.png. The key is content + CLUT + format + size and never the address:
+ * the same art lands at a different address on another screen or run.
+ *
+ * "Repeats" is the filter that removes what is generated per frame -- text,
+ * counters -- because those never come back with the same key at the same
+ * address. A texture is written on its third frame, one sighting per batch.
+ * Video is converted into VRAM every frame and shown for two or three
+ * vblanks, so it would pass that test; addresses in VRAM are skipped.
+ */
+
+#define DUMP_SLOTS 8192
+#define DUMP_ADDRS 4096
+
+static const char *g_dump_dir;
+static int         g_dump_on = -1;          /* -1 unread, 0 off, 1 on */
+static FILE       *g_dump_index;
+static struct { uint32_t addr; uint64_t key; uint32_t batch; uint8_t seen; }
+                   g_dump_seen[DUMP_SLOTS];
+static struct { uint32_t addr; uint16_t keys; } g_dump_addr[DUMP_ADDRS];
+static int         g_dump_addr_n;
+static int         g_dump_files;
+static uint64_t    g_dump_bytes;
+#define DUMP_WRITTEN 2048
+static uint64_t    g_dump_written[DUMP_WRITTEN];   /* 0 = empty slot */
+
+static int dump_enabled(void) {
+    if (g_dump_on < 0) {
+        const char *d = getenv("EMOTIONALSENSE_TEX_DUMP");
+        g_dump_on = (d && *d) ? 1 : 0;
+        if (g_dump_on) {
+            char path[512];
+            g_dump_dir = d;
+            snprintf(path, sizeof path, "%s/index.txt", d);
+            g_dump_index = fopen(path, "w");
+            if (!g_dump_index) {
+                fprintf(stderr, "tex dump: cannot write to %s\n", d);
+                g_dump_on = 0;
+            } else {
+                fprintf(g_dump_index, "# key addr fmt w h scene\n");
+            }
+        }
+    }
+    return g_dump_on;
+}
+
+static uint64_t dump_key(uint64_t data, uint64_t clut, int fmt, int w, int h) {
+    uint64_t k = data;
+    k ^= clut + 0x9E3779B97F4A7C15ull + (k << 6) + (k >> 2);
+    k ^= (uint64_t)(uint32_t)fmt * 0x100000001B3ull;
+    k ^= (((uint64_t)(uint32_t)w << 32) | (uint32_t)h) * 0xC2B2AE3D27D4EB4Full;
+    return k;
+}
+
+/* Counts distinct keys per address: a texture whose palette animates shows up
+ * as dozens of keys on one address and must stay out of the pack. */
+static void dump_addr_note(uint32_t addr) {
+    for (int i = 0; i < g_dump_addr_n; i++) {
+        if (g_dump_addr[i].addr == addr) {
+            if (g_dump_addr[i].keys < 0xFFFFu) g_dump_addr[i].keys++;
+            return;
+        }
+    }
+    if (g_dump_addr_n < DUMP_ADDRS) {
+        g_dump_addr[g_dump_addr_n].addr = addr;
+        g_dump_addr[g_dump_addr_n].keys = 1;
+        g_dump_addr_n++;
+    }
+}
+
+static void dump_write(uint64_t key, uint32_t addr, const psp_draw_state *st,
+                       int w, int h) {
+    /* The same art turns up at several addresses (another screen, another
+     * run); the key is what names the file, so write it once. */
+    uint32_t wi = (uint32_t)(key >> 40) & (DUMP_WRITTEN - 1u);
+    for (int probe = 0; probe < 32; probe++, wi = (wi + 1u) & (DUMP_WRITTEN - 1u)) {
+        if (g_dump_written[wi] == key) return;
+        if (g_dump_written[wi] == 0) { g_dump_written[wi] = key; break; }
+    }
+
+    uint32_t *px = malloc((size_t)w * (size_t)h * 4u);
+    if (!px) return;
+    for (int y = 0; y < h; y++)
+        for (int x = 0; x < w; x++) px[(size_t)y * (size_t)w + (size_t)x] = psp_tex_fetch(st, x, y);
+
+    char path[512];
+    snprintf(path, sizeof path, "%s/%016llx.png", g_dump_dir,
+             (unsigned long long)key);
+    if (psp_tex_png_write(path, px, w, h) == 0) {
+        g_dump_files++;
+        g_dump_bytes += (uint64_t)w * (uint64_t)h * 4u;
+        dump_addr_note(addr);
+        if (g_dump_index)
+            fprintf(g_dump_index, "%016llx %08x %d %d %d %u\n",
+                    (unsigned long long)key, addr, st->tex_fmt, w, h, psp_scene_now());
+    }
+    free(px);
+}
+
+static void tex_dump_note(const psp_draw_state *st, uint64_t data_hash,
+                          uint64_t clut_hash) {
+    if (!dump_enabled()) return;
+    int w = st->tex_w, h = st->tex_h;
+    if (w <= 0 || h <= 0) return;
+    uint64_t key = dump_key(data_hash, clut_hash, st->tex_fmt, w, h);
+    uint32_t addr = st->tex_addr & PSP_ADDR_MASK;
+    if (addr >= PSP_VRAM_BASE && addr < PSP_VRAM_BASE + PSP_VRAM_SIZE) return;
+
+    uint32_t i = (uint32_t)((key ^ ((uint64_t)addr * 0x9E3779B97F4A7C15ull)) >> 40)
+               & (DUMP_SLOTS - 1u);
+    for (int probe = 0; probe < 64; probe++, i = (i + 1u) & (DUMP_SLOTS - 1u)) {
+        if (g_dump_seen[i].seen == 0) {
+            g_dump_seen[i].addr = addr;
+            g_dump_seen[i].key = key;
+            g_dump_seen[i].batch = g_batch_id;
+            g_dump_seen[i].seen = 1;
+            return;
+        }
+        if (g_dump_seen[i].addr == addr && g_dump_seen[i].key == key) {
+            if (g_dump_seen[i].batch == g_batch_id) return;   /* same frame */
+            g_dump_seen[i].batch = g_batch_id;
+            if (g_dump_seen[i].seen < 3) {
+                g_dump_seen[i].seen++;
+                if (g_dump_seen[i].seen == 3) dump_write(key, addr, st, w, h);
+            }
+            return;
+        }
+    }
+}
+
+void psp_tex_dump_report(FILE *f) {
+    if (!dump_enabled()) return;
+    if (g_dump_index) fclose(g_dump_index);
+    g_dump_index = NULL;
+    int multi = 0, worst = 0;
+    uint32_t worst_addr = 0;
+    for (int i = 0; i < g_dump_addr_n; i++) {
+        if (g_dump_addr[i].keys > 1) multi++;
+        if (g_dump_addr[i].keys > worst) {
+            worst = g_dump_addr[i].keys;
+            worst_addr = g_dump_addr[i].addr;
+        }
+    }
+    fprintf(f, "tex dump: %d files, %.1f MiB, %d of %d addresses carry more than "
+               "one key (worst 0x%08X with %d)\n",
+            g_dump_files, (double)g_dump_bytes / (1024.0 * 1024.0),
+            multi, g_dump_addr_n, worst_addr, worst);
+}
+
 /* Point both sampler variants at the entry's current view. Called whenever the
  * image is (re)created, so a recycled slot never keeps a stale view. */
 static int tex_desc_write(vk_tex_entry *e) {
@@ -527,6 +680,8 @@ static int resolve_texture(const psp_draw_state *st) {
     if (is_indexed && st->clut && !clut_hashed) {
         clut_hash = fnv1a_bytes(st->clut, 1024);
     }
+
+    tex_dump_note(st, data_hash, clut_hash);
 
     int match_same_geom = -1;
     for (int i = 2; i < MAX_TEX_CACHE; i++) {

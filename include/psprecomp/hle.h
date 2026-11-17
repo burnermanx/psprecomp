@@ -185,6 +185,14 @@ void psp_audio_output(int channel, int leftvol, int rightvol, const int16_t *buf
 /* The guest released a channel: let its ring drain and retire it without
  * counting the tail as an underrun. */
 void psp_audio_channel_stop(int channel);
+/* Wait until the device has room for the block just submitted: the ring level
+ * is the channel's latency, and following it keeps every channel at the same
+ * distance from the speaker. Falls back to the host-clock grid when there is no
+ * device to follow (virtual clock, no audio opened, callback stopped). */
+void psp_audio_wait(int channel, uint64_t play_us);
+/* Guest address of the game's scene word, so an underrun can be attributed to
+ * gameplay or to a scene change. 0 disables it. */
+void psp_audio_set_scene_source(uint32_t addr);
 
 void psp_threadman_init(void);
 void psp_threadman_register(void);

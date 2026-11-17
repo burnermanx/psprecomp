@@ -348,53 +348,7 @@ static void hle_ChRelease(void) {
  * would against a real queue.
  * Inline mode keeps the virtual-time wait. */
 #if PSPRECOMP_REAL_THREADS
-static uint64_t host_now_us(void) {
-    struct timespec ts;
-    timespec_get(&ts, TIME_UTC);
-    return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u;
-}
-static uint64_t g_audio_due_us[AUDIO_CHANNELS];
-
-/* EMOTIONALSENSE_AUDIO_AHEAD_MS is an A/B override for the old behaviour; the
- * default is 0, no head start. */
-static uint64_t audio_ahead_us(void) {
-    static int init;
-    static uint64_t ahead_us;
-    if (!init) {
-        init = 1;
-        const char *e = getenv("EMOTIONALSENSE_AUDIO_AHEAD_MS");
-        int ms = e ? atoi(e) : 0;
-        ahead_us = (uint64_t)(ms > 0 ? ms : 0) * 1000u;
-    }
-    return ahead_us;
-}
-
-/* A late block is made up on the next one. The grid only restarts after a
- * real stall. The tolerance is time, not one block: the keysound channel
- * (256 samples) plays a block in 5.8 ms, and in gameplay the mixer thread
- * often waits 10-18 ms for the CPU, so "one block late" restarted the grid
- * several times a second and lost 11% of the audio. 100 ms is longer than
- * any scheduler gap measured and still short enough to recover from a real
- * stall without replaying old audio. */
-#define AUDIO_GRID_TOLERANCE_US 100000u
-
-static void audio_pace(int ch, uint64_t play_us) {
-    if (psp_threadman_clock_virtual()) {
-        /* Deterministic runs cannot pace against the host clock: how much audio
-         * is queued would differ from run to run. The frame wait owns the
-         * virtual clock, so only hand over here. */
-        psp_threadman_sleep_real(play_us);
-        return;
-    }
-    if (ch < 0 || ch >= AUDIO_CHANNELS) return;
-    uint64_t now = host_now_us();
-    if (g_audio_due_us[ch] + AUDIO_GRID_TOLERANCE_US < now) g_audio_due_us[ch] = now;
-    g_audio_due_us[ch] += play_us;
-    uint64_t ahead = audio_ahead_us();
-    uint64_t t = host_now_us();
-    if (t + ahead < g_audio_due_us[ch])
-        psp_threadman_sleep_real(g_audio_due_us[ch] - ahead - t);
-}
+static void audio_pace(int ch, uint64_t play_us) { psp_audio_wait(ch, play_us); }
 #endif
 
 static void hle_OutputBlocking(void) {
@@ -473,9 +427,6 @@ void psp_misc_reset(void) {
     g_buttons = 0;
     g_analog_x = g_analog_y = 128;
     memset(g_audio, 0, sizeof g_audio);
-#if PSPRECOMP_REAL_THREADS
-    memset(g_audio_due_us, 0, sizeof g_audio_due_us);
-#endif
     g_audio_blocks = 0;
 }
 

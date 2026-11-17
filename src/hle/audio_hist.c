@@ -56,6 +56,7 @@ typedef struct {
     uint32_t head, tail, count;
     int active;                 /* prefill done, callback may consume */
     int stopping;               /* released; drain, then stop */
+    int dry;                    /* already counted the current empty episode */
     uint32_t target;            /* prefill level in frames */
     uint32_t block;             /* last block size in frames */
     uint64_t last_fill_us;
@@ -78,10 +79,49 @@ static uint64_t g_mag_max;
 static uint64_t g_mag_sum;
 static uint64_t g_calls;
 
+/* --- trace and pacing state (S1/S2) --------------------------------------- */
+
+static int g_trace = -1;                    /* -1 unread, 0 off, 1 on */
+static uint64_t g_last_cb_us;               /* last device callback */
+static uint64_t g_last_report_us;
+static uint64_t g_start_us;
+static uint32_t g_scene_addr;               /* guest scene word, 0 = none */
+static uint32_t g_cb_min[AUDIO_CHANNELS], g_cb_max[AUDIO_CHANNELS];
+static uint32_t g_cb_n[AUDIO_CHANNELS];
+static uint64_t g_underruns_play[AUDIO_CHANNELS], g_underruns_other[AUDIO_CHANNELS];
+static uint64_t g_due_us[AUDIO_CHANNELS];   /* host-clock grid, the fallback */
+
 static uint64_t host_now_us(void) {
     struct timespec ts;
     timespec_get(&ts, TIME_UTC);
     return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u;
+}
+
+static int trace_on(void) {
+    if (g_trace < 0) {
+        const char *e = getenv("EMOTIONALSENSE_TRACE_AUDIO");
+        g_trace = e && e[0] && e[0] != '0';
+    }
+    return g_trace;
+}
+
+/* The game's scene word, so an underrun can be attributed to gameplay or to a
+ * scene change (where a gap is expected). */
+void psp_audio_set_scene_source(uint32_t addr) { g_scene_addr = addr; }
+
+static uint32_t g_scene_last;
+static uint64_t g_scene_changed_us;
+
+/* Reads the scene word and remembers when it changed: an underrun in the
+ * first second of a scene is the scene starting, not the song losing audio. */
+static uint32_t scene_now(uint64_t now) {
+    if (!g_scene_addr) return 0;
+    uint32_t s = psp_read32(g_scene_addr);
+    if (s != g_scene_last) {
+        g_scene_last = s;
+        g_scene_changed_us = now;
+    }
+    return s;
 }
 
 static int16_t clamp16(int32_t v) {
@@ -98,6 +138,7 @@ static void audio_callback(void *userdata, Uint8 *stream, int len) {
     int frames = len / 4;
     memset(out, 0, (size_t)len);
     uint64_t now = host_now_us();
+    uint32_t scene = scene_now(now);
 
     pthread_mutex_lock(&g_lock);
     for (int ch = 0; ch < AUDIO_CHANNELS; ch++) {
@@ -108,10 +149,26 @@ static void audio_callback(void *userdata, Uint8 *stream, int len) {
                 if (r->stopping || now - r->last_fill_us > END_TIMEOUT_US) {
                     r->active = 0;
                     r->stopping = 0;
+                    r->dry = 0;
                 } else {
-                    r->underruns++;
                     r->silence += (uint64_t)(frames - i);
-                    r->active = 0;      /* re-arm: wait for the target again */
+                    if (!r->dry) {
+                        /* One line per dry episode, and the channel stays
+                         * armed: the next block plays at once instead of
+                         * waiting for the whole prefill again. That wait was
+                         * the click in the middle of a long keysound. */
+                        r->dry = 1;
+                        r->underruns++;
+                        if (scene == 3u && now - g_scene_changed_us > 1000000u)
+                            g_underruns_play[ch]++;
+                        else g_underruns_other[ch]++;
+                        if (trace_on())
+                            fprintf(stderr,
+                                    "audio: underrun ch%d vblank=%llu scene=%u level=%u target=%u\n",
+                                    ch, (unsigned long long)psp_display_vblanks(),
+                                    scene,
+                                    r->count, r->target);
+                    }
                 }
                 break;
             }
@@ -126,8 +183,36 @@ static void audio_callback(void *userdata, Uint8 *stream, int len) {
         if (r->count > r->level_max) r->level_max = r->count;
         r->level_sum += r->count;
         r->level_n++;
+        if (trace_on()) {
+            uint32_t f = (uint32_t)frames;
+            if (!g_cb_n[ch]) { g_cb_min[ch] = f; g_cb_max[ch] = f; }
+            if (f < g_cb_min[ch]) g_cb_min[ch] = f;
+            if (f > g_cb_max[ch]) g_cb_max[ch] = f;
+            g_cb_n[ch]++;
+        }
     }
     pthread_mutex_unlock(&g_lock);
+
+    g_last_cb_us = now;
+    if (trace_on()) {
+        if (!g_start_us) g_start_us = now;
+        if (!g_last_report_us) g_last_report_us = now;
+        if (now - g_last_report_us >= 1000000u) {
+            g_last_report_us = now;
+            /* Counts read outside the lock: this is a diagnostic line, not a
+             * measurement that has to be exact to the frame. */
+            for (int ch = 0; ch < AUDIO_CHANNELS; ch++) {
+                if (!g_cb_n[ch]) continue;
+                fprintf(stderr,
+                        "audio[%llus] ch%d level=%u/%u cb=%u/%u n=%u underruns=%llu scene=%u\n",
+                        (unsigned long long)((now - g_start_us) / 1000000u), ch,
+                        g_ring[ch].count, g_target,
+                        g_cb_min[ch], g_cb_max[ch], g_cb_n[ch],
+                        (unsigned long long)g_ring[ch].underruns, scene);
+                g_cb_n[ch] = 0;
+            }
+        }
+    }
 }
 
 static int audio_open(void) {
@@ -150,6 +235,11 @@ static int audio_open(void) {
                 fprintf(stderr, "psprecomp: SDL_OpenAudioDevice failed (%s)\n", SDL_GetError());
             } else {
                 g_dev_samples = got.samples > 0 ? got.samples : want.samples;
+                fprintf(stderr,
+                        "audio: driver=%s asked %d Hz/%d frames, got %d Hz/%d frames fmt %d ch %d\n",
+                        SDL_GetCurrentAudioDriver() ? SDL_GetCurrentAudioDriver() : "?",
+                        AUDIO_OUT_FREQ, want.samples, got.freq, got.samples,
+                        (int)got.format, (int)got.channels);
                 SDL_PauseAudioDevice(g_dev, 0);   /* devices open paused */
                 g_dev_state = 1;
             }
@@ -177,14 +267,20 @@ void psprecomp_audio_reset(void) {
     for (int c = 0; c < AUDIO_CHANNELS; c++) {
         audio_ring *r = &g_ring[c];
         r->head = r->tail = r->count = 0;
-        r->active = r->stopping = 0;
+        r->active = r->stopping = r->dry = 0;
         r->target = r->block = 0;
         r->last_fill_us = 0;
         r->blocks = r->underruns = r->silence = r->dropped = 0;
         r->level_sum = r->level_n = 0;
         r->level_min = UINT32_MAX;
         r->level_max = 0;
+        g_cb_min[c] = g_cb_max[c] = g_cb_n[c] = 0;
+        g_underruns_play[c] = g_underruns_other[c] = 0;
+        g_due_us[c] = 0;
     }
+    g_last_cb_us = 0;
+    g_last_report_us = 0;
+    g_start_us = 0;
     g_audio_blocks = 0;
     g_audio_maxblocks = 0;
     g_target = 0;
@@ -204,9 +300,13 @@ void psprecomp_audio_report(void) {
         double avg = r->level_n ? (double)r->level_sum / (double)r->level_n : 0.0;
         fprintf(stderr,
                 "psprecomp_audio_report: ch%d blocks=%llu samples/block=%u underruns=%llu "
-                "silence=%llu dropped=%llu ring_min=%u ring_avg=%.0f ring_max=%u avg_ms=%.1f\n",
+                "(play=%llu other=%llu) silence=%llu dropped=%llu "
+                "ring_min=%u ring_avg=%.0f ring_max=%u avg_ms=%.1f\n",
                 c, (unsigned long long)r->blocks, r->block,
-                (unsigned long long)r->underruns, (unsigned long long)r->silence,
+                (unsigned long long)r->underruns,
+                (unsigned long long)g_underruns_play[c],
+                (unsigned long long)g_underruns_other[c],
+                (unsigned long long)r->silence,
                 (unsigned long long)r->dropped,
                 r->level_min == UINT32_MAX ? 0 : r->level_min, avg, r->level_max,
                 avg * 1000.0 / AUDIO_OUT_FREQ);
@@ -260,6 +360,7 @@ void psp_audio_output(int channel, int leftvol, int rightvol,
     r->block = (uint32_t)samples;
     r->last_fill_us = host_now_us();
     r->blocks++;
+    r->dry = 0;                 /* the ring is fed again: next dry is a new one */
 
     /* Prefill: one target for every channel, so keysounds and BGM have the
      * same latency. The largest guest block sets the floor (2048 frames =
@@ -298,4 +399,57 @@ void psp_audio_output(int channel, int leftvol, int rightvol,
 
 int audio_passing_blocks(void) {
     return (int)g_audio_blocks;
+}
+
+/* --- S1: the device sets the pace -----------------------------------------
+ *
+ * Every blocking output waits until its channel's ring has room again, which is
+ * what the hardware queue does on a PSP. The level of the ring IS that
+ * channel's latency, so following it keeps keysounds and BGM at the same
+ * distance from the speaker instead of letting each drift on its own clock. */
+
+static int device_consuming(void) {
+    if (g_dev_state != 1) return 0;
+    return g_last_cb_us && host_now_us() - g_last_cb_us < 200000u;
+}
+
+/* The host-clock grid, kept as the fallback: virtual clock, no audio device
+ * opened, or a callback that stopped for longer than 200 ms. */
+static void audio_grid(int ch, uint64_t play_us) {
+    static int ahead_init;
+    static uint64_t ahead_us;
+    if (!ahead_init) {
+        ahead_init = 1;
+        const char *e = getenv("EMOTIONALSENSE_AUDIO_AHEAD_MS");
+        int ms = e ? atoi(e) : 0;
+        ahead_us = (uint64_t)(ms > 0 ? ms : 0) * 1000u;
+    }
+    uint64_t now = host_now_us();
+    if (g_due_us[ch] + 100000u < now) g_due_us[ch] = now;
+    g_due_us[ch] += play_us;
+    uint64_t t = host_now_us();
+    if (t + ahead_us < g_due_us[ch])
+        psp_threadman_sleep_real(g_due_us[ch] - ahead_us - t);
+}
+
+void psp_audio_wait(int channel, uint64_t play_us) {
+    if (psp_threadman_clock_virtual()) {
+        /* Deterministic runs cannot pace against the device: how much audio is
+         * queued would differ from run to run. The frame wait owns the virtual
+         * clock, so only hand over here. */
+        psp_threadman_sleep_real(play_us);
+        return;
+    }
+    if (channel < 0 || channel >= AUDIO_CHANNELS) return;
+    if (!device_consuming()) { audio_grid(channel, play_us); return; }
+    for (;;) {
+        pthread_mutex_lock(&g_lock);
+        uint32_t level = g_ring[channel].count;
+        uint32_t target = g_target;
+        pthread_mutex_unlock(&g_lock);
+        if (!target || level <= target) break;
+        if (!device_consuming()) break;   /* the device stopped: do not hang */
+        uint64_t excess_us = (uint64_t)(level - target) * 1000000u / AUDIO_OUT_FREQ;
+        psp_threadman_sleep_real(excess_us ? excess_us : 1000u);
+    }
 }

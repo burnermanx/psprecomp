@@ -59,6 +59,9 @@ typedef struct {
     int dry;                    /* already counted the current empty episode */
     uint32_t target;            /* prefill level in frames */
     uint32_t block;             /* last block size in frames */
+    uint32_t trim;              /* extra frames this channel may queue past the target */
+    double lat_sum;             /* sum over samples of the queue ahead of each, frames */
+    uint64_t lat_n;             /* samples counted in lat_sum (trace window) */
     uint64_t last_fill_us;
     uint64_t blocks, underruns, silence, dropped;
     uint64_t level_sum, level_n;
@@ -198,11 +201,14 @@ static void audio_callback(void *userdata, Uint8 *stream, int len) {
             for (int ch = 0; ch < AUDIO_CHANNELS; ch++) {
                 if (!g_cb_n[ch]) continue;
                 fprintf(stderr,
-                        "audio[%llus] ch%d level=%u/%u cb=%u/%u n=%u underruns=%llu scene=%u\n",
+                        "audio[%llus] ch%d level=%u/%u cb=%u/%u n=%u underruns=%llu scene=%u lat=%.1f\n",
                         (unsigned long long)((now - g_start_us) / 1000000u), ch,
                         g_ring[ch].count, g_target,
                         g_cb_min[ch], g_cb_max[ch], g_cb_n[ch],
-                        (unsigned long long)g_ring[ch].underruns, scene);
+                        (unsigned long long)g_ring[ch].underruns, scene,
+                        g_ring[ch].lat_n ? g_ring[ch].lat_sum / (double)g_ring[ch].lat_n : 0.0);
+                g_ring[ch].lat_sum = 0;
+                g_ring[ch].lat_n = 0;
                 g_cb_n[ch] = 0;
             }
         }
@@ -262,7 +268,9 @@ void psprecomp_audio_reset(void) {
         audio_ring *r = &g_ring[c];
         r->head = r->tail = r->count = 0;
         r->active = r->stopping = r->dry = 0;
-        r->target = r->block = 0;
+        r->target = r->block = r->trim = 0;
+        r->lat_sum = 0;
+        r->lat_n = 0;
         r->last_fill_us = 0;
         r->blocks = r->underruns = r->silence = r->dropped = 0;
         r->level_sum = r->level_n = 0;
@@ -319,6 +327,23 @@ void psprecomp_audio_report(void) {
 /* PSP volumes run 0..0x8000 (unity). */
 static int scale_vol(int v) { return v < 0 ? 0 : v > 0x8000 ? 0x8000 : v; }
 
+/* Channels that deliver small blocks (the keysounds, 256 frames) sit about
+ * half a big block closer to the speaker than the music (2048 frames), because
+ * latency per sample is the level at enqueue plus (block - 1) / 2. Letting
+ * them queue a little more evens it out. The criterion is the block size, not
+ * the channel number. EMOTIONALSENSE_KEY_TRIM=<frames> adjusts it. */
+static uint32_t key_trim_for(uint32_t block) {
+    if (block > 256) return 0;
+    static int init;
+    static uint32_t trim = 512;
+    if (!init) {
+        init = 1;
+        const char *e = getenv("EMOTIONALSENSE_KEY_TRIM");
+        if (e && e[0]) { int v = atoi(e); trim = v > 0 ? (uint32_t)v : 0; }
+    }
+    return trim;
+}
+
 void psp_audio_output(int channel, int leftvol, int rightvol,
                       const int16_t *buf, int samples) {
     if (!buf || samples <= 0) return;
@@ -350,8 +375,13 @@ void psp_audio_output(int channel, int leftvol, int rightvol,
         sum += m;
         if (m > peak) peak = m;
     }
+    /* Latency per sample: a block that enters behind `count` frames has
+     * samples with count .. count+block-1 frames in front of them. */
+    r->lat_sum += (double)samples * ((double)r->count + ((double)samples - 1.0) / 2.0);
+    r->lat_n += (uint64_t)samples;
     r->count += (uint32_t)samples;
     r->block = (uint32_t)samples;
+    r->trim = key_trim_for(r->block);
     r->last_fill_us = host_now_us();
     r->blocks++;
     r->dry = 0;                 /* the ring is fed again: next dry is a new one */
@@ -440,6 +470,7 @@ void psp_audio_wait(int channel, uint64_t play_us) {
         pthread_mutex_lock(&g_lock);
         uint32_t level = g_ring[channel].count;
         uint32_t target = g_target;
+        if (target) target += g_ring[channel].trim;
         pthread_mutex_unlock(&g_lock);
         if (!target || level <= target) break;
         if (!device_consuming()) break;   /* the device stopped: do not hang */

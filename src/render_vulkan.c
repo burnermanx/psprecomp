@@ -1847,6 +1847,19 @@ static void vk_set_target(uint32_t addr, uint32_t stride, int fmt) {
     g_fb_fmt = fmt;
 }
 
+/* Bilinear for this draw. In auto mode the game's TEXFILTER bit decides, with
+ * one exception: the decoded video lives in VRAM at 480x272 and is stretched
+ * over the whole screen, so at N > 1 nearest turns it into visible blocks.
+ * Only the video is ever a VRAM texture (G0 measured that), and at 1x the
+ * filter stays exactly as the game asked. */
+static int tex_bilinear(const psp_draw_state *st) {
+    int want = psp_render_tex_filter < 0 ? st->tex_filter : psp_render_tex_filter;
+    if (psp_render_tex_filter < 0 && g_scale > 1 &&
+        (st->tex_addr & PSP_ADDR_MASK) >= PSP_VRAM_BASE)
+        return 1;
+    return want ? 1 : 0;
+}
+
 static void emit_tri(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c, int gouraud) {
     if (a->behind || b->behind || c->behind) return;
     int area = (b->x - a->x) * (c->y - a->y) - (b->y - a->y) * (c->x - a->x);
@@ -1978,8 +1991,7 @@ static void vk_draw(int prim, const psp_vertex *v, int count, const psp_draw_sta
                      ((uint32_t)(st->atest_func & 7) << 10) |
                      ((uint32_t)(st->atest_ref & 0xFF) << 16) |
                      ((uint32_t)(st->atest_mask & 0xFF) << 24) |
-                     ((psp_render_tex_filter < 0 ? st->tex_filter : psp_render_tex_filter)
-                          ? 8192u : 0u);   /* F_BILINEAR */
+                     ((tex_bilinear(st) ? 8192u : 0u));   /* F_BILINEAR */
 
     vk_push_constants pc = {
         .tex_w = (int32_t)(st->tex_w * (int)g_uv_scale),

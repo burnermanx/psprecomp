@@ -38,7 +38,7 @@ static int g_scale = 1;
 #define MAX_TEX_CACHE     512
 #define MAX_TEX_UPLOADS   256
 #define MAX_PIPELINES     128
-#define TEX_STAGING_SIZE  (16u * 1024u * 1024u)
+#define TEX_STAGING_SIZE  (32u * 1024u * 1024u)
 
 typedef struct {
     float    x, y, z;
@@ -69,6 +69,8 @@ typedef struct {
     VkDescriptorSet   desc_set;
     VkDescriptorSet   desc_set_linear;
     int               layout_ready;
+    int               uv_scale;      /* 1, or the pack's integer multiple */
+    int               img_w, img_h;  /* size of the image actually allocated */
 } vk_tex_entry;
 
 typedef struct {
@@ -587,7 +589,7 @@ static int alloc_tex_slot(int w, int h) {
         }
     }
     vk_tex_entry *e = &g_tex_cache[best];
-    if (e->used && (e->tex_w != w || e->tex_h != h)) {
+    if (e->used && (e->img_w != w || e->img_h != h)) {
         vkDestroyImageView(g_dev, e->view, NULL);
         vkDestroyImage(g_dev, e->image, NULL);
         vkFreeMemory(g_dev, e->memory, NULL);
@@ -605,6 +607,8 @@ static int alloc_tex_slot(int w, int h) {
         e->used = 1;
         e->layout_ready = 0;
     }
+    e->img_w = w;
+    e->img_h = h;
     return best;
 }
 
@@ -619,6 +623,8 @@ static int queue_solid_texture(int slot, uint32_t color) {
         e->used = 1;
         e->tex_w = 1;
         e->tex_h = 1;
+        e->img_w = 1;
+        e->img_h = 1;
         e->layout_ready = 0;
     }
     uint32_t off = (g_tex_staging_off + 3u) & ~3u;
@@ -627,6 +633,114 @@ static int queue_solid_texture(int slot, uint32_t color) {
     g_tex_uploads[g_num_tex_uploads++] = (vk_tex_upload){ slot, off, 1, 1 };
     e->batch_used = g_batch_id;
     return slot;
+}
+
+/* ---- Texture pack --------------------------------------------------------
+ *
+ * <data>/textures/<key>.png replaces a texture at upload time. The key is the
+ * one the dump writes, so a pack is the dump directory with the files
+ * upscaled: no index, no manifest, and a file that is not there simply means
+ * "keep the original".
+ *
+ * The replacement must be an integer multiple of the original, because the
+ * UVs stay in original texels. The scale is applied where the vertices are
+ * emitted and the shader sees the scaled size, so wrapping and clamping keep
+ * working in the scaled space.
+ *
+ * Loading is lazy: the file is decoded the first time that texture is drawn.
+ * That costs one frame's decode per texture and nothing afterwards; decoding
+ * the whole pack up front would hold every texel in RAM for the whole run. */
+
+#define PACK_MAX 1024
+
+typedef struct {
+    uint64_t  key;
+    uint32_t *px;
+    int       w, h;
+    int       state;        /* 0 untouched, 1 loaded, 2 absent or unusable */
+} vk_pack_entry;
+
+static vk_pack_entry g_pack[PACK_MAX];
+static int           g_pack_dir_ready;
+static char          g_pack_dir[512];
+static int           g_pack_used;
+static int           g_pack_skipped;
+static int           g_pack_over;
+static uint64_t      g_pack_bytes;
+static uint64_t      g_pack_limit;
+static float         g_uv_scale = 1.0f;
+
+static void pack_dir_init(void) {
+    if (g_pack_dir_ready) return;
+    g_pack_dir_ready = 1;
+    const char *env = getenv("EMOTIONALSENSE_TEX_PACK");
+    if (env && *env) {
+        snprintf(g_pack_dir, sizeof g_pack_dir, "%s", env);
+    } else {
+        snprintf(g_pack_dir, sizeof g_pack_dir, "%s/textures", psp_io_root());
+    }
+    /* A 4x pack of the whole game is a few hundred MiB decoded; the budget is
+     * there so a bigger pack degrades to the original art instead of failing
+     * an allocation somewhere deep in the driver. */
+    const char *max = getenv("EMOTIONALSENSE_TEX_PACK_MAX");
+    uint64_t mib = max && *max ? strtoull(max, NULL, 10) : 1024u;
+    g_pack_limit = mib * 1024u * 1024u;
+}
+
+static vk_pack_entry *pack_lookup(uint64_t key, int w, int h) {
+    uint32_t i = (uint32_t)(key >> 40) & (PACK_MAX - 1u);
+    for (int probe = 0; probe < 64; probe++, i = (i + 1u) & (PACK_MAX - 1u)) {
+        vk_pack_entry *e = &g_pack[i];
+        if (e->state == 0) {
+            pack_dir_init();
+            char path[640];
+            snprintf(path, sizeof path, "%s/%016llx.png", g_pack_dir,
+                     (unsigned long long)key);
+            uint32_t *px = NULL;
+            int pw = 0, ph = 0;
+            e->key = key;
+            if (psp_tex_png_read(path, &px, &pw, &ph) != 0) {
+                e->state = 2;
+                return NULL;
+            }
+            if (w <= 0 || h <= 0 || pw < w || ph < h || pw % w || ph % h ||
+                pw / w != ph / h) {
+                free(px);
+                e->state = 2;
+                g_pack_skipped++;
+                return NULL;
+            }
+            uint64_t size = (uint64_t)pw * (uint64_t)ph * 4u;
+            if (g_pack_bytes + size > g_pack_limit) {
+                free(px);
+                e->state = 2;
+                g_pack_skipped++;
+                if (!g_pack_over) {
+                    g_pack_over = 1;
+                    fprintf(stderr, "tex pack: over the %llu MiB budget, "
+                                    "keeping the original textures\n",
+                            (unsigned long long)(g_pack_limit >> 20));
+                }
+                return NULL;
+            }
+            e->px = px;
+            e->w = pw;
+            e->h = ph;
+            e->state = 1;
+            g_pack_used++;
+            g_pack_bytes += size;
+            return e;
+        }
+        if (e->key == key) return e->state == 1 ? e : NULL;
+    }
+    return NULL;
+}
+
+void psp_tex_pack_report(FILE *f) {
+    if (!f) return;
+    if (g_pack_used == 0 && g_pack_skipped == 0) return;
+    fprintf(f, "tex pack: %d textures, %.1f MiB decoded, %d skipped\n",
+            g_pack_used, (double)g_pack_bytes / (1024.0 * 1024.0), g_pack_skipped);
 }
 
 static int resolve_texture(const psp_draw_state *st) {
@@ -683,6 +797,13 @@ static int resolve_texture(const psp_draw_state *st) {
 
     tex_dump_note(st, data_hash, clut_hash);
 
+    vk_pack_entry *pack = pack_lookup(dump_key(data_hash, clut_hash, st->tex_fmt,
+                                               st->tex_w, st->tex_h),
+                                      st->tex_w, st->tex_h);
+    int up_w = pack ? pack->w : st->tex_w;
+    int up_h = pack ? pack->h : st->tex_h;
+    int uv_scale = pack ? up_w / st->tex_w : 1;
+
     int match_same_geom = -1;
     for (int i = 2; i < MAX_TEX_CACHE; i++) {
         vk_tex_entry *e = &g_tex_cache[i];
@@ -700,24 +821,27 @@ static int resolve_texture(const psp_draw_state *st) {
                 e->batch_used = g_batch_id;
                 return i;
             }
-            if (e->batch_used != g_batch_id) match_same_geom = i;
+            if (e->batch_used != g_batch_id && e->img_w == up_w && e->img_h == up_h)
+                match_same_geom = i;
         }
     }
 
-    uint32_t bytes_needed = (uint32_t)st->tex_w * (uint32_t)st->tex_h * 4u;
+    uint32_t bytes_needed = (uint32_t)up_w * (uint32_t)up_h * 4u;
     uint32_t aligned_off = (g_tex_staging_off + 3u) & ~3u;
     if (aligned_off + bytes_needed > TEX_STAGING_SIZE || g_num_tex_uploads >= MAX_TEX_UPLOADS) {
         vk_flush();
         aligned_off = (g_tex_staging_off + 3u) & ~3u;
     }
 
-    int slot = match_same_geom >= 0 ? match_same_geom : alloc_tex_slot(st->tex_w, st->tex_h);
+    int slot = match_same_geom >= 0 ? match_same_geom : alloc_tex_slot(up_w, up_h);
     if (slot < 0) return g_dummy_white_slot;
 
     /* Decode texture into staging buffer */
     uint32_t *dst = (uint32_t *)(g_tex_staging_ptr + aligned_off);
     int w = st->tex_w, h = st->tex_h;
-    if (!st->tex_swizzle && st->tex_fmt == PSP_TPSM_8888) {
+    if (pack) {
+        memcpy(dst, pack->px, (size_t)up_w * (size_t)up_h * 4u);
+    } else if (!st->tex_swizzle && st->tex_fmt == PSP_TPSM_8888) {
         for (int y = 0; y < h; y++) {
             uint32_t row_addr = st->tex_addr + (uint32_t)(y * st->tex_bw) * 4u;
             const void *src = psp_mem_ptr(row_addr, (uint32_t)w * 4u);
@@ -736,7 +860,7 @@ static int resolve_texture(const psp_draw_state *st) {
     }
 
     g_tex_staging_off = aligned_off + bytes_needed;
-    g_tex_uploads[g_num_tex_uploads++] = (vk_tex_upload){ slot, aligned_off, w, h };
+    g_tex_uploads[g_num_tex_uploads++] = (vk_tex_upload){ slot, aligned_off, up_w, up_h };
 
     vk_tex_entry *e = &g_tex_cache[slot];
     e->tex_addr = st->tex_addr & PSP_ADDR_MASK;
@@ -750,6 +874,7 @@ static int resolve_texture(const psp_draw_state *st) {
     e->data_hash = data_hash;
     e->last_used = ++g_use_tick;
     e->batch_used = g_batch_id;
+    e->uv_scale = uv_scale;
     return slot;
 }
 
@@ -1734,9 +1859,12 @@ static void emit_tri(const psp_vertex *a, const psp_vertex *b, const psp_vertex 
     /* Positions stay in guest pixels: the viewport already maps the 480x272
      * clip space onto the scaled target, so the triangles are rasterized at
      * N times the resolution without touching the geometry. */
-    g_vbo_ptr[g_vbo_count++] = (vk_vertex){ (float)a->x, (float)a->y, a->z, col_a, a->u, a->v };
-    g_vbo_ptr[g_vbo_count++] = (vk_vertex){ (float)b->x, (float)b->y, b->z, col_b, b->u, b->v };
-    g_vbo_ptr[g_vbo_count++] = (vk_vertex){ (float)c->x, (float)c->y, c->z, col_c, c->u, c->v };
+    g_vbo_ptr[g_vbo_count++] = (vk_vertex){ (float)a->x, (float)a->y, a->z, col_a,
+                                            a->u * g_uv_scale, a->v * g_uv_scale };
+    g_vbo_ptr[g_vbo_count++] = (vk_vertex){ (float)b->x, (float)b->y, b->z, col_b,
+                                            b->u * g_uv_scale, b->v * g_uv_scale };
+    g_vbo_ptr[g_vbo_count++] = (vk_vertex){ (float)c->x, (float)c->y, c->z, col_c,
+                                            c->u * g_uv_scale, c->v * g_uv_scale };
 }
 
 static void emit_sprite(const psp_vertex *a, const psp_vertex *b) {
@@ -1751,13 +1879,19 @@ static void emit_sprite(const psp_vertex *a, const psp_vertex *b) {
     uint32_t col = b->rgba;
     float z = b->z;
 
-    g_vbo_ptr[g_vbo_count++] = (vk_vertex){ (float)x0, (float)y0, z, col, u0, v0 };
-    g_vbo_ptr[g_vbo_count++] = (vk_vertex){ (float)x1, (float)y0, z, col, u1, v0 };
-    g_vbo_ptr[g_vbo_count++] = (vk_vertex){ (float)x0, (float)y1, z, col, u0, v1 };
+    g_vbo_ptr[g_vbo_count++] = (vk_vertex){ (float)x0, (float)y0, z, col,
+                                            u0 * g_uv_scale, v0 * g_uv_scale };
+    g_vbo_ptr[g_vbo_count++] = (vk_vertex){ (float)x1, (float)y0, z, col,
+                                            u1 * g_uv_scale, v0 * g_uv_scale };
+    g_vbo_ptr[g_vbo_count++] = (vk_vertex){ (float)x0, (float)y1, z, col,
+                                            u0 * g_uv_scale, v1 * g_uv_scale };
 
-    g_vbo_ptr[g_vbo_count++] = (vk_vertex){ (float)x1, (float)y0, z, col, u1, v0 };
-    g_vbo_ptr[g_vbo_count++] = (vk_vertex){ (float)x1, (float)y1, z, col, u1, v1 };
-    g_vbo_ptr[g_vbo_count++] = (vk_vertex){ (float)x0, (float)y1, z, col, u0, v1 };
+    g_vbo_ptr[g_vbo_count++] = (vk_vertex){ (float)x1, (float)y0, z, col,
+                                            u1 * g_uv_scale, v0 * g_uv_scale };
+    g_vbo_ptr[g_vbo_count++] = (vk_vertex){ (float)x1, (float)y1, z, col,
+                                            u1 * g_uv_scale, v1 * g_uv_scale };
+    g_vbo_ptr[g_vbo_count++] = (vk_vertex){ (float)x0, (float)y1, z, col,
+                                            u0 * g_uv_scale, v1 * g_uv_scale };
 }
 
 static void vk_draw(int prim, const psp_vertex *v, int count, const psp_draw_state *st) {
@@ -1786,6 +1920,8 @@ static void vk_draw(int prim, const psp_vertex *v, int count, const psp_draw_sta
     }
 
     int tex_slot = resolve_texture(st);
+    g_uv_scale = g_tex_cache[tex_slot].uv_scale > 0
+                     ? (float)g_tex_cache[tex_slot].uv_scale : 1.0f;
 
     if (uses_z) {
         g_batch_has_z = 1;
@@ -1846,8 +1982,8 @@ static void vk_draw(int prim, const psp_vertex *v, int count, const psp_draw_sta
                           ? 8192u : 0u);   /* F_BILINEAR */
 
     vk_push_constants pc = {
-        .tex_w = st->tex_w,
-        .tex_h = st->tex_h,
+        .tex_w = (int32_t)(st->tex_w * (int)g_uv_scale),
+        .tex_h = (int32_t)(st->tex_h * (int)g_uv_scale),
         .flags = flags,
         .tex_env = st->tex_env
     };

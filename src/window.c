@@ -259,9 +259,12 @@ static uint32_t pad(SDL_GameController *gc, uint8_t *ax, uint8_t *ay) {
  * is the case at 1x and at 2x on a 1440p screen. At 4x the frame is 1088 tall
  * and a 1080p window cannot hold it whole, so let SDL scale by aspect instead
  * of cropping the bottom rows. */
+static atomic_int g_win_h;          /* drawable height, for --internal-scale auto */
+
 static void fit_scale(SDL_Renderer *ren, int w, int h) {
     int dw = 0, dh = 0;
     SDL_GetRendererOutputSize(ren, &dw, &dh);
+    atomic_store(&g_win_h, dh);
     SDL_RenderSetIntegerScale(ren, (dw > 0 && dh > 0 && dw % w == 0 && dh % h == 0)
                                    ? SDL_TRUE : SDL_FALSE);
 }
@@ -422,11 +425,15 @@ int psp_window_start(const char *title, int scale) {
 
 int psp_window_closed(void) { return atomic_load(&g_closed) != 0; }
 
+int psp_window_height(void) { return atomic_load(&g_win_h); }
+
 #else
 
 /* ponytail: no window without Win32 or SDL2 (configure with
  * -DPSPRECOMP_SDL2=ON). */
 int psp_window_start(const char *title, int scale) { (void)title; (void)scale; return -1; }
 int psp_window_closed(void) { return 0; }
+
+int psp_window_height(void) { return 0; }
 
 #endif

@@ -30,4 +30,7 @@ int psp_window_start(const char *title, int scale);
 /* Nonzero once the user has closed the window. */
 int psp_window_closed(void);
 
+/* Drawable height in pixels, or 0 when there is no window. */
+int psp_window_height(void);
+
 #endif

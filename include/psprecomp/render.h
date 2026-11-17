@@ -132,7 +132,9 @@ int psp_render_frame(const uint32_t **px, int *w, int *h);
 
 /* Texture dump (EMOTIONALSENSE_TEX_DUMP). Writes RGBA8 PNGs, no dependency. */
 int  psp_tex_png_write(const char *path, const uint32_t *rgba, int w, int h);
+int  psp_tex_png_read(const char *path, uint32_t **rgba, int *w, int *h);
 void psp_tex_dump_report(FILE *f);
+void psp_tex_pack_report(FILE *f);
 
 /* Select a backend by name ("software", "null", ...). Returns 0 on success,
  * -1 if the name is unknown, leaving the current backend in place. */

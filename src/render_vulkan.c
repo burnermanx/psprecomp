@@ -23,6 +23,12 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <dirent.h>
+#endif
+
 #define FB_W 480
 #define FB_H 272
 
@@ -647,9 +653,10 @@ static int queue_solid_texture(int slot, uint32_t color) {
  * emitted and the shader sees the scaled size, so wrapping and clamping keep
  * working in the scaled space.
  *
- * Loading is lazy: the file is decoded the first time that texture is drawn.
- * That costs one frame's decode per texture and nothing afterwards; decoding
- * the whole pack up front would hold every texel in RAM for the whole run. */
+ * The whole pack is decoded once, before the first frame. Decoding on first
+ * use was the obvious thing and it is wrong: a 2048x2048 decode takes tens of
+ * milliseconds, the audio ring holds about forty, and the result was an
+ * underrun in the middle of a song (measured at vblank 2067). */
 
 #define PACK_MAX 1024
 
@@ -657,11 +664,11 @@ typedef struct {
     uint64_t  key;
     uint32_t *px;
     int       w, h;
-    int       state;        /* 0 untouched, 1 loaded, 2 absent or unusable */
+    int       state;        /* 0 empty, 1 loaded */
 } vk_pack_entry;
 
 static vk_pack_entry g_pack[PACK_MAX];
-static int           g_pack_dir_ready;
+static int           g_pack_scanned;
 static char          g_pack_dir[512];
 static int           g_pack_used;
 static int           g_pack_skipped;
@@ -670,9 +677,66 @@ static uint64_t      g_pack_bytes;
 static uint64_t      g_pack_limit;
 static float         g_uv_scale = 1.0f;
 
-static void pack_dir_init(void) {
-    if (g_pack_dir_ready) return;
-    g_pack_dir_ready = 1;
+static uint32_t pack_slot(uint64_t key) {
+    return (uint32_t)(key >> 40) & (PACK_MAX - 1u);
+}
+
+/* Insert one decoded file. Returns 0 when it fits, -1 when it does not. */
+static int pack_insert(uint64_t key, uint32_t *px, int w, int h) {
+    uint32_t i = pack_slot(key);
+    for (int probe = 0; probe < 64; probe++, i = (i + 1u) & (PACK_MAX - 1u)) {
+        vk_pack_entry *e = &g_pack[i];
+        if (e->state == 0) {
+            e->key = key;
+            e->px = px;
+            e->w = w;
+            e->h = h;
+            e->state = 1;
+            g_pack_used++;
+            g_pack_bytes += (uint64_t)w * (uint64_t)h * 4u;
+            return 0;
+        }
+        if (e->key == key) return 0;    /* same art twice; keep the first */
+    }
+    return -1;
+}
+
+static void pack_load_file(const char *name) {
+    /* <16 hex>.png and nothing else. */
+    if (strlen(name) != 20 || strcmp(name + 16, ".png") != 0) return;
+    uint64_t key = 0;
+    for (int i = 0; i < 16; i++) {
+        int c = name[i];
+        int v;
+        if (c >= '0' && c <= '9') v = c - '0';
+        else if (c >= 'a' && c <= 'f') v = c - 'a' + 10;
+        else if (c >= 'A' && c <= 'F') v = c - 'A' + 10;
+        else return;
+        key = (key << 4) | (uint64_t)v;
+    }
+    char path[640];
+    snprintf(path, sizeof path, "%s/%s", g_pack_dir, name);
+    uint32_t *px = NULL;
+    int w = 0, h = 0;
+    if (psp_tex_png_read(path, &px, &w, &h) != 0) return;
+    uint64_t size = (uint64_t)w * (uint64_t)h * 4u;
+    if (g_pack_bytes + size > g_pack_limit) {
+        free(px);
+        if (!g_pack_over) {
+            g_pack_over = 1;
+            fprintf(stderr, "tex pack: over the %llu MiB budget, keeping the "
+                            "original textures\n",
+                    (unsigned long long)(g_pack_limit >> 20));
+        }
+        return;
+    }
+    if (pack_insert(key, px, w, h) != 0) free(px);
+}
+
+static void pack_scan(void) {
+    if (g_pack_scanned) return;
+    g_pack_scanned = 1;
+
     const char *env = getenv("EMOTIONALSENSE_TEX_PACK");
     if (env && *env) {
         snprintf(g_pack_dir, sizeof g_pack_dir, "%s", env);
@@ -685,60 +749,44 @@ static void pack_dir_init(void) {
     const char *max = getenv("EMOTIONALSENSE_TEX_PACK_MAX");
     uint64_t mib = max && *max ? strtoull(max, NULL, 10) : 1024u;
     g_pack_limit = mib * 1024u * 1024u;
+
+#ifdef _WIN32
+    char pattern[640];
+    snprintf(pattern, sizeof pattern, "%s\\*", g_pack_dir);
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(pattern, &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) pack_load_file(fd.cFileName);
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+#else
+    DIR *d = opendir(g_pack_dir);
+    if (!d) return;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) pack_load_file(de->d_name);
+    closedir(d);
+#endif
 }
 
 static vk_pack_entry *pack_lookup(uint64_t key, int w, int h) {
-    uint32_t i = (uint32_t)(key >> 40) & (PACK_MAX - 1u);
+    uint32_t i = pack_slot(key);
     for (int probe = 0; probe < 64; probe++, i = (i + 1u) & (PACK_MAX - 1u)) {
         vk_pack_entry *e = &g_pack[i];
-        if (e->state == 0) {
-            pack_dir_init();
-            char path[640];
-            snprintf(path, sizeof path, "%s/%016llx.png", g_pack_dir,
-                     (unsigned long long)key);
-            uint32_t *px = NULL;
-            int pw = 0, ph = 0;
-            e->key = key;
-            if (psp_tex_png_read(path, &px, &pw, &ph) != 0) {
-                e->state = 2;
-                return NULL;
-            }
-            if (w <= 0 || h <= 0 || pw < w || ph < h || pw % w || ph % h ||
-                pw / w != ph / h) {
-                free(px);
-                e->state = 2;
-                g_pack_skipped++;
-                return NULL;
-            }
-            uint64_t size = (uint64_t)pw * (uint64_t)ph * 4u;
-            if (g_pack_bytes + size > g_pack_limit) {
-                free(px);
-                e->state = 2;
-                g_pack_skipped++;
-                if (!g_pack_over) {
-                    g_pack_over = 1;
-                    fprintf(stderr, "tex pack: over the %llu MiB budget, "
-                                    "keeping the original textures\n",
-                            (unsigned long long)(g_pack_limit >> 20));
-                }
-                return NULL;
-            }
-            e->px = px;
-            e->w = pw;
-            e->h = ph;
-            e->state = 1;
-            g_pack_used++;
-            g_pack_bytes += size;
-            return e;
+        if (e->state == 0) return NULL;
+        if (e->key != key) continue;
+        if (w <= 0 || h <= 0 || e->w < w || e->h < h ||
+            e->w % w || e->h % h || e->w / w != e->h / h) {
+            g_pack_skipped++;
+            return NULL;
         }
-        if (e->key == key) return e->state == 1 ? e : NULL;
+        return e;
     }
     return NULL;
 }
 
 void psp_tex_pack_report(FILE *f) {
-    if (!f) return;
-    if (g_pack_used == 0 && g_pack_skipped == 0) return;
+    if (!f || (g_pack_used == 0 && g_pack_skipped == 0)) return;
     fprintf(f, "tex pack: %d textures, %.1f MiB decoded, %d skipped\n",
             g_pack_used, (double)g_pack_bytes / (1024.0 * 1024.0), g_pack_skipped);
 }
@@ -1228,6 +1276,9 @@ static int vk_init(int width, int height) {
 
     /* Attachments */
     g_scale = psp_render_scale < 1 ? 1 : psp_render_scale > 4 ? 4 : psp_render_scale;
+    /* Before the first frame: a decode in the middle of a song starves the
+     * audio ring, which is measured, not theoretical. */
+    pack_scan();
     if (create_image((uint32_t)VW, (uint32_t)VH, VK_FORMAT_R8G8B8A8_UNORM,
                      VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                      VK_IMAGE_ASPECT_COLOR_BIT, &g_color_img, &g_color_mem, &g_color_view) != 0 ||

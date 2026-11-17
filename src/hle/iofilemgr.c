@@ -53,7 +53,7 @@ static int64_t io_tell(FILE *f) {
 #define PSP_O_CREAT  0x0200
 #define PSP_O_TRUNC  0x0400
 
-typedef struct { FILE *f; int used; int raw; uint64_t lba; } io_file;
+typedef struct { FILE *f; int used; int raw; uint64_t lba; char guest[96]; } io_file;
 
 typedef struct {
     int used;
@@ -224,6 +224,7 @@ static void hle_Open(void) {
         if (g_file[i].used) continue;
         g_file[i].f = f;
         g_file[i].used = 1;
+        snprintf(g_file[i].guest, sizeof g_file[i].guest, "%s", guest);
         psp_ret((uint32_t)(i + 3));   /* 0-2 are reserved for the std streams */
         return;
     }
@@ -321,6 +322,18 @@ static void hle_Write(void) {
     uint8_t *tmp = (uint8_t *)malloc(size ? size : 1);
     if (!tmp) { psp_ret(0x80020190); return; }
     for (uint32_t i = 0; i < size; i++) tmp[i] = psp_read8(src + i);
+    /* EMOTIONALSENSE_TRACE_SAVE=1: every guest write to a file, with the
+     * vblank, the file offset and the caller. How the game saves is not
+     * documented anywhere; this is how it is found out. */
+    static int trace_save = -1;
+    if (trace_save < 0) {
+        const char *e = getenv("EMOTIONALSENSE_TRACE_SAVE");
+        trace_save = e && e[0] && e[0] != '0';
+    }
+    if (trace_save)
+        fprintf(stderr, "save: write vblank=%llu \"%s\" off=%ld size=%u ra=0x%08X\n",
+                (unsigned long long)psp_display_vblanks(), h->guest,
+                ftell(h->f), size, psp_cpu.r[PSP_REG_RA]);
     size_t put = fwrite(tmp, 1, size, h->f);
     free(tmp);
     psp_ret((uint32_t)put);

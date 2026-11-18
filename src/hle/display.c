@@ -47,6 +47,12 @@ static uint32_t g_tf_last_fb;
 typedef struct { uint32_t ra; uint32_t n; } tf_ra;
 static tf_ra g_tf_wait[4], g_tf_flip[4];
 static uint64_t g_tf_ge0;
+/* A flicker of a few pixels (the life gauge sparkle) changes the hash without
+ * the picture moving, so a frame also counts as "real" only when at least
+ * 0.2% of its pixels differ from the previous vblank's. */
+static uint32_t *g_tf_prev;
+static size_t g_tf_prev_n;
+static uint64_t g_tf_real, g_tf_rrun, g_tf_rmax;
 
 static void tf_ra_add(tf_ra *t, uint32_t ra) {
     for (int i = 0; i < 4; i++)
@@ -295,20 +301,42 @@ static void trace_fps_vblank(void) {
     } else {
         g_tf_run++;
     }
+    if (g_snap) {
+        size_t n = (size_t)g_snap_w * (size_t)g_snap_h;
+        if (n != g_tf_prev_n) {
+            free(g_tf_prev);
+            g_tf_prev = calloc(n, 4);
+            g_tf_prev_n = g_tf_prev ? n : 0;
+        }
+        size_t diff = 0;
+        if (g_tf_prev) {
+            for (size_t i = 0; i < n; i++) diff += g_snap[i] != g_tf_prev[i];
+            memcpy(g_tf_prev, g_snap, n * 4);
+        }
+        if (diff * 500 > n) {
+            g_tf_real++;
+            if (g_tf_rrun > g_tf_rmax) g_tf_rmax = g_tf_rrun;
+            g_tf_rrun = 1;
+        } else {
+            g_tf_rrun++;
+        }
+    }
     uint64_t sec = psp_clock_us() / 1000000ull;
     if (sec != g_tf_sec) {
         if (g_tf_run > g_tf_maxrep) g_tf_maxrep = g_tf_run;
-        fprintf(stderr, "fps[%llu]: t=%llus vblanks=%llu flips=%llu fbchg=%llu distinct=%llu maxrep=%llu",
+        fprintf(stderr, "fps[%llu]: t=%llus vblanks=%llu flips=%llu fbchg=%llu distinct=%llu maxrep=%llu real=%llu realrep=%llu",
                 (unsigned long long)g_vblank_count, (unsigned long long)sec,
                 (unsigned long long)g_tf_vb, (unsigned long long)g_tf_flips,
                 (unsigned long long)g_tf_chg, (unsigned long long)g_tf_distinct,
-                (unsigned long long)g_tf_maxrep);
+                (unsigned long long)g_tf_maxrep, (unsigned long long)g_tf_real,
+                (unsigned long long)(g_tf_rrun > g_tf_rmax ? g_tf_rrun : g_tf_rmax));
         tf_ra_print("wait_ra", g_tf_wait);
         tf_ra_print("flip_ra", g_tf_flip);
         fprintf(stderr, " ge_cmds=%llu\n", (unsigned long long)(psp_ge_command_count() - g_tf_ge0));
         g_tf_ge0 = psp_ge_command_count();
         g_tf_sec = sec;
         g_tf_vb = g_tf_flips = g_tf_chg = g_tf_distinct = g_tf_maxrep = 0;
+        g_tf_real = g_tf_rmax = 0;
     }
 }
 

@@ -22,6 +22,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -498,7 +499,14 @@ static void tex_dump_note(const psp_draw_state *st, uint64_t data_hash,
     if (w <= 0 || h <= 0) return;
     uint64_t key = dump_key(data_hash, clut_hash, st->tex_fmt, w, h);
     uint32_t addr = st->tex_addr & PSP_ADDR_MASK;
-    if (addr >= PSP_VRAM_BASE && addr < PSP_VRAM_BASE + PSP_VRAM_SIZE) return;
+    if (addr >= PSP_VRAM_BASE && addr < PSP_VRAM_BASE + PSP_VRAM_SIZE) {
+        /* Video goes through VRAM; EMOTIONALSENSE_TEX_DUMP_VRAM=1 keeps it in
+         * the dump anyway from scene 2 on, for UI art the game stages there. */
+        static int vram_ok = -1;
+        if (vram_ok < 0) vram_ok = getenv("EMOTIONALSENSE_TEX_DUMP_VRAM") != NULL;
+        /* Scenes 0 and 1 are the opening video and the title. */
+        if (!vram_ok || psp_scene_now() < 2) return;
+    }
 
     uint32_t i = (uint32_t)((key ^ ((uint64_t)addr * 0x9E3779B97F4A7C15ull)) >> 40)
                & (DUMP_SLOTS - 1u);
@@ -791,6 +799,97 @@ void psp_tex_pack_report(FILE *f) {
             g_pack_used, (double)g_pack_bytes / (1024.0 * 1024.0), g_pack_skipped);
 }
 
+/* ---- Button glyphs -------------------------------------------------------
+ *
+ * See psp_glyph_rule. The rewrite happens on the uploaded copy, at whatever
+ * integer scale a pack gave the texture, and the cache entry carries the swap
+ * state in its hash so the original and the rewritten texture never collide. */
+
+#define GLYPH_SALT 0x5A17C0DE5A17C0DEull
+static const psp_glyph_rule *g_glyph_rules;
+static int g_glyph_n;
+
+void psp_render_set_glyph_rules(const psp_glyph_rule *rules, int n) {
+    g_glyph_rules = rules;
+    g_glyph_n = n;
+}
+
+static int glyph_has_rule(uint64_t key, int w, int h) {
+    for (int i = 0; i < g_glyph_n; i++)
+        if (g_glyph_rules[i].key == key && g_glyph_rules[i].w == w && g_glyph_rules[i].h == h)
+            return 1;
+    return 0;
+}
+
+static int px_lum(uint32_t p) {
+    return (int)(((p & 0xFF) * 30u + ((p >> 8) & 0xFF) * 59u + ((p >> 16) & 0xFF) * 11u) / 100u);
+}
+
+/* Redraw the symbol of one disc glyph (ring or cross) over its dark button. */
+static void glyph_paint(uint32_t *px, int stride, int x0, int y0, int gw, int gh, char kind) {
+    /* Symbol colour: the mean of the bright opaque texels; button colour: of
+     * the dark ones. Both are read from the glyph, so nothing is invented. */
+    uint32_t sym = 0, dark = 0;
+    long sl = 0, dl = 0, sr = 0, sg = 0, sb = 0, dr = 0, dg = 0, db = 0;
+    for (int y = 0; y < gh; y++)
+        for (int x = 0; x < gw; x++) {
+            uint32_t p = px[(size_t)(y0 + y) * (size_t)stride + (size_t)(x0 + x)];
+            if ((p >> 24) < 0xE0) continue;
+            int l = px_lum(p);
+            if (l > 120) { sl++; sr += p & 0xFF; sg += (p >> 8) & 0xFF; sb += (p >> 16) & 0xFF; }
+            else if (l < 50) { dl++; dr += p & 0xFF; dg += (p >> 8) & 0xFF; db += (p >> 16) & 0xFF; }
+        }
+    if (!sl || !dl) return;
+    sym = 0xFF000000u | (uint32_t)(sr / sl) | ((uint32_t)(sg / sl) << 8) | ((uint32_t)(sb / sl) << 16);
+    dark = 0xFF000000u | (uint32_t)(dr / dl) | ((uint32_t)(dg / dl) << 8) | ((uint32_t)(db / dl) << 16);
+    const float cx = (gw - 1) * 0.5f, cy = (gh - 1) * 0.5f;
+    const float rin = gw * 0.37f, arm = gw * 0.26f, hw = gw * 0.07f + 0.5f;
+    const float rring = gw * 0.27f, thick = gw * 0.085f + 0.4f;
+    for (int y = 0; y < gh; y++)
+        for (int x = 0; x < gw; x++) {
+            uint32_t *p = &px[(size_t)(y0 + y) * (size_t)stride + (size_t)(x0 + x)];
+            float dx = x - cx, dy = y - cy;
+            float r = sqrtf(dx * dx + dy * dy);
+            if ((*p >> 24) < 0xE0 || r > rin) continue;   /* rim and surroundings stay */
+            float cov = 0.0f;
+            if (kind == 'X') {
+                float d1 = fabsf(dx - dy) * 0.70710678f, d2 = fabsf(dx + dy) * 0.70710678f;
+                float d = d1 < d2 ? d1 : d2;
+                if (fabsf(dx) <= arm + 0.5f && fabsf(dy) <= arm + 0.5f)
+                    cov = hw + 0.5f - d;
+            } else {
+                cov = thick * 0.5f + 0.5f - fabsf(r - rring);
+            }
+            if (cov < 0.0f) cov = 0.0f;
+            if (cov > 1.0f) cov = 1.0f;
+            uint32_t out = 0xFF000000u;
+            for (int c = 0; c < 24; c += 8) {
+                float a = (float)((dark >> c) & 0xFF), b = (float)((sym >> c) & 0xFF);
+                out |= (uint32_t)(a + (b - a) * cov + 0.5f) << c;
+            }
+            *p = out;
+        }
+}
+
+/* Apply every rule of `key` to the uploaded copy, `s` times the original size. */
+static void glyph_rewrite(uint32_t *px, int up_w, int s, uint64_t key, int w, int h) {
+    for (int i = 0; i < g_glyph_n; i++) {
+        const psp_glyph_rule *r = &g_glyph_rules[i];
+        if (r->key != key || r->w != w || r->h != h) continue;
+        int gw = r->gw * s, gh = r->gh * s;
+        if (r->kind == 'S') {
+            for (int y = 0; y < gh; y++)
+                for (int x = 0; x < gw; x++) {
+                    uint32_t *a = &px[(size_t)(r->ay * s + y) * (size_t)up_w + (size_t)(r->ax * s + x)];
+                    uint32_t *b = &px[(size_t)(r->by * s + y) * (size_t)up_w + (size_t)(r->bx * s + x)];
+                    uint32_t t = *a; *a = *b; *b = t;
+                }
+        } else if (r->kind == 'X' || r->kind == 'O') {
+            glyph_paint(px, up_w, r->ax * s, r->ay * s, gw, gh, r->kind);
+        }
+    }
+}
+
 static int resolve_texture(const psp_draw_state *st) {
     if (st->clear || !st->tex_enable) {
         g_tex_cache[g_dummy_white_slot].batch_used = g_batch_id;
@@ -822,6 +921,18 @@ static int resolve_texture(const psp_draw_state *st) {
         clut_hashed = 1;
     }
 
+    /* A circle/cross swap changes the pixels, so the swapped copy is a
+     * different cache entry from the original. The dump key and the pack
+     * lookup below keep using the original hash. */
+    const uint64_t data_hash_orig = data_hash;
+    int glyph_swap = 0;
+    if (g_glyph_n && psp_render_face_swap &&
+        glyph_has_rule(dump_key(data_hash, clut_hash, st->tex_fmt, st->tex_w, st->tex_h),
+                       st->tex_w, st->tex_h)) {
+        glyph_swap = 1;
+        data_hash ^= GLYPH_SALT;
+    }
+
     for (int i = 2; i < MAX_TEX_CACHE; i++) {
         vk_tex_entry *e = &g_tex_cache[i];
         if (!e->used || e->batch_used != g_batch_id) continue;
@@ -843,9 +954,19 @@ static int resolve_texture(const psp_draw_state *st) {
         clut_hash = fnv1a_bytes(st->clut, 1024);
     }
 
-    tex_dump_note(st, data_hash, clut_hash);
+    tex_dump_note(st, data_hash_orig, clut_hash);
+    {   /* EMOTIONALSENSE_TEX_TRACE=1: one line per texture resolved. */
+        static int tr = -1;
+        if (tr < 0) tr = getenv("EMOTIONALSENSE_TEX_TRACE") != NULL;
+        if (tr)
+            fprintf(stderr, "tex: scene=%u addr=%08x fmt=%d %dx%d key=%016llx\n",
+                    psp_scene_now(), st->tex_addr & PSP_ADDR_MASK, st->tex_fmt,
+                    st->tex_w, st->tex_h,
+                    (unsigned long long)dump_key(data_hash_orig, clut_hash, st->tex_fmt,
+                                                 st->tex_w, st->tex_h));
+    }
 
-    vk_pack_entry *pack = pack_lookup(dump_key(data_hash, clut_hash, st->tex_fmt,
+    vk_pack_entry *pack = pack_lookup(dump_key(data_hash_orig, clut_hash, st->tex_fmt,
                                                st->tex_w, st->tex_h),
                                       st->tex_w, st->tex_h);
     int up_w = pack ? pack->w : st->tex_w;
@@ -906,6 +1027,10 @@ static int resolve_texture(const psp_draw_state *st) {
             }
         }
     }
+
+    if (glyph_swap)
+        glyph_rewrite(dst, up_w, uv_scale, dump_key(data_hash_orig, clut_hash, st->tex_fmt,
+                                                    st->tex_w, st->tex_h), st->tex_w, st->tex_h);
 
     g_tex_staging_off = aligned_off + bytes_needed;
     g_tex_uploads[g_num_tex_uploads++] = (vk_tex_upload){ slot, aligned_off, up_w, up_h };

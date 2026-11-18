@@ -130,6 +130,25 @@ extern int psp_render_tex_filter;
  * (then psp_display_read() is the way to get the 480x272 frame). */
 int psp_render_frame(const uint32_t **px, int *w, int *h);
 
+/* Button-glyph rewriting, for a host that swaps circle and cross. A rule names
+ * a texture by the dump key (content + CLUT + format + size) and one rectangle
+ * of 18x18-ish texels:
+ *   'S'  swap rectangle A with rectangle B (a circle and a cross glyph)
+ *   'X'  rewrite the circle glyph at A into a cross
+ *   'O'  rewrite the cross glyph at A into a circle
+ * The texture is changed only while psp_render_face_swap is non-zero, in the
+ * uploaded copy only: nothing is written anywhere, and the numbers in a rule
+ * are the only game-specific data. Vulkan backend only. */
+typedef struct {
+    uint64_t key;
+    int w, h;               /* the texture size, as part of the key */
+    int ax, ay, bx, by;     /* rectangle corners in texels; B used by 'S' */
+    int gw, gh;             /* rectangle size */
+    char kind;
+} psp_glyph_rule;
+extern volatile int psp_render_face_swap;
+void psp_render_set_glyph_rules(const psp_glyph_rule *rules, int n);
+
 /* Texture dump (EMOTIONALSENSE_TEX_DUMP). Writes RGBA8 PNGs, no dependency. */
 int  psp_tex_png_write(const char *path, const uint32_t *rgba, int w, int h);
 int  psp_tex_png_read(const char *path, uint32_t **rgba, int *w, int *h);

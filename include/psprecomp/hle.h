@@ -184,6 +184,15 @@ void psp_misc_register(void);
 void psp_misc_reset(void);
 int  psp_exit_requested(void);
 void psp_ctrl_set(uint32_t buttons, uint8_t ax, uint8_t ay);
+
+/* Swap the circle and cross bits (0x2000 / 0x4000) in the buttons the guest
+ * reads from sceCtrl, for a game that hardcodes circle as "confirm" on a
+ * host that wants cross. `swap_now` is asked on every read and says whether
+ * the swap applies right then (a menu) or not (the game is being played). When
+ * it changes, a circle or cross that is held at that moment stays masked until
+ * it is released, so a key held for one meaning never arrives as the other.
+ * enabled == 0 leaves the buttons exactly as the host delivered them. */
+void psp_ctrl_set_face_swap(int enabled, int (*swap_now)(void));
 uint64_t psp_audio_blocks(void);
 void psp_audio_output(int channel, int leftvol, int rightvol, const int16_t *buf, int samples);
 /* The guest released a channel: let its ring drain and retire it without

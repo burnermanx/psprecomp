@@ -8,6 +8,7 @@
  */
 
 #include "psprecomp/hle.h"
+#include "psprecomp/render.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -127,6 +128,33 @@ void psp_ctrl_set(uint32_t buttons, uint8_t ax, uint8_t ay) {
     g_buttons = buttons;
     g_analog_x = ax;
     g_analog_y = ay;
+}
+
+#define BTN_FACE_SWAP 0x6000u   /* circle 0x2000, cross 0x4000 */
+static int g_swap_enabled;
+static int (*g_swap_now)(void);
+
+void psp_ctrl_set_face_swap(int enabled, int (*swap_now)(void)) {
+    g_swap_enabled = enabled;
+    g_swap_now = swap_now;
+}
+
+/* The swap and its mask, applied to what the host delivered. */
+static uint32_t face_swap(uint32_t btns) {
+    static int was = -1;
+    static uint32_t masked;      /* face buttons held across a change of state */
+    if (!g_swap_enabled) return btns;
+    int now = g_swap_now ? g_swap_now() != 0 : 1;
+    psp_render_face_swap = now;     /* the on-screen glyphs follow the same gate */
+    if (was >= 0 && now != was) masked = btns & BTN_FACE_SWAP;
+    was = now;
+    masked &= btns;              /* released: no longer masked */
+    btns &= ~masked;
+    if (now) {
+        uint32_t c = btns & 0x2000u, x = btns & 0x4000u;
+        btns = (btns & ~BTN_FACE_SWAP) | (c << 1) | (x >> 1);
+    }
+    return btns;
 }
 
 static void hle_CtrlSet(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
@@ -275,6 +303,7 @@ static void hle_ReadBufferPositive(void) {
         else if (vb >= 750 && vb < 755) btns |= 0x2000u; /* CIRCLE */
         else if (vb >= 800 && vb < 805) btns |= 0x2000u; /* CIRCLE */
     }
+    btns = face_swap(btns);
     static int ctrl_trace = -1;
     if (ctrl_trace < 0) ctrl_trace = getenv("EMOTIONALSENSE_TRACE_CTRL") != NULL;
     if (ctrl_trace && (btns || psp_read16(buf + 16) != psp_read16(buf + 18)))

@@ -886,6 +886,50 @@ static void test_callbacks(void) {
           (unsigned long long)psp_power_registered());
 }
 
+/* Circle/cross swap on the sceCtrl value: applies only while the gate says
+ * so, never touches other buttons, and a face button held across a change of
+ * state stays masked until released. */
+static int g_gate;
+static int gate(void) { return g_gate; }
+
+static uint32_t read_buttons(uint32_t host) {
+    const uint32_t buf = 0x08100000u;
+    psp_ctrl_set(host, 128, 128);
+    call(0x1F803938u, buf, 1, 0, 0);
+    return psp_read32(buf + 4);
+}
+
+static void test_ctrl_face_swap(void) {
+    psp_ctrl_set_face_swap(0, NULL);
+    CHECK(read_buttons(0x2000u) == 0x2000u && read_buttons(0x4000u) == 0x4000u,
+          "swap off: buttons pass through");
+
+    psp_ctrl_set_face_swap(1, gate);
+    g_gate = 1;
+    CHECK(read_buttons(0) == 0, "swap on, nothing held");
+    CHECK(read_buttons(0x2000u) == 0x4000u, "menu: circle arrives as cross");
+    CHECK(read_buttons(0x4000u) == 0x2000u, "menu: cross arrives as circle");
+    CHECK(read_buttons(0x6000u | 0x0008u | 0x0020u) == (0x6000u | 0x0008u | 0x0020u),
+          "menu: both swapped, start and right untouched");
+
+    /* Entering play with cross held: masked until released, and the other
+     * face button is not affected. */
+    read_buttons(0x4000u);
+    g_gate = 0;
+    CHECK(read_buttons(0x4000u) == 0, "play entered holding cross: masked");
+    CHECK(read_buttons(0x4000u | 0x2000u) == 0x2000u, "play: circle is a key, unswapped");
+    CHECK(read_buttons(0) == 0, "released");
+    CHECK(read_buttons(0x4000u) == 0x4000u, "play: cross pressed again is a key");
+
+    /* Leaving play with a key held: masked, then the menu meaning. */
+    g_gate = 1;
+    CHECK(read_buttons(0x4000u) == 0, "leaving play holding cross: masked");
+    CHECK(read_buttons(0) == 0, "released");
+    CHECK(read_buttons(0x4000u) == 0x2000u, "menu again: cross arrives as circle");
+    psp_ctrl_set_face_swap(0, NULL);
+    psp_ctrl_set(0, 128, 128);
+}
+
 int main(void) {
     CHECK(psp_mem_init() == 0, "memory init");
     psp_cpu_reset();
@@ -895,6 +939,7 @@ int main(void) {
     printf("registered %d firmware functions\n", psp_hle_count());
 
     test_sha1_vectors();
+    test_ctrl_face_swap();
     test_nids_match_names();
     test_sysmem();
     test_semaphores();

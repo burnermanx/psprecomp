@@ -3,6 +3,9 @@
 #include "psprecomp/window.h"
 #include "psprecomp/hle.h"
 
+#include <stdlib.h>
+#include <string.h>
+
 #if defined(_WIN32) && !defined(PSPRECOMP_SDL2)
 
 #define WIN32_LEAN_AND_MEAN
@@ -24,6 +27,46 @@ static volatile LONG g_closed;
 static int g_scale;
 static const char *g_title = "psprecomp";
 static uint32_t g_px[W * H];
+static unsigned char *g_icon;
+static int g_icon_w, g_icon_h;
+
+void psp_window_set_icon(const unsigned char *rgba, int w, int h) {
+    free(g_icon);
+    g_icon = (unsigned char *)malloc((size_t)w * (size_t)h * 4);
+    if (!g_icon) return;
+    memcpy(g_icon, rgba, (size_t)w * (size_t)h * 4);
+    g_icon_w = w; g_icon_h = h;
+}
+
+/* HICON from the RGBA pixels: a 32-bit BGRA colour bitmap plus an empty mask. */
+static HICON make_icon(void) {
+    if (!g_icon) return NULL;
+    const int w = g_icon_w, hh = g_icon_h;
+    BITMAPV5HEADER bi;
+    ZeroMemory(&bi, sizeof bi);
+    bi.bV5Size = sizeof bi; bi.bV5Width = w; bi.bV5Height = -hh;
+    bi.bV5Planes = 1; bi.bV5BitCount = 32; bi.bV5Compression = BI_BITFIELDS;
+    bi.bV5RedMask = 0x00FF0000; bi.bV5GreenMask = 0x0000FF00;
+    bi.bV5BlueMask = 0x000000FF; bi.bV5AlphaMask = 0xFF000000;
+    void *bits = NULL;
+    HDC dc = GetDC(NULL);
+    HBITMAP color = CreateDIBSection(dc, (BITMAPINFO *)&bi, DIB_RGB_COLORS, &bits, NULL, 0);
+    ReleaseDC(NULL, dc);
+    if (!color || !bits) return NULL;
+    uint32_t *d = (uint32_t *)bits;
+    for (int i = 0; i < w * hh; i++) {
+        const unsigned char *p = g_icon + (size_t)i * 4;
+        d[i] = ((uint32_t)p[3] << 24) | ((uint32_t)p[0] << 16) | ((uint32_t)p[1] << 8) | p[2];
+    }
+    HBITMAP mask = CreateBitmap(w, hh, 1, 1, NULL);
+    ICONINFO ii;
+    ZeroMemory(&ii, sizeof ii);
+    ii.fIcon = TRUE; ii.hbmMask = mask; ii.hbmColor = color;
+    HICON ic = CreateIconIndirect(&ii);
+    DeleteObject(color);
+    DeleteObject(mask);
+    return ic;
+}
 
 static uint32_t keyboard(void) {
     static const struct { int vk; uint32_t bit; } K[] = {
@@ -142,6 +185,13 @@ static DWORD WINAPI window_main(LPVOID arg) {
                            CW_USEDEFAULT, CW_USEDEFAULT, r.right - r.left, r.bottom - r.top,
                            NULL, NULL, wc.hInstance, NULL);
     if (!h) { InterlockedExchange(&g_closed, 1); SetEvent(ready); return 1; }
+    {
+        HICON ic = make_icon();
+        if (ic) {
+            SendMessageA(h, WM_SETICON, ICON_BIG, (LPARAM)ic);
+            SendMessageA(h, WM_SETICON, ICON_SMALL, (LPARAM)ic);
+        }
+    }
     SetTimer(h, 1, 16, NULL);
     SetEvent(ready);
 
@@ -196,6 +246,16 @@ static int g_scale;
 static const char *g_title = "psprecomp";
 /* Max internal resolution is 4x (see psp_render_scale). */
 static uint32_t g_px[W * H * 16];
+static unsigned char *g_icon;
+static int g_icon_w, g_icon_h;
+
+void psp_window_set_icon(const unsigned char *rgba, int w, int h) {
+    free(g_icon);
+    g_icon = (unsigned char *)malloc((size_t)w * (size_t)h * 4);
+    if (!g_icon) return;
+    memcpy(g_icon, rgba, (size_t)w * (size_t)h * 4);
+    g_icon_w = w; g_icon_h = h;
+}
 
 /* Host keyboard and gamepad are a convenience when someone is playing, and a
  * source of non-determinism when a script is driving: a connected pad with a
@@ -297,6 +357,11 @@ static int window_main(void *arg) {
     SDL_Window *win = SDL_CreateWindow(g_title, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
                                        W * g_scale, H * g_scale,
                                        SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
+    if (win && g_icon) {
+        SDL_Surface *is = SDL_CreateRGBSurfaceWithFormatFrom(g_icon, g_icon_w, g_icon_h, 32, g_icon_w * 4,
+                                                             SDL_PIXELFORMAT_RGBA32);
+        if (is) { SDL_SetWindowIcon(win, is); SDL_FreeSurface(is); }
+    }
     const char *vsync = getenv("EMOTIONALSENSE_VSYNC");
     Uint32 rflags = SDL_RENDERER_ACCELERATED;
     if (!(vsync && vsync[0] == '0')) rflags |= SDL_RENDERER_PRESENTVSYNC;
@@ -458,6 +523,7 @@ int psp_window_height(void) { return atomic_load(&g_win_h); }
 
 /* ponytail: no window without Win32 or SDL2 (configure with
  * -DPSPRECOMP_SDL2=ON). */
+void psp_window_set_icon(const unsigned char *rgba, int w, int h) { (void)rgba; (void)w; (void)h; }
 int psp_window_start(const char *title, int scale) { (void)title; (void)scale; return -1; }
 int psp_window_closed(void) { return 0; }
 

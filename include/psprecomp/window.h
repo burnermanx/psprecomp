@@ -23,6 +23,10 @@
 #ifndef PSPRECOMP_WINDOW_H
 #define PSPRECOMP_WINDOW_H
 
+/* The window's icon, RGBA8888 (w*h*4 bytes, copied). Call before
+ * psp_window_start; without it the system's default icon is used. */
+void psp_window_set_icon(const unsigned char *rgba, int w, int h);
+
 /* Open the window, `scale` times the PSP's 480x272, or with `scale` 0 as
  * large as fits the screen. Returns 0 if it opened. */
 int psp_window_start(const char *title, int scale);

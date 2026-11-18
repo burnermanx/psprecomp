@@ -198,6 +198,10 @@ void psp_ctrl_set(uint32_t buttons, uint8_t ax, uint8_t ay);
  * it is released, so a key held for one meaning never arrives as the other.
  * enabled == 0 leaves the buttons exactly as the host delivered them. */
 void psp_ctrl_set_face_swap(int enabled, int (*swap_now)(void));
+/* A host filter on the buttons the game is about to read (after the circle/cross
+ * swap, so cross is the game's cancel in menus). It is called once per
+ * sceCtrlRead*; what it returns is what the game sees. NULL removes it. */
+void psp_ctrl_set_filter(uint32_t (*fn)(uint32_t buttons));
 uint64_t psp_audio_blocks(void);
 void psp_audio_output(int channel, int leftvol, int rightvol, const int16_t *buf, int samples);
 /* The guest released a channel: let its ring drain and retire it without

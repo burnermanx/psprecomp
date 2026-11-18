@@ -157,6 +157,11 @@ static uint32_t face_swap(uint32_t btns) {
     return btns;
 }
 
+/* Host hook on what the game reads: after the face swap, so the filter sees the
+ * buttons as the game does (cancel is always cross in a menu). */
+static uint32_t (*g_ctrl_filter)(uint32_t);
+void psp_ctrl_set_filter(uint32_t (*fn)(uint32_t buttons)) { g_ctrl_filter = fn; }
+
 static void hle_CtrlSet(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
 
 /* EMOTIONALSENSE_SCRIPT presses buttons on a schedule, so a headless run can
@@ -301,6 +306,7 @@ static void hle_ReadBufferPositive(void) {
         else if (vb >= 800 && vb < 805) btns |= 0x2000u; /* CIRCLE */
     }
     btns = face_swap(btns);
+    if (g_ctrl_filter) btns = g_ctrl_filter(btns);
     static int ctrl_trace = -1;
     if (ctrl_trace < 0) ctrl_trace = getenv("EMOTIONALSENSE_TRACE_CTRL") != NULL;
     if (ctrl_trace && (btns || psp_read16(buf + 16) != psp_read16(buf + 18)))

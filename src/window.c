@@ -3,6 +3,7 @@
 #include "psprecomp/window.h"
 #include "psprecomp/hle.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -217,6 +218,11 @@ int psp_window_start(const char *title, int scale) {
 }
 
 int psp_window_closed(void) { return g_closed != 0; }
+void psp_window_request_close(void) { InterlockedExchange(&g_closed, 1); }
+int psp_window_take_escape(void) { return 0; }
+void psp_window_set_overlay(psp_overlay_fn fn) { (void)fn; }
+void psp_window_set_state_file(const char *path) { (void)path; }
+void psp_window_set_start_mode(int mode) { (void)mode; }
 
 #elif defined(PSPRECOMP_SDL2)
 
@@ -286,6 +292,8 @@ static uint32_t keyboard(void) {
     uint32_t b = 0;
     for (size_t i = 0; i < sizeof K / sizeof K[0]; i++)
         if (ks[K[i].sc]) b |= K[i].bit;
+    /* Alt+Enter is the full screen toggle, not START. */
+    if (SDL_GetModState() & KMOD_ALT) b &= ~(uint32_t)B_START;
     return b;
 }
 
@@ -334,6 +342,9 @@ static FILE *g_trace;
 static atomic_int g_present_state;  /* 0 starting, 1 running, -1 failed */
 static atomic_int g_dirty = 1;      /* redraw the last frame (resize, expose) */
 static atomic_int g_refit;          /* the window size changed: refit the scale */
+static atomic_int g_esc;            /* Escape presses not yet taken by the host */
+static psp_overlay_fn g_overlay;
+static uint32_t *g_px_ov;           /* scratch copy the overlay draws on */
 
 /* Owns the SDL renderer: copies the guest's newest frame to the screen. It
  * blocks in SDL_RenderPresent (vsync) without holding up anything else. */
@@ -385,7 +396,36 @@ static int present_main(void *arg) {
             }
             SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
             SDL_RenderClear(ren);
-            SDL_UpdateTexture(tex, NULL, g_px, tex_w * 4);   /* 0xAABBGGRR == ABGR8888 */
+            const uint32_t *src = g_px;
+            if (g_overlay) {
+                /* Draw on a copy: a redraw without a new frame would otherwise
+                 * blend the overlay over its own previous result. */
+                if (!g_px_ov) g_px_ov = (uint32_t *)malloc(sizeof g_px);
+                if (g_px_ov) {
+                    memcpy(g_px_ov, g_px, (size_t)tex_w * (size_t)tex_h * 4);
+                    if (g_overlay(g_px_ov, tex_w, tex_h)) {
+                        src = g_px_ov;
+                        /* EMOTIONALSENSE_OVERLAY_SHOT=<file.ppm>: keep the first
+                         * overlaid frame (a test aid: the compositor is not
+                         * capturable from a script). */
+                        static int shot_done; const char *sp;
+                        if (!shot_done && (sp = getenv("EMOTIONALSENSE_OVERLAY_SHOT")) && *sp) {
+                            FILE *f = fopen(sp, "wb");
+                            if (f) {
+                                fprintf(f, "P6\n%d %d\n255\n", tex_w, tex_h);
+                                for (int i = 0; i < tex_w * tex_h; i++) {
+                                    uint32_t c = g_px_ov[i];
+                                    unsigned char rgb[3] = { (unsigned char)c, (unsigned char)(c >> 8), (unsigned char)(c >> 16) };
+                                    fwrite(rgb, 1, 3, f);
+                                }
+                                fclose(f);
+                                shot_done = 1;
+                            }
+                        }
+                    }
+                }
+            }
+            SDL_UpdateTexture(tex, NULL, src, tex_w * 4);   /* 0xAABBGGRR == ABGR8888 */
             SDL_RenderCopy(ren, tex, NULL, NULL);
             uint64_t t_before = tp ? psp_host_mono_us() : 0;
             SDL_RenderPresent(ren);
@@ -410,11 +450,14 @@ static int present_main(void *arg) {
  * mode shows every frame for exactly two refreshes, while 75 or 144 Hz
  * repeat frames unevenly. EMOTIONALSENSE_REFRESH = auto (60, else 120, else the
  * desktop mode) | 60 | 120 | native (the desktop mode, no mode change).
- * Windowed, the desktop's rate is whatever it is. Returns 1 if a mode was set. */
+ * Windowed, the desktop's rate is whatever it is. Only a user who sets one of
+ * those (auto, 60, 120) gets the exclusive mode; with none, or "native", full
+ * screen is a borderless window over the desktop. Returns 1 if a mode was set. */
 static int pick_refresh_mode(SDL_Window *win, SDL_DisplayMode *out) {
     const char *e = getenv("EMOTIONALSENSE_REFRESH");
     int want[2] = { 60, 120 }, n = 2;
-    if (e && !strcmp(e, "native")) return 0;
+    /* No rate chosen (or "native"): no mode change, full screen is borderless. */
+    if (!e || !*e || !strcmp(e, "native")) return 0;
     if (e && !strcmp(e, "60"))  { want[0] = 60;  n = 1; }
     if (e && !strcmp(e, "120")) { want[0] = 120; n = 1; }
     int di = SDL_GetWindowDisplayIndex(win);
@@ -434,21 +477,83 @@ static int pick_refresh_mode(SDL_Window *win, SDL_DisplayMode *out) {
     return 0;
 }
 
+static int is_fullscreen(SDL_Window *win) {
+    return (SDL_GetWindowFlags(win) & (SDL_WINDOW_FULLSCREEN | SDL_WINDOW_FULLSCREEN_DESKTOP)) != 0;
+}
+
+/* Where the last mode is remembered (a one-word file), or NULL. */
+static char g_state_path[1024];
+static int g_start_mode = -1;       /* -1 remember/auto, 0 window, 1 full screen */
+
+void psp_window_set_state_file(const char *path) {
+    snprintf(g_state_path, sizeof g_state_path, "%s", path ? path : "");
+}
+void psp_window_set_start_mode(int mode) { g_start_mode = mode; }
+
+static void remember_fullscreen(int on) {
+    if (!g_state_path[0]) return;
+    FILE *f = fopen(g_state_path, "w");
+    if (f) { fputs(on ? "fullscreen\n" : "window\n", f); fclose(f); }
+}
+
+/* gamescope (Steam Deck game mode) draws one full-screen surface and a window
+ * there is pointless: start full screen unless told otherwise. */
+static int on_gamescope(void) {
+    const char *d = getenv("XDG_CURRENT_DESKTOP"), *sd = getenv("SteamDeck");
+    return getenv("GAMESCOPE_WAYLAND_DISPLAY") || (sd && *sd && strcmp(sd, "0")) ||
+           (d && strstr(d, "gamescope"));
+}
+
+static int want_fullscreen_at_start(void) {
+    if (g_start_mode >= 0) return g_start_mode;
+    if (g_state_path[0]) {
+        FILE *f = fopen(g_state_path, "r");
+        if (f) {
+            char b[16] = "";
+            if (fgets(b, sizeof b, f)) { fclose(f); return b[0] == 'f'; }
+            fclose(f);
+        }
+    }
+    return on_gamescope();
+}
+
+/* Borderless full screen over the desktop: no mode change, the swapchain (the
+ * SDL renderer here) follows the size event, textures are not touched. */
+static void set_borderless(SDL_Window *win, int on) {
+    SDL_SetWindowFullscreen(win, on ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
+    remember_fullscreen(on);
+}
+
+/* Alt+Enter: window <-> borderless, always. */
+static void toggle_borderless(SDL_Window *win) {
+    int on = !is_fullscreen(win);
+    set_borderless(win, on);
+    SDL_DisplayMode d;
+    if (on && SDL_GetDesktopDisplayMode(SDL_GetWindowDisplayIndex(win), &d) == 0)
+        fprintf(stderr, "window: borderless full screen %dx%d at %d Hz\n", d.w, d.h, d.refresh_rate);
+    else if (!on) fprintf(stderr, "window: windowed\n");
+}
+
+/* F11: window <-> full screen at the rate the user chose (exclusive 60/120 Hz
+ * when EMOTIONALSENSE_REFRESH is auto/60/120, otherwise borderless). */
 static void toggle_fullscreen(SDL_Window *win) {
-    if (SDL_GetWindowFlags(win) & (SDL_WINDOW_FULLSCREEN | SDL_WINDOW_FULLSCREEN_DESKTOP)) {
+    if (is_fullscreen(win)) {
         SDL_SetWindowFullscreen(win, 0);
+        remember_fullscreen(0);
+        fprintf(stderr, "window: windowed\n");
         return;
     }
     SDL_DisplayMode m;
     if (pick_refresh_mode(win, &m) && SDL_SetWindowDisplayMode(win, &m) == 0 &&
         SDL_SetWindowFullscreen(win, SDL_WINDOW_FULLSCREEN) == 0) {
+        remember_fullscreen(1);
         fprintf(stderr, "window: exclusive full screen %dx%d at %d Hz\n", m.w, m.h, m.refresh_rate);
         return;
     }
-    SDL_SetWindowFullscreen(win, SDL_WINDOW_FULLSCREEN_DESKTOP);
+    set_borderless(win, 1);
     SDL_DisplayMode d;
     if (SDL_GetDesktopDisplayMode(SDL_GetWindowDisplayIndex(win), &d) == 0)
-        fprintf(stderr, "window: desktop full screen %dx%d at %d Hz\n", d.w, d.h, d.refresh_rate);
+        fprintf(stderr, "window: borderless full screen %dx%d at %d Hz\n", d.w, d.h, d.refresh_rate);
 }
 
 static int window_main(void *arg) {
@@ -476,9 +581,11 @@ static int window_main(void *arg) {
             if (g_scale < 1) g_scale = 1;
         }
     }
+    const int start_fs = want_fullscreen_at_start();
     SDL_Window *win = SDL_CreateWindow(g_title, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
                                        W * g_scale, H * g_scale,
-                                       SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
+                                       SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI |
+                                       (start_fs ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0));
     if (win && g_icon) {
         SDL_Surface *is = SDL_CreateRGBSurfaceWithFormatFrom(g_icon, g_icon_w, g_icon_h, 32, g_icon_w * 4,
                                                              SDL_PIXELFORMAT_RGBA32);
@@ -531,6 +638,23 @@ static int window_main(void *arg) {
                 (unsigned long long)n, (unsigned long long)(n - last_poll_us));
             last_poll_us = n;
         }
+        /* EMOTIONALSENSE_TEST_ALTENTER="ms,ms,...": synthesise Alt+Enter that many
+         * ms after the loop starts (there is no way to type into a headless
+         * test run). It goes through the same event branch as the keyboard. */
+        {
+            static const char *list; static Uint32 t0; static int init;
+            if (!init) { init = 1; list = getenv("EMOTIONALSENSE_TEST_ALTENTER"); t0 = SDL_GetTicks(); }
+            if (list && *list && SDL_GetTicks() - t0 >= (Uint32)strtoul(list, NULL, 10)) {
+                SDL_Event k;
+                SDL_zero(k);
+                k.type = SDL_KEYDOWN; k.key.state = SDL_PRESSED;
+                k.key.keysym.sym = SDLK_RETURN; k.key.keysym.scancode = SDL_SCANCODE_RETURN;
+                k.key.keysym.mod = KMOD_LALT;
+                SDL_PushEvent(&k);
+                while (*list && *list != ',') list++;
+                if (*list == ',') list++;
+            }
+        }
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
             switch (ev.type) {
@@ -538,8 +662,12 @@ static int window_main(void *arg) {
             case SDL_WINDOWEVENT:
                 if (ev.window.event == SDL_WINDOWEVENT_SIZE_CHANGED ||
                     ev.window.event == SDL_WINDOWEVENT_EXPOSED) {
-                    if (ev.window.event == SDL_WINDOWEVENT_SIZE_CHANGED)
+                    if (ev.window.event == SDL_WINDOWEVENT_SIZE_CHANGED) {
                         atomic_store(&g_refit, 1);
+                        if (getenv("EMOTIONALSENSE_TRACE_MODES"))
+                            fprintf(stderr, "window: size %dx%d%s\n", ev.window.data1, ev.window.data2,
+                                    is_fullscreen(win) ? " (full screen)" : " (window)");
+                    }
                     atomic_store(&g_dirty, 1);
                 }
                 break;
@@ -552,8 +680,13 @@ static int window_main(void *arg) {
                 }
                 break;
             case SDL_KEYDOWN:
-                if (ev.key.keysym.sym == SDLK_F11) {
+                if (ev.key.keysym.sym == SDLK_ESCAPE) {
+                    if (!ev.key.repeat) atomic_fetch_add(&g_esc, 1);
+                } else if (ev.key.keysym.sym == SDLK_F11) {
                     toggle_fullscreen(win);
+                } else if ((ev.key.keysym.sym == SDLK_RETURN || ev.key.keysym.sym == SDLK_KP_ENTER) &&
+                           (ev.key.keysym.mod & KMOD_ALT) && !ev.key.repeat) {
+                    toggle_borderless(win);
                 } else if (ev.key.keysym.sym == SDLK_F9) {
                     psp_ge_dump_stats(stderr);
                     psp_hle_dump_counts(stderr, 40);
@@ -609,15 +742,24 @@ int psp_window_start(const char *title, int scale) {
 
 int psp_window_closed(void) { return atomic_load(&g_closed) != 0; }
 
+void psp_window_request_close(void) { atomic_store(&g_closed, 1); }
+int psp_window_take_escape(void) { return atomic_exchange(&g_esc, 0); }
+void psp_window_set_overlay(psp_overlay_fn fn) { g_overlay = fn; }
+
 int psp_window_height(void) { return atomic_load(&g_win_h); }
 
 #else
 
 /* ponytail: no window without Win32 or SDL2 (configure with
  * -DPSPRECOMP_SDL2=ON). */
+void psp_window_set_state_file(const char *path) { (void)path; }
+void psp_window_set_start_mode(int mode) { (void)mode; }
 void psp_window_set_icon(const unsigned char *rgba, int w, int h) { (void)rgba; (void)w; (void)h; }
 int psp_window_start(const char *title, int scale) { (void)title; (void)scale; return -1; }
 int psp_window_closed(void) { return 0; }
+void psp_window_request_close(void) {}
+int psp_window_take_escape(void) { return 0; }
+void psp_window_set_overlay(psp_overlay_fn fn) { (void)fn; }
 
 int psp_window_height(void) { return 0; }
 

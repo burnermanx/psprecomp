@@ -61,12 +61,20 @@ void psp_mem_watch_read(uint32_t addr) { g_rwatch = addr; g_rfn_n = 0; }
 
 static void note_read(uint32_t addr, uint32_t width) {
     if (!g_rwatch || addr + width <= g_rwatch || addr > g_rwatch) return;
-    uint32_t fn = psp_trace_last();
+    /* The trace of function entries is not compiled into the generated code, so
+     * identify the reader by the innermost guest call in flight (the caller's
+     * return site) and $ra. */
+    const psp_frame *f0 = psp_cpu.frame;
+    uint32_t fn = f0 && f0->ret ? f0->ret : psp_trace_last();
     for (int i = 0; i < g_rfn_n; i++) if (g_rfns[i] == fn) return;
     if (g_rfn_n < 16) {
         g_rfns[g_rfn_n++] = fn;
-        fprintf(stderr, "read%u of 0x%08X (watch 0x%08X) from fn 0x%08X\n",
-                width * 8, addr, g_rwatch, fn);
+        fprintf(stderr, "read%u of 0x%08X (watch 0x%08X) from fn 0x%08X ra 0x%08X calls",
+                width * 8, addr, g_rwatch, psp_trace_last(), psp_cpu.r[PSP_REG_RA]);
+        int n = 0;
+        for (const psp_frame *f = f0; f && f->ret && n < 6; f = f->prev, n++)
+            fprintf(stderr, " 0x%08X", f->ret);
+        fputc('\n', stderr);
     }
 }
 

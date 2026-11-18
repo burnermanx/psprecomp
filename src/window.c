@@ -329,6 +329,128 @@ static void fit_scale(SDL_Renderer *ren, int w, int h) {
                                    ? SDL_TRUE : SDL_FALSE);
 }
 
+static SDL_Window *g_win;
+static FILE *g_trace;
+static atomic_int g_present_state;  /* 0 starting, 1 running, -1 failed */
+static atomic_int g_dirty = 1;      /* redraw the last frame (resize, expose) */
+static atomic_int g_refit;          /* the window size changed: refit the scale */
+
+/* Owns the SDL renderer: copies the guest's newest frame to the screen. It
+ * blocks in SDL_RenderPresent (vsync) without holding up anything else. */
+static int present_main(void *arg) {
+    (void)arg;
+    SDL_Window *win = g_win;
+    const char *vsync = getenv("EMOTIONALSENSE_VSYNC");
+    Uint32 rflags = SDL_RENDERER_ACCELERATED;
+    if (!(vsync && vsync[0] == '0')) rflags |= SDL_RENDERER_PRESENTVSYNC;
+    SDL_Renderer *ren = SDL_CreateRenderer(win, -1, rflags);
+    if (!ren) ren = SDL_CreateRenderer(win, -1, SDL_RENDERER_SOFTWARE);
+    int tex_w = W, tex_h = H;
+    psp_display_size(&tex_w, &tex_h);
+    SDL_Texture *tex = ren ? SDL_CreateTexture(ren, SDL_PIXELFORMAT_ABGR8888,
+                                               SDL_TEXTUREACCESS_STREAMING, tex_w, tex_h) : NULL;
+    if (!tex) {
+        fprintf(stderr, "psprecomp: cannot open a window: %s\n", SDL_GetError());
+        atomic_store(&g_present_state, -1);
+        return 1;
+    }
+    SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "0");          /* nearest: crisp pixels */
+    SDL_RenderSetLogicalSize(ren, tex_w, tex_h);               /* keep the aspect, black bars */
+    fit_scale(ren, tex_w, tex_h);
+    atomic_store(&g_present_state, 1);
+
+    uint32_t snap_seq = 0;
+    FILE *tp = g_trace;
+    while (!atomic_load(&g_closed)) {
+        if (atomic_exchange(&g_refit, 0)) fit_scale(ren, tex_w, tex_h);
+        /* Present only when the guest produced a frame (or the window changed),
+         * so the screen rate never paces the game. */
+        uint32_t prev_seq = snap_seq;
+        int fresh = psp_display_snapshot(g_px, &snap_seq);
+        int dirty = atomic_exchange(&g_dirty, 0) || fresh;
+        if (dirty) {
+            int fw, fh;
+            psp_display_size(&fw, &fh);
+            if (fw != tex_w || fh != tex_h) {
+                /* The frame size only changes when --internal-scale does. */
+                SDL_Texture *nt = SDL_CreateTexture(ren, SDL_PIXELFORMAT_ABGR8888,
+                                                    SDL_TEXTUREACCESS_STREAMING, fw, fh);
+                if (nt) {
+                    SDL_DestroyTexture(tex);
+                    tex = nt;
+                    tex_w = fw; tex_h = fh;
+                    SDL_RenderSetLogicalSize(ren, fw, fh);
+                    fit_scale(ren, fw, fh);
+                }
+            }
+            SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
+            SDL_RenderClear(ren);
+            SDL_UpdateTexture(tex, NULL, g_px, tex_w * 4);   /* 0xAABBGGRR == ABGR8888 */
+            SDL_RenderCopy(ren, tex, NULL, NULL);
+            uint64_t t_before = tp ? psp_host_mono_us() : 0;
+            SDL_RenderPresent(ren);
+            if (tp && fresh) {
+                uint64_t t_after = psp_host_mono_us();
+                fprintf(tp, "P %llu %llu %llu %u\n", (unsigned long long)t_before,
+                        (unsigned long long)t_after,
+                        (unsigned long long)psp_display_snap_us(),
+                        (snap_seq - prev_seq) / 2 - 1);
+                fflush(tp);
+            }
+        }
+        SDL_Delay(1);
+    }
+    SDL_DestroyTexture(tex);
+    SDL_DestroyRenderer(ren);
+    return 0;
+}
+
+/* Exclusive full screen at a rate the guest divides evenly into: the guest runs
+ * at 59.94 Hz, so a 60 Hz mode repeats a frame about once in 17 s and a 120 Hz
+ * mode shows every frame for exactly two refreshes, while 75 or 144 Hz
+ * repeat frames unevenly. EMOTIONALSENSE_REFRESH = auto (60, else 120, else the
+ * desktop mode) | 60 | 120 | native (the desktop mode, no mode change).
+ * Windowed, the desktop's rate is whatever it is. Returns 1 if a mode was set. */
+static int pick_refresh_mode(SDL_Window *win, SDL_DisplayMode *out) {
+    const char *e = getenv("EMOTIONALSENSE_REFRESH");
+    int want[2] = { 60, 120 }, n = 2;
+    if (e && !strcmp(e, "native")) return 0;
+    if (e && !strcmp(e, "60"))  { want[0] = 60;  n = 1; }
+    if (e && !strcmp(e, "120")) { want[0] = 120; n = 1; }
+    int di = SDL_GetWindowDisplayIndex(win);
+    SDL_DisplayMode desk;
+    if (di < 0 || SDL_GetDesktopDisplayMode(di, &desk) != 0) return 0;
+    int modes = SDL_GetNumDisplayModes(di);
+    for (int k = 0; k < n; k++) {
+        int best = -1, bd = 1 << 30;
+        for (int i = 0; i < modes; i++) {
+            SDL_DisplayMode m;
+            if (SDL_GetDisplayMode(di, i, &m) != 0 || m.w != desk.w || m.h != desk.h) continue;
+            int d = m.refresh_rate > want[k] ? m.refresh_rate - want[k] : want[k] - m.refresh_rate;
+            if (d <= 1 && d < bd) { best = i; bd = d; }
+        }
+        if (best >= 0) { SDL_GetDisplayMode(di, best, out); return 1; }
+    }
+    return 0;
+}
+
+static void toggle_fullscreen(SDL_Window *win) {
+    if (SDL_GetWindowFlags(win) & (SDL_WINDOW_FULLSCREEN | SDL_WINDOW_FULLSCREEN_DESKTOP)) {
+        SDL_SetWindowFullscreen(win, 0);
+        return;
+    }
+    SDL_DisplayMode m;
+    if (pick_refresh_mode(win, &m) && SDL_SetWindowDisplayMode(win, &m) == 0 &&
+        SDL_SetWindowFullscreen(win, SDL_WINDOW_FULLSCREEN) == 0) {
+        fprintf(stderr, "window: exclusive full screen %dx%d at %d Hz\n", m.w, m.h, m.refresh_rate);
+        return;
+    }
+    SDL_SetWindowFullscreen(win, SDL_WINDOW_FULLSCREEN_DESKTOP);
+    SDL_DisplayMode d;
+    if (SDL_GetDesktopDisplayMode(SDL_GetWindowDisplayIndex(win), &d) == 0)
+        fprintf(stderr, "window: desktop full screen %dx%d at %d Hz\n", d.w, d.h, d.refresh_rate);
+}
+
 static int window_main(void *arg) {
     (void)arg;
     /* Without this Windows reports a scaled size and blurs the nearest-neighbour
@@ -362,42 +484,50 @@ static int window_main(void *arg) {
                                                              SDL_PIXELFORMAT_RGBA32);
         if (is) { SDL_SetWindowIcon(win, is); SDL_FreeSurface(is); }
     }
-    const char *vsync = getenv("EMOTIONALSENSE_VSYNC");
-    Uint32 rflags = SDL_RENDERER_ACCELERATED;
-    if (!(vsync && vsync[0] == '0')) rflags |= SDL_RENDERER_PRESENTVSYNC;
-    SDL_Renderer *ren = win ? SDL_CreateRenderer(win, -1, rflags) : NULL;
-    if (win && !ren) ren = SDL_CreateRenderer(win, -1, SDL_RENDERER_SOFTWARE);
-    int tex_w = W, tex_h = H;
-    psp_display_size(&tex_w, &tex_h);
-    SDL_Texture *tex = ren ? SDL_CreateTexture(ren, SDL_PIXELFORMAT_ABGR8888,
-                                               SDL_TEXTUREACCESS_STREAMING, tex_w, tex_h) : NULL;
-    if (!tex) {
+    g_win = win;
+    if (win && getenv("EMOTIONALSENSE_TRACE_MODES")) {
+        int di = SDL_GetWindowDisplayIndex(win);
+        SDL_DisplayMode d, p;
+        SDL_GetDesktopDisplayMode(di, &d);
+        fprintf(stderr, "window: display %d, desktop %dx%d at %d Hz; modes:", di, d.w, d.h, d.refresh_rate);
+        for (int i = 0; i < SDL_GetNumDisplayModes(di); i++)
+            if (SDL_GetDisplayMode(di, i, &p) == 0 && p.w == d.w && p.h == d.h) fprintf(stderr, " %d", p.refresh_rate);
+        fprintf(stderr, "\n");
+        if (pick_refresh_mode(win, &p)) fprintf(stderr, "window: refresh option picks %d Hz\n", p.refresh_rate);
+        else fprintf(stderr, "window: refresh option keeps the desktop mode\n");
+    }
+    if (!win) {
         fprintf(stderr, "psprecomp: cannot open a window: %s\n", SDL_GetError());
         atomic_store(&g_closed, 1); atomic_store(&g_ready, -1);
         return 1;
     }
-    SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "0");          /* nearest: crisp pixels */
-    SDL_RenderSetLogicalSize(ren, tex_w, tex_h);               /* keep the aspect, black bars */
-    fit_scale(ren, tex_w, tex_h);
+    /* EMOTIONALSENSE_TRACE_PRESENT=<file>: one line per presented frame,
+     * "P <before-present us> <after-present us> <snapshot copied us> <snapshots
+     * skipped>", and "G <us> <gap us>" whenever the input loop did not poll
+     * for more than 3 ms. Times are host monotonic microseconds. */
+    {
+        const char *f = getenv("EMOTIONALSENSE_TRACE_PRESENT");
+        if (f && *f) g_trace = fopen(f, "w");
+    }
+    /* The renderer lives on a thread of its own: SDL_RenderPresent blocks until
+     * the monitor's next refresh, and the thread that reads the buttons must
+     * not wait for that (the guest would read buttons up to one refresh old). */
+    SDL_Thread *pt = SDL_CreateThread(present_main, "psp_present", NULL);
+    if (!pt) { atomic_store(&g_closed, 1); atomic_store(&g_ready, -1); return 1; }
+    while (atomic_load(&g_present_state) == 0) SDL_Delay(1);
+    if (atomic_load(&g_present_state) < 0) {
+        atomic_store(&g_closed, 1); atomic_store(&g_ready, -1);
+        SDL_WaitThread(pt, NULL);
+        return 1;
+    }
     atomic_store(&g_ready, 1);
 
     SDL_GameController *gc = NULL;
-    uint32_t snap_seq = 0;
-    int dirty = 1;                              /* first frame and every resize */
-    /* EMOTIONALSENSE_TRACE_PRESENT=<file>: one line per presented frame,
-     * "P <before-present us> <after-present us> <snapshot copied us> <snapshots
-     * skipped>", and "G <us> <gap us>" whenever the window loop did not poll
-     * the input for more than 3 ms. Times are host monotonic microseconds. */
-    FILE *tp = NULL;
     uint64_t last_poll_us = 0;
-    {
-        const char *f = getenv("EMOTIONALSENSE_TRACE_PRESENT");
-        if (f && *f) tp = fopen(f, "w");
-    }
     while (!atomic_load(&g_closed)) {
-        if (tp) {
+        if (g_trace) {
             uint64_t n = psp_host_mono_us();
-            if (last_poll_us && n - last_poll_us > 3000) fprintf(tp, "G %llu %llu\n",
+            if (last_poll_us && n - last_poll_us > 3000) fprintf(g_trace, "G %llu %llu\n",
                 (unsigned long long)n, (unsigned long long)(n - last_poll_us));
             last_poll_us = n;
         }
@@ -409,8 +539,8 @@ static int window_main(void *arg) {
                 if (ev.window.event == SDL_WINDOWEVENT_SIZE_CHANGED ||
                     ev.window.event == SDL_WINDOWEVENT_EXPOSED) {
                     if (ev.window.event == SDL_WINDOWEVENT_SIZE_CHANGED)
-                        fit_scale(ren, tex_w, tex_h);
-                    dirty = 1;
+                        atomic_store(&g_refit, 1);
+                    atomic_store(&g_dirty, 1);
                 }
                 break;
             case SDL_CONTROLLERDEVICEADDED:
@@ -423,8 +553,7 @@ static int window_main(void *arg) {
                 break;
             case SDL_KEYDOWN:
                 if (ev.key.keysym.sym == SDLK_F11) {
-                    Uint32 fs = SDL_GetWindowFlags(win) & SDL_WINDOW_FULLSCREEN_DESKTOP;
-                    SDL_SetWindowFullscreen(win, fs ? 0 : SDL_WINDOW_FULLSCREEN_DESKTOP);
+                    toggle_fullscreen(win);
                 } else if (ev.key.keysym.sym == SDLK_F9) {
                     psp_ge_dump_stats(stderr);
                     psp_hle_dump_counts(stderr, 40);
@@ -457,48 +586,11 @@ static int window_main(void *arg) {
                 l_b = bp | bk; l_ax = ax; l_ay = ay;
             }
         }
-
-        /* Present only when the guest produced a frame (or the window changed),
-         * so the screen rate never paces the game. */
-        uint32_t prev_seq = snap_seq;
-        int fresh = psp_display_snapshot(g_px, &snap_seq);
-        if (fresh) dirty = 1;
-        if (dirty) {
-            int fw, fh;
-            psp_display_size(&fw, &fh);
-            if (fw != tex_w || fh != tex_h) {
-                /* The frame size only changes when --internal-scale does. */
-                SDL_Texture *nt = SDL_CreateTexture(ren, SDL_PIXELFORMAT_ABGR8888,
-                                                    SDL_TEXTUREACCESS_STREAMING, fw, fh);
-                if (nt) {
-                    SDL_DestroyTexture(tex);
-                    tex = nt;
-                    tex_w = fw; tex_h = fh;
-                    SDL_RenderSetLogicalSize(ren, fw, fh);
-                    fit_scale(ren, fw, fh);
-                }
-            }
-            SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
-            SDL_RenderClear(ren);
-            SDL_UpdateTexture(tex, NULL, g_px, tex_w * 4);   /* 0xAABBGGRR == ABGR8888 */
-            SDL_RenderCopy(ren, tex, NULL, NULL);
-            uint64_t t_before = tp ? psp_host_mono_us() : 0;
-            SDL_RenderPresent(ren);
-            if (tp && fresh) {
-                uint64_t t_after = psp_host_mono_us();
-                fprintf(tp, "P %llu %llu %llu %u\n", (unsigned long long)t_before,
-                        (unsigned long long)t_after,
-                        (unsigned long long)psp_display_snap_us(),
-                        (snap_seq - prev_seq) / 2 - 1);
-                fflush(tp);
-            }
-            dirty = 0;
-        }
         SDL_Delay(1);
     }
+    atomic_store(&g_closed, 1);
+    SDL_WaitThread(pt, NULL);
     if (gc) SDL_GameControllerClose(gc);
-    SDL_DestroyTexture(tex);
-    SDL_DestroyRenderer(ren);
     SDL_DestroyWindow(win);
     return 0;
 }

@@ -85,6 +85,22 @@ static const struct { const char *guest; uint64_t lba; } g_disc_lba[] = {
     { "disc0:/PSP_GAME/USRDIR/STREAMV.TPA", 469104 },
 };
 
+static char g_overlay_guest[160], g_overlay_host[1024];
+
+/* PSPRECOMP_TRACE_IO=1, read once. */
+static int trace_io(void) {
+    static int on = -1;
+    if (on < 0) on = getenv("PSPRECOMP_TRACE_IO") != NULL;
+    return on;
+}
+
+void psp_io_set_overlay(const char *guest_path, const char *host_path) {
+    g_overlay_guest[0] = g_overlay_host[0] = '\0';
+    if (!guest_path || !host_path) return;
+    snprintf(g_overlay_guest, sizeof g_overlay_guest, "%s", guest_path);
+    snprintf(g_overlay_host, sizeof g_overlay_host, "%s", host_path);
+}
+
 void psp_io_set_root(const char *root) {
     snprintf(g_root, sizeof g_root, "%s", root ? root : ".");
 }
@@ -198,6 +214,11 @@ static void hle_Open(void) {
     }
 
     map_path(guest, host, sizeof host);
+    if (g_overlay_guest[0] && !(flags & (PSP_O_WRONLY | PSP_O_TRUNC | PSP_O_APPEND | PSP_O_CREAT))) {
+        char ov[1024];
+        map_path(g_overlay_guest, ov, sizeof ov);
+        if (!strcmp(ov, host)) snprintf(host, sizeof host, "%s", g_overlay_host);
+    }
 
     const char *mode = "rb";
     if (flags & PSP_O_TRUNC)                  mode = (flags & PSP_O_RDWR) == PSP_O_RDWR ? "w+b" : "wb";
@@ -262,11 +283,20 @@ static int raw_read(io_file *h, uint8_t *dst, uint32_t bytes) {
     if (!guest) return 0;
     char host[1024];
     map_path(guest, host, sizeof host);
+    /* With an overlay on this container the data sectors come from it (the
+     * game addresses entries by the offsets of the table it read), but the
+     * container's first sector -- all the disc check looks at -- stays the
+     * disc's own. */
+    if (g_overlay_guest[0] && !strcmp(guest, g_overlay_guest) && h->lba != base)
+        snprintf(host, sizeof host, "%s", g_overlay_host);
     FILE *f = fopen(host, "rb");
     if (!f) return 0;
     io_seek(f, (int64_t)(h->lba - base) * 2048, SEEK_SET);
     size_t got = fread(dst, 1, bytes, f);
     fclose(f);
+    if (trace_io())
+        fprintf(stderr, "io: raw read lba %llu (+%llu in %s) %u bytes -> %zu\n", (unsigned long long)h->lba,
+                (unsigned long long)(h->lba - base), guest, bytes, got);
     h->lba += (got + 2047) / 2048;
     return (int)got;
 }
@@ -295,7 +325,10 @@ static void hle_Read(void) {
     uint8_t *tmp = (uint8_t *)malloc(size);
     if (!tmp) { psp_ret(0x80020190); return; }
 
+    long pos_before = trace_io() ? (long)io_tell(h->f) : 0;
     size_t got = fread(tmp, 1, size, h->f);
+    if (trace_io())
+        fprintf(stderr, "io: read fd %d at %ld size %u -> %zu\n", (int)psp_arg(0), pos_before, size, got);
     if (got && psp_mem_write_block(dst, tmp, (uint32_t)got) != 0) {
         /* Fall back to byte-at-a-time so a partially mapped destination still
          * gets what fits, and the bad-access counter records the rest. */
@@ -521,6 +554,11 @@ static void hle_Getstat(void) {
     psp_str(psp_arg(0), guest, sizeof guest);
     uint32_t st_ptr = psp_arg(1);
     map_path(guest, host, sizeof host);
+    if (g_overlay_guest[0]) {          /* the size the game sees is the overlay's; the LBA stays the disc's */
+        char ov[1024];
+        map_path(g_overlay_guest, ov, sizeof ov);
+        if (!strcmp(ov, host)) snprintf(host, sizeof host, "%s", g_overlay_host);
+    }
     struct stat st;
     if (stat(host, &st) != 0) { psp_ret(0x80010002); return; }
     if (st_ptr) {

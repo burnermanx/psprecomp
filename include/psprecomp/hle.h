@@ -175,6 +175,11 @@ void psp_io_init(void);
 void psp_io_register(void);
 void psp_io_reset(void);
 void psp_io_set_root(const char *root);
+
+/* Serve `host_path` instead of the disc file when the guest opens `guest_path`
+ * (a normal open; the raw-sector reads of the disc check keep using the
+ * original). NULL host_path removes it. The paths are copied. */
+void psp_io_set_overlay(const char *guest_path, const char *host_path);
 const char *psp_io_root(void);
 void psp_io_escape_name(const char *in, char *out, size_t cap);
 uint64_t psp_io_bytes_read(void);

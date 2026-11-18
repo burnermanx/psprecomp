@@ -211,6 +211,7 @@ void psp_audio_wait(int channel, uint64_t play_us);
 /* Guest address of the game's scene word, so an underrun can be attributed to
  * gameplay or to a scene change. 0 disables it. */
 void psp_set_scene_source(uint32_t addr);
+void psp_set_scene_source_ptr(uint32_t ptr_addr, uint32_t off, uint32_t fallback);
 uint32_t psp_scene_now(void);
 
 void psp_threadman_init(void);

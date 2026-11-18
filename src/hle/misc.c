@@ -185,9 +185,6 @@ static int g_script_n;
 static uint32_t g_scene_last;
 static uint32_t g_scene_count[256];
 
-/* The scene machine object is a fixed heap allocation; its id is at +4.
- * 0x0805E870 is app, so the id is the word below. */
-#define SCENE_WORD 0x0805E874u
 
 static void script_load(void) {
     const char *s = getenv("EMOTIONALSENSE_SCRIPT");
@@ -241,7 +238,7 @@ static void hle_ReadBufferPositive(void) {
     if (!script_init) { script_init = 1; script_load(); }
     if (g_script_n) {
         uint64_t vb = psp_display_vblanks();
-        uint32_t scene = psp_read32(SCENE_WORD);
+        uint32_t scene = psp_scene_now();
         if (scene && scene != g_scene_last) g_scene_count[scene & 0xFFu]++;
         g_scene_last = scene;
         for (int i = 0; i < g_script_n; i++) {
@@ -450,13 +447,28 @@ static void hle_SetChannelDataLen(void) {
 static void hle_GetChannelRestLength(void) { psp_ret(0); }
 
 static uint32_t g_scene_addr;
+static uint32_t g_scene_ptr;   /* guest address of a pointer to the object holding the word */
+static uint32_t g_scene_off;
 
 /* Where the game keeps the word that names the current scene. Registered by
  * the host, read by the audio trace and the texture dump. */
 void psp_set_scene_source(uint32_t addr) { g_scene_addr = addr; }
 
+/* Same word, but found through a pointer: the object is a heap allocation, so
+ * its address moves with whatever was allocated before it (a data update with
+ * a bigger resident package shifts it). The fixed address stays the fallback
+ * until the pointer is set. */
+void psp_set_scene_source_ptr(uint32_t ptr_addr, uint32_t off, uint32_t fallback) {
+    g_scene_ptr = ptr_addr; g_scene_off = off; g_scene_addr = fallback;
+}
+
 uint32_t psp_scene_now(void) {
-    return g_scene_addr ? psp_read32(g_scene_addr) : 0;
+    uint32_t a = g_scene_addr;
+    if (g_scene_ptr) {
+        uint32_t o = psp_read32(g_scene_ptr);
+        if (o) a = o + g_scene_off;
+    }
+    return a ? psp_read32(a) : 0;
 }
 
 void psp_misc_reset(void) {

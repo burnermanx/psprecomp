@@ -23,6 +23,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <time.h>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -890,6 +891,97 @@ static void glyph_rewrite(uint32_t *px, int up_w, int s, uint64_t key, int w, in
     }
 }
 
+/* ---- BGA smoothing (psp_render_bga_smooth) ------------------------------- */
+/* The background video is a 512x512 8888 VRAM texture rewritten every second
+ * vblank. On the vblank a new frame N(k) arrives the screen keeps showing
+ * N(k-1); on the next one it shows (N(k-1)+N(k))/2; then N(k) from the next
+ * arrival on. The cost is one vblank of delay for the video alone. */
+static struct {
+    uint32_t *prev, *cur;
+    int       valid, slot, phase;
+    uint64_t  hash, vb;
+    uint64_t  n_arrive, n_blend;
+    double    ms;
+} g_bga;
+
+static double bga_now_ms(void) {
+#ifdef _WIN32
+    LARGE_INTEGER f, c; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&c);
+    return 1000.0 * (double)c.QuadPart / (double)f.QuadPart;
+#else
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
+#endif
+}
+
+static int bga_candidate(const psp_draw_state *st) {
+    return psp_render_bga_smooth && st->tex_enable && st->tex_fmt == PSP_TPSM_8888 &&
+           !st->tex_swizzle && st->tex_w == 512 && st->tex_h == 512 &&
+           (st->tex_addr & PSP_ADDR_MASK) >= PSP_VRAM_BASE && psp_scene_now() == 3;
+}
+
+static void bga_avg(uint32_t *d, const uint32_t *a, const uint32_t *b, size_t n) {
+    for (size_t i = 0; i < n; i++)
+        d[i] = ((a[i] >> 1) & 0x7F7F7F7Fu) + ((b[i] >> 1) & 0x7F7F7F7Fu) + (a[i] & b[i] & 0x01010101u);
+}
+
+/* Unchanged video content on a later vblank: refresh the cache entry with the
+ * blend (first time) or the new frame. Returns the slot, or -1 if this is not
+ * that case and the normal path must run. */
+static int bga_hold(const psp_draw_state *st, uint64_t data_hash) {
+    if (!g_bga.valid || data_hash != g_bga.hash) return -1;
+    int slot = g_bga.slot;
+    vk_tex_entry *e = &g_tex_cache[slot];
+    if (!e->used || e->tex_addr != (st->tex_addr & PSP_ADDR_MASK) || e->data_hash != data_hash ||
+        e->img_w != 512 || e->img_h != 512) { g_bga.valid = 0; return -1; }
+    uint64_t vb = psp_display_vblanks();
+    if (vb != g_bga.vb && g_bga.phase < 2) {
+        double t0 = bga_now_ms();
+        if (e->batch_used == g_batch_id) vk_flush();
+        uint32_t bytes = 512u * 512u * 4u;
+        uint32_t off = (g_tex_staging_off + 3u) & ~3u;
+        if (off + bytes > TEX_STAGING_SIZE || g_num_tex_uploads >= MAX_TEX_UPLOADS) {
+            vk_flush();
+            off = (g_tex_staging_off + 3u) & ~3u;
+        }
+        uint32_t *dst = (uint32_t *)(g_tex_staging_ptr + off);
+        if (g_bga.phase == 0) { bga_avg(dst, g_bga.prev, g_bga.cur, 512u * 512u); g_bga.n_blend++; }
+        else memcpy(dst, g_bga.cur, bytes);
+        g_bga.phase++;
+        g_tex_staging_off = off + bytes;
+        g_tex_uploads[g_num_tex_uploads++] = (vk_tex_upload){ slot, off, 512, 512 };
+        g_bga.ms += bga_now_ms() - t0;
+    }
+    g_bga.vb = vb > g_bga.vb ? vb : g_bga.vb;
+    e->last_used = ++g_use_tick;
+    e->batch_used = g_batch_id;
+    return slot;
+}
+
+/* A new video frame was decoded into `dst` (cache miss): keep it as the
+ * newest, and upload the previous one instead. */
+static void bga_arrive(uint32_t *dst, int slot, uint64_t data_hash) {
+    double t0 = bga_now_ms();
+    uint64_t vb = psp_display_vblanks();
+    size_t n = 512u * 512u;
+    if (!g_bga.cur) { g_bga.cur = malloc(n * 4); g_bga.prev = malloc(n * 4); }
+    if (!g_bga.cur || !g_bga.prev) return;
+    if (g_bga.valid && vb - g_bga.vb > 8) g_bga.valid = 0;     /* new song, stale frames */
+    if (g_bga.valid) memcpy(g_bga.prev, g_bga.cur, n * 4);
+    else memcpy(g_bga.prev, dst, n * 4);
+    memcpy(g_bga.cur, dst, n * 4);
+    memcpy(dst, g_bga.prev, n * 4);
+    g_bga.valid = 1; g_bga.slot = slot; g_bga.hash = data_hash; g_bga.vb = vb; g_bga.phase = 0;
+    g_bga.n_arrive++;
+    g_bga.ms += bga_now_ms() - t0;
+    static int stats = -1;
+    if (stats < 0) stats = getenv("EMOTIONALSENSE_BGA_STATS") != NULL;
+    if (stats && g_bga.n_arrive % 120 == 0)
+        fprintf(stderr, "bga: arrivals=%llu blends=%llu cost=%.3f ms per arrival (%.3f ms/s at 30 arrivals/s)\n",
+                (unsigned long long)g_bga.n_arrive, (unsigned long long)g_bga.n_blend,
+                g_bga.ms / (double)g_bga.n_arrive, 30.0 * g_bga.ms / (double)g_bga.n_arrive);
+}
+
 static int resolve_texture(const psp_draw_state *st) {
     if (st->clear || !st->tex_enable) {
         g_tex_cache[g_dummy_white_slot].batch_used = g_batch_id;
@@ -931,6 +1023,12 @@ static int resolve_texture(const psp_draw_state *st) {
                        st->tex_w, st->tex_h)) {
         glyph_swap = 1;
         data_hash ^= GLYPH_SALT;
+    }
+
+    const int bga = bga_candidate(st);
+    if (bga && !glyph_swap) {
+        int bs = bga_hold(st, data_hash);
+        if (bs >= 0) return bs;
     }
 
     for (int i = 2; i < MAX_TEX_CACHE; i++) {
@@ -1027,6 +1125,8 @@ static int resolve_texture(const psp_draw_state *st) {
             }
         }
     }
+
+    if (bga && !pack && !glyph_swap) bga_arrive(dst, slot, data_hash);
 
     if (glyph_swap)
         glyph_rewrite(dst, up_w, uv_scale, dump_key(data_hash_orig, clut_hash, st->tex_fmt,
@@ -2048,11 +2148,11 @@ static void emit_tri(const psp_vertex *a, const psp_vertex *b, const psp_vertex 
     /* Positions stay in guest pixels: the viewport already maps the 480x272
      * clip space onto the scaled target, so the triangles are rasterized at
      * N times the resolution without touching the geometry. */
-    g_vbo_ptr[g_vbo_count++] = (vk_vertex){ (float)a->x, (float)a->y, a->z, col_a,
+    g_vbo_ptr[g_vbo_count++] = (vk_vertex){ a->fx, a->fy, a->z, col_a,
                                             a->u * g_uv_scale, a->v * g_uv_scale };
-    g_vbo_ptr[g_vbo_count++] = (vk_vertex){ (float)b->x, (float)b->y, b->z, col_b,
+    g_vbo_ptr[g_vbo_count++] = (vk_vertex){ b->fx, b->fy, b->z, col_b,
                                             b->u * g_uv_scale, b->v * g_uv_scale };
-    g_vbo_ptr[g_vbo_count++] = (vk_vertex){ (float)c->x, (float)c->y, c->z, col_c,
+    g_vbo_ptr[g_vbo_count++] = (vk_vertex){ c->fx, c->fy, c->z, col_c,
                                             c->u * g_uv_scale, c->v * g_uv_scale };
 }
 
@@ -2060,6 +2160,10 @@ static void emit_sprite(const psp_vertex *a, const psp_vertex *b) {
     int x0 = a->x < b->x ? a->x : b->x, x1 = a->x > b->x ? a->x : b->x;
     int y0 = a->y < b->y ? a->y : b->y, y1 = a->y > b->y ? a->y : b->y;
     if (x0 == x1 || y0 == y1) return;
+    /* the same corners with their sub-pixel fraction (== x0.. unless the
+     * lane keeps it, see psp_render_subpixel) */
+    float fx0 = a->x < b->x ? a->fx : b->fx, fx1 = a->x < b->x ? b->fx : a->fx;
+    float fy0 = a->y < b->y ? a->fy : b->fy, fy1 = a->y < b->y ? b->fy : a->fy;
 
     float u0 = a->x < b->x ? a->u : b->u;
     float u1 = a->x < b->x ? b->u : a->u;
@@ -2068,18 +2172,18 @@ static void emit_sprite(const psp_vertex *a, const psp_vertex *b) {
     uint32_t col = b->rgba;
     float z = b->z;
 
-    g_vbo_ptr[g_vbo_count++] = (vk_vertex){ (float)x0, (float)y0, z, col,
+    g_vbo_ptr[g_vbo_count++] = (vk_vertex){ fx0, fy0, z, col,
                                             u0 * g_uv_scale, v0 * g_uv_scale };
-    g_vbo_ptr[g_vbo_count++] = (vk_vertex){ (float)x1, (float)y0, z, col,
+    g_vbo_ptr[g_vbo_count++] = (vk_vertex){ fx1, fy0, z, col,
                                             u1 * g_uv_scale, v0 * g_uv_scale };
-    g_vbo_ptr[g_vbo_count++] = (vk_vertex){ (float)x0, (float)y1, z, col,
+    g_vbo_ptr[g_vbo_count++] = (vk_vertex){ fx0, fy1, z, col,
                                             u0 * g_uv_scale, v1 * g_uv_scale };
 
-    g_vbo_ptr[g_vbo_count++] = (vk_vertex){ (float)x1, (float)y0, z, col,
+    g_vbo_ptr[g_vbo_count++] = (vk_vertex){ fx1, fy0, z, col,
                                             u1 * g_uv_scale, v0 * g_uv_scale };
-    g_vbo_ptr[g_vbo_count++] = (vk_vertex){ (float)x1, (float)y1, z, col,
+    g_vbo_ptr[g_vbo_count++] = (vk_vertex){ fx1, fy1, z, col,
                                             u1 * g_uv_scale, v1 * g_uv_scale };
-    g_vbo_ptr[g_vbo_count++] = (vk_vertex){ (float)x0, (float)y1, z, col,
+    g_vbo_ptr[g_vbo_count++] = (vk_vertex){ fx0, fy1, z, col,
                                             u0 * g_uv_scale, v1 * g_uv_scale };
 }
 

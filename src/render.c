@@ -512,6 +512,8 @@ const psp_render_backend psp_render_null = {
 
 volatile int psp_render_face_swap;
 int psp_render_scale = 1;
+int psp_render_subpixel = 1;
+int psp_render_bga_smooth = 0;
 int psp_render_tex_filter = -1;
 
 int psp_render_frame(const uint32_t **px, int *w, int *h) {

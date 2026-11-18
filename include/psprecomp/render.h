@@ -21,6 +21,7 @@
  * here and below are 0xAABBGGRR, the GE's own byte order. */
 typedef struct {
     int      x, y;
+    float    fx, fy;         /* x, y before rounding, for backends that keep it (see psp_render_subpixel) */
     float    z;              /* depth, 0..65535 */
     uint32_t rgba;
     float    u, v;
@@ -121,6 +122,24 @@ typedef struct {
  * software renderer ignores it and stays at 1x, because it is the oracle the
  * others are checked against. */
 extern int psp_render_scale;
+
+/* Sub-pixel vertices. The game places the notes and bar lines of the
+ * gameplay lane at fractional pixel positions (a quarter of a pixel steps,
+ * from the song clock), and the GE front end rounds every vertex to the 480x272
+ * grid (ge.c read_vertex). With psp_render_subpixel != 0 the fraction is kept
+ * in psp_vertex.fx/fy for those draws (scene 3 only, transformed vertices),
+ * and a backend rendering above 1x may use it; otherwise fx == x, fy == y.
+ * 0 = off, 1 = on (default). EMOTIONALSENSE_SUBPIXEL=0|1 in the game. */
+extern int psp_render_subpixel;
+
+/* Background video (BGA) smoothing, Vulkan backend, gameplay scene only. The
+ * decoded video reaches the screen as a 512x512 VRAM texture that changes
+ * every second vblank (it is a 30 fps video). 0 = as the game draws it
+ * (default); 1 = "blend": the new video frame is held back one vblank and
+ * the in-between vblank shows the 50 % average of the previous and the new
+ * frame. Only that texture is touched; the lane, notes and HUD are not.
+ * EMOTIONALSENSE_BGA_SMOOTH=0|blend in the game. */
+extern int psp_render_bga_smooth;
 
 /* --tex-filter: -1 keeps the game's TEXFILTER bit, 0 forces nearest, 1 forces
  * bilinear. For comparing the two, and for looking for seams at 2x and up. */

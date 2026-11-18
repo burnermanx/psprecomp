@@ -519,6 +519,8 @@ static int read_vertex(uint32_t addr, uint32_t vtype, int tex_off, int col_off,
         /* Through mode's depth is an unsigned 16-bit value. */
         out->x = (int)pos[0];
         out->y = (int)pos[1];
+        out->fx = (float)out->x;
+        out->fy = (float)out->y;
         out->z = VT_POS(vtype) == 2 ? (float)psp_read16(addr + (uint32_t)pos_off + 4) : pos[2];
         return 1;
     }
@@ -534,6 +536,15 @@ static int read_vertex(uint32_t addr, uint32_t vtype, int tex_off, int col_off,
      * pixel 170, not 169. */
     out->x = (int)floorf(sx + 0.5f);
     out->y = (int)floorf(sy + 0.5f);
+    out->fx = (float)out->x;
+    out->fy = (float)out->y;
+    /* The gameplay lane (scene 3) is drawn with fractional positions: keep
+     * them, snapped to the GE's 1/16 pixel so float noise (169.9992) stays
+     * on its pixel. Only above 1x does a backend look at them. */
+    if (psp_render_subpixel && psp_render_scale > 1 && psp_scene_now() == 3) {
+        out->fx = floorf(sx * 16.0f + 0.5f) / 16.0f;
+        out->fy = floorf(sy * 16.0f + 0.5f) / 16.0f;
+    }
     out->z = sz;
     return 1;
 }

@@ -319,7 +319,23 @@ static int window_main(void *arg) {
     SDL_GameController *gc = NULL;
     uint32_t snap_seq = 0;
     int dirty = 1;                              /* first frame and every resize */
+    /* EMOTIONALSENSE_TRACE_PRESENT=<file>: one line per presented frame,
+     * "P <before-present us> <after-present us> <snapshot copied us> <snapshots
+     * skipped>", and "G <us> <gap us>" whenever the window loop did not poll
+     * the input for more than 3 ms. Times are host monotonic microseconds. */
+    FILE *tp = NULL;
+    uint64_t last_poll_us = 0;
+    {
+        const char *f = getenv("EMOTIONALSENSE_TRACE_PRESENT");
+        if (f && *f) tp = fopen(f, "w");
+    }
     while (!atomic_load(&g_closed)) {
+        if (tp) {
+            uint64_t n = psp_host_mono_us();
+            if (last_poll_us && n - last_poll_us > 3000) fprintf(tp, "G %llu %llu\n",
+                (unsigned long long)n, (unsigned long long)(n - last_poll_us));
+            last_poll_us = n;
+        }
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
             switch (ev.type) {
@@ -379,7 +395,9 @@ static int window_main(void *arg) {
 
         /* Present only when the guest produced a frame (or the window changed),
          * so the screen rate never paces the game. */
-        if (psp_display_snapshot(g_px, &snap_seq)) dirty = 1;
+        uint32_t prev_seq = snap_seq;
+        int fresh = psp_display_snapshot(g_px, &snap_seq);
+        if (fresh) dirty = 1;
         if (dirty) {
             int fw, fh;
             psp_display_size(&fw, &fh);
@@ -399,7 +417,16 @@ static int window_main(void *arg) {
             SDL_RenderClear(ren);
             SDL_UpdateTexture(tex, NULL, g_px, tex_w * 4);   /* 0xAABBGGRR == ABGR8888 */
             SDL_RenderCopy(ren, tex, NULL, NULL);
+            uint64_t t_before = tp ? psp_host_mono_us() : 0;
             SDL_RenderPresent(ren);
+            if (tp && fresh) {
+                uint64_t t_after = psp_host_mono_us();
+                fprintf(tp, "P %llu %llu %llu %u\n", (unsigned long long)t_before,
+                        (unsigned long long)t_after,
+                        (unsigned long long)psp_display_snap_us(),
+                        (snap_seq - prev_seq) / 2 - 1);
+                fflush(tp);
+            }
             dirty = 0;
         }
         SDL_Delay(1);

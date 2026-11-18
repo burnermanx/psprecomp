@@ -151,6 +151,10 @@ int      psp_display_snapshot(uint32_t *out, uint32_t *seq);
  * resolution when it keeps the frame itself. */
 void     psp_display_size(int *w, int *h);
 uint64_t psp_display_vblanks(void);
+/* Host monotonic time (us) when the last frame was copied for the window, and
+ * a host monotonic clock to compare it with. */
+uint64_t psp_display_snap_us(void);
+uint64_t psp_host_mono_us(void);
 uint32_t psp_display_framebuffer(void);
 
 void psp_ge_init(void);

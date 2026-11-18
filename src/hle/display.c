@@ -34,6 +34,41 @@ static uint32_t g_fb_format;
 static uint32_t g_mode, g_mode_w, g_mode_h;
 static uint64_t g_vblank_count;
 
+/* EMOTIONALSENSE_TRACE_FPS=1: one line per second of guest clock with how many
+ * of the vblanks showed a new picture. A frame is "new" when the snapshot taken
+ * at the last SetFrameBuf differs (FNV-1a over the pixels) from the one seen at
+ * the previous vblank, so it counts content, not calls. Costs one hash per
+ * flip, only when the variable is set. */
+static int g_tf = -1;
+static uint64_t g_snap_hash, g_snap_us, g_prev_hash;
+static uint64_t g_tf_vb, g_tf_flips, g_tf_chg, g_tf_distinct, g_tf_run, g_tf_maxrep, g_tf_sec;
+static uint32_t g_tf_last_fb;
+/* Callers of WaitVblank and SetFrameBuf (the guest return address), per second. */
+typedef struct { uint32_t ra; uint32_t n; } tf_ra;
+static tf_ra g_tf_wait[4], g_tf_flip[4];
+static uint64_t g_tf_ge0;
+
+static void tf_ra_add(tf_ra *t, uint32_t ra) {
+    for (int i = 0; i < 4; i++)
+        if (t[i].ra == ra || !t[i].n) { t[i].ra = ra; t[i].n++; return; }
+}
+static void tf_ra_print(const char *name, tf_ra *t) {
+    fprintf(stderr, " %s=", name);
+    for (int i = 0; i < 4 && t[i].n; i++) fprintf(stderr, "%s0x%X:%u", i ? "," : "", t[i].ra, t[i].n);
+    memset(t, 0, 4 * sizeof *t);
+}
+
+static int trace_fps_on(void) {
+    if (g_tf < 0) { const char *e = getenv("EMOTIONALSENSE_TRACE_FPS"); g_tf = e && *e && *e != '0'; }
+    return g_tf;
+}
+
+static uint64_t hash_px(const uint32_t *p, size_t n) {
+    uint64_t h = 1469598103934665603ull;
+    for (size_t i = 0; i < n; i++) { h ^= p[i]; h *= 1099511628211ull; }
+    return h;
+}
+
 /* A completed frame, copied at the flip point so the window never reads a
  * buffer the guest is drawing into. Seqlock: odd means a copy is in progress.
  *
@@ -59,6 +94,8 @@ static void snap_capture(void) {
         atomic_store_explicit(&g_snap_seq, s + 1, memory_order_relaxed);
         atomic_thread_fence(memory_order_release);
         memcpy(g_snap, fpx, (size_t)fw * (size_t)fh * 4u);
+        g_snap_us = psp_host_mono_us();
+        if (trace_fps_on()) g_snap_hash = hash_px(g_snap, (size_t)fw * (size_t)fh);
         atomic_store_explicit(&g_snap_seq, s + 2, memory_order_release);
         return;
     }
@@ -70,8 +107,13 @@ static void snap_capture(void) {
     atomic_store_explicit(&g_snap_seq, s + 1, memory_order_relaxed);
     atomic_thread_fence(memory_order_release);
     psp_display_read(g_snap);
+    g_snap_us = psp_host_mono_us();
+    if (trace_fps_on()) g_snap_hash = hash_px(g_snap, (size_t)g_snap_w * (size_t)g_snap_h);
     atomic_store_explicit(&g_snap_seq, s + 2, memory_order_release);
 }
+
+/* Host time at which the last completed frame was copied (monotonic us). */
+uint64_t psp_display_snap_us(void) { return g_snap_us; }
 
 void psp_display_size(int *w, int *h) { *w = g_snap_w; *h = g_snap_h; }
 
@@ -206,7 +248,7 @@ static void shot_if_wanted(void) {
     if (!want) return;
     char path[600];
     snprintf(path, sizeof path, "%s/frame_%llu.ppm", dir, (unsigned long long)g_vblank_count);
-    if (psp_display_capture(path) == 0) fprintf(stderr, "Saved screenshot %s\n", path);
+    if (psp_display_capture(path) == 0) fprintf(stderr, "Saved screenshot %s t=%.4f\n", path, (double)psp_clock_us() / 1e6);
 }
 
 static void hle_SetFrameBuf(void) {
@@ -223,6 +265,11 @@ static void hle_SetFrameBuf(void) {
      * buffer is published; the window reads the snapshot, not live VRAM. */
     psp_render_current()->present();
     if (g_fb_addr) snap_capture();
+    if (trace_fps_on()) {
+        g_tf_flips++;
+        tf_ra_add(g_tf_flip, psp_cpu.r[PSP_REG_RA]);
+        if (psp_arg(0) != g_tf_last_fb) { g_tf_chg++; g_tf_last_fb = psp_arg(0); }
+    }
     shot_if_wanted();
     g_fb_addr   = psp_arg(0);
     g_fb_width  = psp_arg(1);
@@ -237,8 +284,37 @@ static void hle_SetFrameBuf(void) {
  * the most useful single number to have during bring-up, because it tells you
  * whether the game is looping or stuck -- and the yield is what lets the
  * threads that feed that loop run. */
+static void trace_fps_vblank(void) {
+    g_tf_vb++;
+    tf_ra_add(g_tf_wait, psp_cpu.r[PSP_REG_RA]);
+    if (g_snap_hash != g_prev_hash) {
+        g_tf_distinct++;
+        if (g_tf_run > g_tf_maxrep) g_tf_maxrep = g_tf_run;
+        g_tf_run = 1;
+        g_prev_hash = g_snap_hash;
+    } else {
+        g_tf_run++;
+    }
+    uint64_t sec = psp_clock_us() / 1000000ull;
+    if (sec != g_tf_sec) {
+        if (g_tf_run > g_tf_maxrep) g_tf_maxrep = g_tf_run;
+        fprintf(stderr, "fps[%llu]: t=%llus vblanks=%llu flips=%llu fbchg=%llu distinct=%llu maxrep=%llu",
+                (unsigned long long)g_vblank_count, (unsigned long long)sec,
+                (unsigned long long)g_tf_vb, (unsigned long long)g_tf_flips,
+                (unsigned long long)g_tf_chg, (unsigned long long)g_tf_distinct,
+                (unsigned long long)g_tf_maxrep);
+        tf_ra_print("wait_ra", g_tf_wait);
+        tf_ra_print("flip_ra", g_tf_flip);
+        fprintf(stderr, " ge_cmds=%llu\n", (unsigned long long)(psp_ge_command_count() - g_tf_ge0));
+        g_tf_ge0 = psp_ge_command_count();
+        g_tf_sec = sec;
+        g_tf_vb = g_tf_flips = g_tf_chg = g_tf_distinct = g_tf_maxrep = 0;
+    }
+}
+
 static void hle_WaitVblank(void) {
     g_vblank_count++;
+    if (trace_fps_on()) trace_fps_vblank();
     if (getenv("EMOTIONALSENSE_DEBUG_FB") && (g_vblank_count % 100) == 0) {
         fprintf(stderr, "vblank %llu\n", (unsigned long long)g_vblank_count);
     }
@@ -246,6 +322,21 @@ static void hle_WaitVblank(void) {
      * point where an interrupt is delivered (src/hle/intrman.c) -- and, on one
      * CPU, the most natural place to hand the CPU over. */
     psp_threadman_frame_wait();
+    /* EMOTIONALSENSE_EXP_SKIPVB=N (with EMOTIONALSENSE_EXP_FROM=<vblank>):
+     * experiment, not behaviour. Every N-th vblank takes two frame periods, as
+     * if the host had missed one, so the guest sees 60*(N-1)/N vblanks per
+     * second of real time. Used to tell whether the gameplay follows time or
+     * the frame count. */
+    static int skip = -1;
+    static uint64_t from;
+    if (skip < 0) {
+        const char *e = getenv("EMOTIONALSENSE_EXP_SKIPVB");
+        skip = e ? atoi(e) : 0;
+        const char *f = getenv("EMOTIONALSENSE_EXP_FROM");
+        from = f ? strtoull(f, NULL, 0) : 0;
+    }
+    if (skip > 0 && g_vblank_count >= from && g_vblank_count % (uint64_t)skip == 0)
+        psp_threadman_frame_wait();
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 

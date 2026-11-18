@@ -140,7 +140,7 @@ static void hle_CtrlSet(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
  * what a multi-song run needs. The relative form survives a change in how long
  * the opening runs; the absolute form does not. A value starting with '@'
  * names a file with one entry per line ('#' comments). */
-#define SCRIPT_MAX 256
+#define SCRIPT_MAX 2048
 typedef struct {
     int relative;
     int has_nth;                    /* @scene#k+N: restrict to the k-th entry */
@@ -163,7 +163,7 @@ static uint32_t g_scene_count[256];
 
 static void script_load(void) {
     const char *s = getenv("EMOTIONALSENSE_SCRIPT");
-    static char buf[16384];
+    static char buf[131072];
     if (s && *s == '@') {
         FILE *f = fopen(s + 1, "r");
         if (!f) { fprintf(stderr, "script: cannot open %s\n", s + 1); return; }

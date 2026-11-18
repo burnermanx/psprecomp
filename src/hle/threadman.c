@@ -337,6 +337,9 @@ static uint64_t mono_us(void) {
 #endif
 }
 
+/* Host monotonic microseconds, for traces that compare host and guest time. */
+uint64_t psp_host_mono_us(void) { return mono_us(); }
+
 /* The clock the guest reads: uptime in microseconds. g_vtime_us stays internal
  * scheduler accounting and is no longer visible to the game. */
 uint64_t psp_clock_us(void) {

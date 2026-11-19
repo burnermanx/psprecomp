@@ -58,6 +58,9 @@ uint64_t psp_hle_zero_calls(void);
  * Unimplemented NIDs are counted individually too. */
 void psp_hle_dump_counts(FILE *out, int limit);
 
+/* Called for every firmware call (name is NULL when unimplemented); NULL = off. */
+extern void (*psp_hle_trace_hook)(uint32_t nid, const char *name);
+
 /* Every registered entry, for the coverage report a game repo wants: which of
  * a module's imports actually exist yet. */
 typedef struct {

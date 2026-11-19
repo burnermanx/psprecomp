@@ -138,6 +138,9 @@ void psp_hle_dump_recent(FILE *out) {
 static uint64_t g_unimpl_total;
 static uint64_t g_unimpl_logged;
 
+/* Optional observer of every firmware call (the host's crash report keeps a ring of them). */
+void (*psp_hle_trace_hook)(uint32_t nid, const char *name);
+
 void psp_hle_call(uint32_t nid) {
     static int trace_uid = -2;
     if (trace_uid == -2) {
@@ -152,6 +155,7 @@ void psp_hle_call(uint32_t nid) {
     for (int i = 0; i < g_count; i++) {
         if (g_entry[i].nid == nid) {
             g_calls[i]++;
+            if (psp_hle_trace_hook) psp_hle_trace_hook(nid, g_entry[i].name);
             if (trace_uid == -1 || (trace_uid >= 0 && (int)psp_threadman_current_uid() == trace_uid))
                 fprintf(stderr, "hle[%u@%llu]: %s(0x%08X,0x%08X,0x%08X,0x%08X) ra=0x%08X t=%llu\n",
                         psp_threadman_current_uid(), (unsigned long long)psp_display_vblanks(), g_entry[i].name,
@@ -164,6 +168,7 @@ void psp_hle_call(uint32_t nid) {
         }
     }
     note_zero(nid, NULL);
+    if (psp_hle_trace_hook) psp_hle_trace_hook(nid, NULL);
 
     /* Unimplemented. Naming the function is the whole point — bringing a game
      * up is largely the process of watching this message stop appearing, and

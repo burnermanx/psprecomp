@@ -560,7 +560,9 @@ static int window_main(void *arg) {
     (void)arg;
     /* Without this Windows reports a scaled size and blurs the nearest-neighbour
      * pixels; the hint is ignored off Windows. */
+#ifdef SDL_HINT_WINDOWS_DPI_AWARENESS   /* SDL >= 2.24; older SDL2 (Ubuntu 22.04: 2.0.20) lacks it */
     SDL_SetHint(SDL_HINT_WINDOWS_DPI_AWARENESS, "permonitorv2");
+#endif
     if (SDL_InitSubSystem(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER) != 0) {
         fprintf(stderr, "psprecomp: SDL_Init: %s\n", SDL_GetError());
         atomic_store(&g_closed, 1); atomic_store(&g_ready, -1);

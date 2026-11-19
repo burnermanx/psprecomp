@@ -1,6 +1,7 @@
 /* psprecomp — address → function dispatch. See include/psprecomp/dispatch.h. */
 
 #include "psprecomp/dispatch.h"
+#include "psprecomp/log.h"
 #include "psprecomp/cpu.h"
 
 #include <stdio.h>
@@ -135,32 +136,32 @@ uint32_t psp_trace_last(void) {
 
 void psp_trace_dump(void) {
     if (!g_trace_n) {
-        fprintf(stderr, "  (no function trace -- build the generated code with "
+        psp_log("  (no function trace -- build the generated code with "
                         "PSPRECOMP_TRACE to enable it)\n");
         return;
     }
     uint64_t n = g_trace_n < TRACE_DEPTH ? g_trace_n : TRACE_DEPTH;
-    fprintf(stderr, "  last %llu functions entered, newest first:\n",
+    psp_log("  last %llu functions entered, newest first:\n",
             (unsigned long long)n);
     for (uint64_t i = 1; i <= n; i++) {
         uint64_t k = (g_trace_n - i) % TRACE_DEPTH;
-        fprintf(stderr, "    psp_func_%08X\n", g_trace[k]);
+        psp_log("    psp_func_%08X\n", g_trace[k]);
     }
-    fprintf(stderr, "  (%llu function entries total)\n",
+    psp_log("  (%llu function entries total)\n",
             (unsigned long long)g_trace_n);
 }
 
 static void default_miss(uint32_t addr) {
-    fprintf(stderr,
+    psp_log(
             "psprecomp: indirect call to 0x%08X (ra=0x%08X, sp=0x%08X, a0=0x%08X, a1=0x%08X, v0=0x%08X), "
             "which is not a recompiled function.\n"
             "  Either discovery missed it, or it is data being called as code.\n",
             addr, psp_cpu.r[PSP_REG_RA], psp_cpu.r[PSP_REG_SP],
             psp_cpu.r[PSP_REG_A0], psp_cpu.r[PSP_REG_A1], psp_cpu.r[PSP_REG_V0]);
-    fprintf(stderr, "  guest call stack (frame->ret):\n");
+    psp_log("  guest call stack (frame->ret):\n");
     int depth = 0;
     for (const psp_frame *f = psp_cpu.frame; f && depth < 32; f = f->prev, depth++)
-        fprintf(stderr, "    [%2d] ret=0x%08X\n", depth, f->ret);
+        psp_log("    [%2d] ret=0x%08X\n", depth, f->ret);
     psp_miss_context();
     abort();
 }
@@ -217,7 +218,7 @@ void psp_dispatch(uint32_t addr) {
         static int logged;
         if (psp_log_indirect && logged < 12) {
             logged++;
-            fprintf(stderr, "indirect ok: target=0x%08X from fn 0x%08X\n",
+            psp_log("indirect ok: target=0x%08X from fn 0x%08X\n",
                     addr, psp_trace_last());
         }
         fn();
@@ -392,7 +393,7 @@ void psp_trace_sp(uint32_t fn, uint32_t sp_in, uint32_t sp_out) {
      * they are noise. A *negative* delta is the dangerous case: stack consumed
      * and never returned. */
     if (g_sp_bad < 24)
-        fprintf(stderr, "sp UNBALANCED in 0x%08X: %+d%s\n", fn,
+        psp_log("sp UNBALANCED in 0x%08X: %+d%s\n", fn,
                 (int)(sp_out - sp_in),
                 (int32_t)(sp_out - sp_in) < 0 ? "   <-- leak" : "");
     if (!g_sp_bad) { g_sp_first = fn; g_sp_delta = (int32_t)(sp_out - sp_in); }
@@ -419,7 +420,7 @@ void psp_trace_sp_leave(uint32_t fn, uint32_t sp_in, uint32_t sp_out) {
     if (d < 0) return;                    /* this fragment's own frame: expected */
     sp_record(&g_sp_tbl, fn, d, sp_in, sp_out, psp_trace_last());
     if (g_sp_bad < 24)
-        fprintf(stderr, "sp HANDED OVER HIGH in 0x%08X: %+d   <-- released a frame "
+        psp_log("sp HANDED OVER HIGH in 0x%08X: %+d   <-- released a frame "
                         "it never took\n", fn, (int)d);
     if (!g_sp_bad) { g_sp_first = fn; g_sp_delta = d; }
     g_sp_bad++;
@@ -438,7 +439,7 @@ void psp_trace_sp_call(uint32_t callee, uint32_t sp_before, uint32_t sp_after) {
     sp_record(&g_spc_tbl, callee, (int32_t)(sp_after - sp_before),
               sp_before, sp_after, psp_trace_last());
     if (g_spc_bad < 16)
-        fprintf(stderr, "sp NOT RESTORED by callee 0x%08X: %+d\n",
+        psp_log("sp NOT RESTORED by callee 0x%08X: %+d\n",
                 callee, (int)(sp_after - sp_before));
     g_spc_bad++;
 }

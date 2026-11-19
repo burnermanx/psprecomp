@@ -33,6 +33,7 @@ endif()
 # --- the runtime library ------------------------------------------------------
 
 add_library(psprecomp STATIC
+    src/log.c
     src/cpu.c
     src/mem.c
     src/dispatch.c

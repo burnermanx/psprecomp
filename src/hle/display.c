@@ -11,6 +11,7 @@
  */
 
 #include "psprecomp/hle.h"
+#include "psprecomp/log.h"
 #include "psprecomp/render.h"
 #include <stdatomic.h>
 #include <stdlib.h>
@@ -59,8 +60,8 @@ static void tf_ra_add(tf_ra *t, uint32_t ra) {
         if (t[i].ra == ra || !t[i].n) { t[i].ra = ra; t[i].n++; return; }
 }
 static void tf_ra_print(const char *name, tf_ra *t) {
-    fprintf(stderr, " %s=", name);
-    for (int i = 0; i < 4 && t[i].n; i++) fprintf(stderr, "%s0x%X:%u", i ? "," : "", t[i].ra, t[i].n);
+    psp_log(" %s=", name);
+    for (int i = 0; i < 4 && t[i].n; i++) psp_log("%s0x%X:%u", i ? "," : "", t[i].ra, t[i].n);
     memset(t, 0, 4 * sizeof *t);
 }
 
@@ -254,7 +255,7 @@ static void shot_if_wanted(void) {
     if (!want) return;
     char path[600];
     snprintf(path, sizeof path, "%s/frame_%llu.ppm", dir, (unsigned long long)g_vblank_count);
-    if (psp_display_capture(path) == 0) fprintf(stderr, "Saved screenshot %s t=%.4f\n", path, (double)psp_clock_us() / 1e6);
+    if (psp_display_capture(path) == 0) psp_log("Saved screenshot %s t=%.4f\n", path, (double)psp_clock_us() / 1e6);
 }
 
 static void hle_SetFrameBuf(void) {
@@ -262,7 +263,7 @@ static void hle_SetFrameBuf(void) {
     if (getenv("EMOTIONALSENSE_DEBUG_FB")) {
         static uint32_t last_fb;
         if (psp_arg(0) != last_fb) {
-            fprintf(stderr, "SetFrameBuf changed: 0x%08X -> 0x%08X width=%u fmt=%u vb=%llu\n",
+            psp_log("SetFrameBuf changed: 0x%08X -> 0x%08X width=%u fmt=%u vb=%llu\n",
                     last_fb, psp_arg(0), psp_arg(1), psp_arg(2), (unsigned long long)g_vblank_count);
             last_fb = psp_arg(0);
         }
@@ -324,7 +325,7 @@ static void trace_fps_vblank(void) {
     uint64_t sec = psp_clock_us() / 1000000ull;
     if (sec != g_tf_sec) {
         if (g_tf_run > g_tf_maxrep) g_tf_maxrep = g_tf_run;
-        fprintf(stderr, "fps[%llu]: t=%llus vblanks=%llu flips=%llu fbchg=%llu distinct=%llu maxrep=%llu real=%llu realrep=%llu",
+        psp_log("fps[%llu]: t=%llus vblanks=%llu flips=%llu fbchg=%llu distinct=%llu maxrep=%llu real=%llu realrep=%llu",
                 (unsigned long long)g_vblank_count, (unsigned long long)sec,
                 (unsigned long long)g_tf_vb, (unsigned long long)g_tf_flips,
                 (unsigned long long)g_tf_chg, (unsigned long long)g_tf_distinct,
@@ -332,7 +333,7 @@ static void trace_fps_vblank(void) {
                 (unsigned long long)(g_tf_rrun > g_tf_rmax ? g_tf_rrun : g_tf_rmax));
         tf_ra_print("wait_ra", g_tf_wait);
         tf_ra_print("flip_ra", g_tf_flip);
-        fprintf(stderr, " ge_cmds=%llu\n", (unsigned long long)(psp_ge_command_count() - g_tf_ge0));
+        psp_log(" ge_cmds=%llu\n", (unsigned long long)(psp_ge_command_count() - g_tf_ge0));
         g_tf_ge0 = psp_ge_command_count();
         g_tf_sec = sec;
         g_tf_vb = g_tf_flips = g_tf_chg = g_tf_distinct = g_tf_maxrep = 0;
@@ -344,7 +345,7 @@ static void hle_WaitVblank(void) {
     g_vblank_count++;
     if (trace_fps_on()) trace_fps_vblank();
     if (getenv("EMOTIONALSENSE_DEBUG_FB") && (g_vblank_count % 100) == 0) {
-        fprintf(stderr, "vblank %llu\n", (unsigned long long)g_vblank_count);
+        psp_log("vblank %llu\n", (unsigned long long)g_vblank_count);
     }
     /* A frame boundary is the guest asking for time to pass, so it is the third
      * point where an interrupt is delivered (src/hle/intrman.c) -- and, on one

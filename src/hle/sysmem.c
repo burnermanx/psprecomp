@@ -13,6 +13,7 @@
  */
 
 #include "psprecomp/hle.h"
+#include "psprecomp/log.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -203,7 +204,7 @@ static void hle_AllocPartitionMemory(void) {
     b->uid = g_next_uid++;
     b->addr = addr;
     b->size = rounded;
-    fprintf(stderr, "AllocPartition -> uid 0x%X at 0x%08X size %u (ends 0x%08X)\n",
+    psp_log("AllocPartition -> uid 0x%X at 0x%08X size %u (ends 0x%08X)\n",
             b->uid, b->addr, b->size, b->addr + b->size);
     b->used = 1;
     psp_str(name_ptr, b->name, sizeof b->name);
@@ -220,7 +221,7 @@ static void hle_FreePartitionMemory(void) {
 
 static void hle_GetBlockHeadAddr(void) {
     mem_block *b = find_uid(psp_arg(0));
-    fprintf(stderr, "GetBlockHeadAddr(uid=0x%X) -> 0x%08X (size %u, ends 0x%08X)\n",
+    psp_log("GetBlockHeadAddr(uid=0x%X) -> 0x%08X (size %u, ends 0x%08X)\n",
             psp_arg(0), b ? b->addr : 0, b ? b->size : 0,
             b ? b->addr + b->size : 0);
     psp_ret(b ? b->addr : 0);
@@ -243,26 +244,26 @@ static void hle_Printf(void) {
 
     int argi = 1;
     for (const char *p = fmt; *p; p++) {
-        if (*p != '%') { fputc(*p, stderr); continue; }
+        if (*p != '%') { psp_log_putc(*p); continue; }
         p++;
         if (!*p) break;
         /* Skip flags/width/precision; we do not reproduce padding. */
         while (*p && strchr("-+ #0123456789.lhz", *p)) p++;
         switch (*p) {
-        case 'd': case 'i': fprintf(stderr, "%d", (int32_t)psp_arg(argi++)); break;
-        case 'u':           fprintf(stderr, "%u", psp_arg(argi++)); break;
-        case 'x':           fprintf(stderr, "%x", psp_arg(argi++)); break;
-        case 'X':           fprintf(stderr, "%X", psp_arg(argi++)); break;
-        case 'p':           fprintf(stderr, "0x%08X", psp_arg(argi++)); break;
-        case 'c':           fputc((int)psp_arg(argi++), stderr); break;
+        case 'd': case 'i': psp_log("%d", (int32_t)psp_arg(argi++)); break;
+        case 'u':           psp_log("%u", psp_arg(argi++)); break;
+        case 'x':           psp_log("%x", psp_arg(argi++)); break;
+        case 'X':           psp_log("%X", psp_arg(argi++)); break;
+        case 'p':           psp_log("0x%08X", psp_arg(argi++)); break;
+        case 'c':           psp_log_putc((int)psp_arg(argi++)); break;
         case 's': {
             char s[256];
             psp_str(psp_arg(argi++), s, sizeof s);
-            fputs(s, stderr);
+            psp_log_puts(s);
             break;
         }
-        case '%': fputc('%', stderr); break;
-        default:  fputc('%', stderr); fputc(*p, stderr); break;
+        case '%': psp_log_putc('%'); break;
+        default:  psp_log_putc('%'); psp_log_putc(*p); break;
         }
     }
     psp_ret(SCE_KERNEL_ERROR_OK);

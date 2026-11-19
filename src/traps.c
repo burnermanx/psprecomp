@@ -25,6 +25,7 @@
  * les premiers, on compte les suivants, et les totaux restent lisibles a la fin.
  */
 #include "psprecomp/recomp_rt.h"
+#include "psprecomp/log.h"
 
 #include <stdio.h>
 
@@ -38,7 +39,7 @@ static uint32_t g_unimplemented_logged;
 void psp_syscall(uint32_t id) {
     if (g_syscall_logged < PSP_TRAP_LOGGED) {
         g_syscall_logged++;
-        fprintf(stderr, "psprecomp: syscall 0x%05X\n", id);
+        psp_log("psprecomp: syscall 0x%05X\n", id);
     }
     g_syscall_total++;
 }
@@ -46,7 +47,7 @@ void psp_syscall(uint32_t id) {
 void psp_unimplemented(uint32_t addr, const char *what) {
     if (g_unimplemented_logged < PSP_TRAP_LOGGED) {
         g_unimplemented_logged++;
-        fprintf(stderr, "psprecomp: unimplemented at 0x%08X: %s\n", addr,
+        psp_log("psprecomp: unimplemented at 0x%08X: %s\n", addr,
                 what ? what : "?");
     }
     g_unimplemented_total++;

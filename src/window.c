@@ -1,6 +1,7 @@
 /* psprecomp -- a window to play in. See include/psprecomp/window.h. */
 
 #include "psprecomp/window.h"
+#include "psprecomp/log.h"
 #include "psprecomp/hle.h"
 
 #include <stdio.h>
@@ -361,7 +362,7 @@ static int present_main(void *arg) {
     SDL_Texture *tex = ren ? SDL_CreateTexture(ren, SDL_PIXELFORMAT_ABGR8888,
                                                SDL_TEXTUREACCESS_STREAMING, tex_w, tex_h) : NULL;
     if (!tex) {
-        fprintf(stderr, "psprecomp: cannot open a window: %s\n", SDL_GetError());
+        psp_log("psprecomp: cannot open a window: %s\n", SDL_GetError());
         atomic_store(&g_present_state, -1);
         return 1;
     }
@@ -530,8 +531,8 @@ static void toggle_borderless(SDL_Window *win) {
     set_borderless(win, on);
     SDL_DisplayMode d;
     if (on && SDL_GetDesktopDisplayMode(SDL_GetWindowDisplayIndex(win), &d) == 0)
-        fprintf(stderr, "window: borderless full screen %dx%d at %d Hz\n", d.w, d.h, d.refresh_rate);
-    else if (!on) fprintf(stderr, "window: windowed\n");
+        psp_log("window: borderless full screen %dx%d at %d Hz\n", d.w, d.h, d.refresh_rate);
+    else if (!on) psp_log("window: windowed\n");
 }
 
 /* F11: window <-> full screen at the rate the user chose (exclusive 60/120 Hz
@@ -540,20 +541,20 @@ static void toggle_fullscreen(SDL_Window *win) {
     if (is_fullscreen(win)) {
         SDL_SetWindowFullscreen(win, 0);
         remember_fullscreen(0);
-        fprintf(stderr, "window: windowed\n");
+        psp_log("window: windowed\n");
         return;
     }
     SDL_DisplayMode m;
     if (pick_refresh_mode(win, &m) && SDL_SetWindowDisplayMode(win, &m) == 0 &&
         SDL_SetWindowFullscreen(win, SDL_WINDOW_FULLSCREEN) == 0) {
         remember_fullscreen(1);
-        fprintf(stderr, "window: exclusive full screen %dx%d at %d Hz\n", m.w, m.h, m.refresh_rate);
+        psp_log("window: exclusive full screen %dx%d at %d Hz\n", m.w, m.h, m.refresh_rate);
         return;
     }
     set_borderless(win, 1);
     SDL_DisplayMode d;
     if (SDL_GetDesktopDisplayMode(SDL_GetWindowDisplayIndex(win), &d) == 0)
-        fprintf(stderr, "window: borderless full screen %dx%d at %d Hz\n", d.w, d.h, d.refresh_rate);
+        psp_log("window: borderless full screen %dx%d at %d Hz\n", d.w, d.h, d.refresh_rate);
 }
 
 static int window_main(void *arg) {
@@ -564,7 +565,7 @@ static int window_main(void *arg) {
     SDL_SetHint(SDL_HINT_WINDOWS_DPI_AWARENESS, "permonitorv2");
 #endif
     if (SDL_InitSubSystem(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER) != 0) {
-        fprintf(stderr, "psprecomp: SDL_Init: %s\n", SDL_GetError());
+        psp_log("psprecomp: SDL_Init: %s\n", SDL_GetError());
         atomic_store(&g_closed, 1); atomic_store(&g_ready, -1);
         return 1;
     }
@@ -598,15 +599,15 @@ static int window_main(void *arg) {
         int di = SDL_GetWindowDisplayIndex(win);
         SDL_DisplayMode d, p;
         SDL_GetDesktopDisplayMode(di, &d);
-        fprintf(stderr, "window: display %d, desktop %dx%d at %d Hz; modes:", di, d.w, d.h, d.refresh_rate);
+        psp_log("window: display %d, desktop %dx%d at %d Hz; modes:", di, d.w, d.h, d.refresh_rate);
         for (int i = 0; i < SDL_GetNumDisplayModes(di); i++)
-            if (SDL_GetDisplayMode(di, i, &p) == 0 && p.w == d.w && p.h == d.h) fprintf(stderr, " %d", p.refresh_rate);
-        fprintf(stderr, "\n");
-        if (pick_refresh_mode(win, &p)) fprintf(stderr, "window: refresh option picks %d Hz\n", p.refresh_rate);
-        else fprintf(stderr, "window: refresh option keeps the desktop mode\n");
+            if (SDL_GetDisplayMode(di, i, &p) == 0 && p.w == d.w && p.h == d.h) psp_log(" %d", p.refresh_rate);
+        psp_log("\n");
+        if (pick_refresh_mode(win, &p)) psp_log("window: refresh option picks %d Hz\n", p.refresh_rate);
+        else psp_log("window: refresh option keeps the desktop mode\n");
     }
     if (!win) {
-        fprintf(stderr, "psprecomp: cannot open a window: %s\n", SDL_GetError());
+        psp_log("psprecomp: cannot open a window: %s\n", SDL_GetError());
         atomic_store(&g_closed, 1); atomic_store(&g_ready, -1);
         return 1;
     }
@@ -667,7 +668,7 @@ static int window_main(void *arg) {
                     if (ev.window.event == SDL_WINDOWEVENT_SIZE_CHANGED) {
                         atomic_store(&g_refit, 1);
                         if (getenv("EMOTIONALSENSE_TRACE_MODES"))
-                            fprintf(stderr, "window: size %dx%d%s\n", ev.window.data1, ev.window.data2,
+                            psp_log("window: size %dx%d%s\n", ev.window.data1, ev.window.data2,
                                     is_fullscreen(win) ? " (full screen)" : " (window)");
                     }
                     atomic_store(&g_dirty, 1);
@@ -690,8 +691,8 @@ static int window_main(void *arg) {
                            (ev.key.keysym.mod & KMOD_ALT) && !ev.key.repeat) {
                     toggle_borderless(win);
                 } else if (ev.key.keysym.sym == SDLK_F9) {
-                    psp_ge_dump_stats(stderr);
-                    psp_hle_dump_counts(stderr, 40);
+                    psp_ge_dump_stats(psp_log_stream());
+                    psp_hle_dump_counts(psp_log_stream(), 40);
                 } else if (ev.key.keysym.sym == SDLK_F12) {
                     const char *dir = getenv("EMOTIONALSENSE_SHOT_DIR");
                     char path[512];
@@ -699,7 +700,7 @@ static int window_main(void *arg) {
                              dir ? dir : psp_host_temp_dir(),
                              (unsigned long long)psp_display_vblanks());
                     psp_display_capture(path);
-                    fprintf(stderr, "window: captured %s\n", path);
+                    psp_log("window: captured %s\n", path);
                 }
                 break;
             }
@@ -716,7 +717,7 @@ static int window_main(void *arg) {
         if (in_trace) {
             static uint32_t l_b; static uint8_t l_ax = 128, l_ay = 128;
             if ((bp | bk) != l_b || ax != l_ax || ay != l_ay) {
-                fprintf(stderr, "input[%llu]: pad=%04X kbd=%04X ax=%u ay=%u\n",
+                psp_log("input[%llu]: pad=%04X kbd=%04X ax=%u ay=%u\n",
                         (unsigned long long)psp_display_vblanks(), bp, bk, ax, ay);
                 l_b = bp | bk; l_ax = ax; l_ay = ay;
             }

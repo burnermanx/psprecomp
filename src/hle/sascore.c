@@ -12,6 +12,7 @@
  */
 
 #include "psprecomp/hle.h"
+#include "psprecomp/log.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -24,7 +25,7 @@ static int sas_trace(void) {
     if (t < 0) t = getenv("PSPRECOMP_TRACE_SAS") != NULL;
     return t;
 }
-#define SAS_LOG(...) do { if (sas_trace()) fprintf(stderr, __VA_ARGS__); } while (0)
+#define SAS_LOG(...) do { if (sas_trace()) psp_log(__VA_ARGS__); } while (0)
 
 #define SAS_VOICES     32
 #define SAS_MAX_GRAIN  1024
@@ -406,7 +407,7 @@ static void mix_to_guest(uint32_t out_addr, int add) {
     if (sas_trace() && (g_frames_rendered <= 20 || g_frames_rendered % 64 == 0)) {
         int playing = 0;
         for (int i = 0; i < SAS_VOICES; i++) playing += g_voice[i].playing;
-        fprintf(stderr, "sas: Core #%llu out 0x%08X grain %u voices playing %d nonzero so far %llu\n",
+        psp_log("sas: Core #%llu out 0x%08X grain %u voices playing %d nonzero so far %llu\n",
                 (unsigned long long)g_frames_rendered, out_addr, n, playing,
                 (unsigned long long)g_samples_nonzero);
     }

@@ -1,6 +1,7 @@
 /* psprecomp -- loading and starting a recompiled module. See module.h. */
 
 #include "psprecomp/module.h"
+#include "psprecomp/log.h"
 #include "psprecomp/mem.h"
 #include "psprecomp/cpu.h"
 #include "psprecomp/ctors.h"
@@ -17,14 +18,14 @@ static uint32_t rd32(const uint8_t *p) {
 int psp_module_load(const char *path, uint32_t span, psp_module *m) {
     memset(m, 0, sizeof *m);
     FILE *f = fopen(path, "rb");
-    if (!f) { fprintf(stderr, "psprecomp: cannot open %s\n", path); return -1; }
+    if (!f) { psp_log("psprecomp: cannot open %s\n", path); return -1; }
     fseek(f, 0, SEEK_END);
     const long n = ftell(f);
     rewind(f);
     uint8_t *b = (n > 52) ? (uint8_t *)malloc((size_t)n) : NULL;
     if (!b || fread(b, 1, (size_t)n, f) != (size_t)n) {
         fclose(f); free(b);
-        fprintf(stderr, "psprecomp: cannot read %s\n", path);
+        psp_log("psprecomp: cannot read %s\n", path);
         return -1;
     }
     fclose(f);
@@ -34,7 +35,7 @@ int psp_module_load(const char *path, uint32_t span, psp_module *m) {
     const uint32_t phoff = rd32(b + 28);
     if (memcmp(b, "\x7F" "ELF", 4) != 0 || (size_t)phoff + 32 > (size_t)n) {
         free(b);
-        fprintf(stderr, "psprecomp: %s is not a decrypted ELF module\n", path);
+        psp_log("psprecomp: %s is not a decrypted ELF module\n", path);
         return -1;
     }
     const uint8_t *ph = b + phoff;
@@ -44,7 +45,7 @@ int psp_module_load(const char *path, uint32_t span, psp_module *m) {
         psp_mem_map_module(vaddr, span) != 0 ||
         psp_mem_write_block(vaddr, b + off, filesz) != 0) {
         free(b);
-        fprintf(stderr, "psprecomp: cannot place %s at 0x%08X\n", path, vaddr);
+        psp_log("psprecomp: cannot place %s at 0x%08X\n", path, vaddr);
         return -1;
     }
 
@@ -65,7 +66,7 @@ int psp_module_load(const char *path, uint32_t span, psp_module *m) {
             (size_t)qoff + qfile > (size_t)n ||
             psp_mem_write_block(qaddr, b + qoff, qfile) != 0) {
             free(b);
-            fprintf(stderr, "psprecomp: cannot place segment %u of %s at 0x%08X\n",
+            psp_log("psprecomp: cannot place segment %u of %s at 0x%08X\n",
                     (unsigned)i, path, qaddr);
             return -1;
         }
@@ -120,7 +121,7 @@ uint32_t psp_module_start(const psp_module *m) {
     for (int i = 0; ctors_ok && i < m->nctors; i++)
         if (!psp_lookup(psp_read32(m->ctors + (uint32_t)i * 4))) ctors_ok = 0;
     if (m->ctors && !ctors_ok)
-        fprintf(stderr, "psprecomp: ignoring constructor table candidate at 0x%08X "
+        psp_log("psprecomp: ignoring constructor table candidate at 0x%08X "
                         "(entries are not recompiled code)\n", m->ctors);
     if (ctors_ok) psp_ctors_run(m->ctors);
     psp_call_from_host(m->entry);

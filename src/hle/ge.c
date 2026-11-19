@@ -25,6 +25,7 @@
  */
 
 #include "psprecomp/hle.h"
+#include "psprecomp/log.h"
 #include "psprecomp/render.h"
 
 #include <math.h>
@@ -561,7 +562,7 @@ static FILE *trace_out(void) {
         const char *p = getenv("PSPRECOMP_TRACE_GE_FILE");
         if (p && *p) fp = fopen(p, "w");
     }
-    return fp ? fp : stderr;
+    return fp ? fp : psp_log_stream();
 }
 
 static int trace_frame(void) {

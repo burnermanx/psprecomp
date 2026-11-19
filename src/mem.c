@@ -1,6 +1,7 @@
 /* psprecomp — PSP memory map. See include/psprecomp/mem.h. */
 
 #include "psprecomp/mem.h"
+#include "psprecomp/log.h"
 #include "psprecomp/dispatch.h"
 #include "psprecomp/cpu.h"
 
@@ -39,14 +40,14 @@ static void note_write(uint32_t addr, uint32_t width) {
     g_wlast = v; g_wseen = 1;
     if (g_whits++ < g_wlimit)
     {
-        fprintf(stderr, "write%u to 0x%08X (watch 0x%08X) = 0x%08X from fn 0x%08X ra 0x%08X calls",
+        psp_log("write%u to 0x%08X (watch 0x%08X) = 0x%08X from fn 0x%08X ra 0x%08X calls",
                 width * 8, addr, g_wwatch, v,
                 psp_trace_last(), psp_cpu.r[PSP_REG_RA]);
         /* The return sites of the guest calls in flight, innermost first:
          * the writer is the body that called the first of them. */
         for (const psp_frame *f = psp_cpu.frame; f && f->ret; f = f->prev)
-            fprintf(stderr, " 0x%08X", f->ret);
-        fprintf(stderr, "\n");
+            psp_log(" 0x%08X", f->ret);
+        psp_log("\n");
     }
 }
 
@@ -69,12 +70,12 @@ static void note_read(uint32_t addr, uint32_t width) {
     for (int i = 0; i < g_rfn_n; i++) if (g_rfns[i] == fn) return;
     if (g_rfn_n < 16) {
         g_rfns[g_rfn_n++] = fn;
-        fprintf(stderr, "read%u of 0x%08X (watch 0x%08X) from fn 0x%08X ra 0x%08X calls",
+        psp_log("read%u of 0x%08X (watch 0x%08X) from fn 0x%08X ra 0x%08X calls",
                 width * 8, addr, g_rwatch, psp_trace_last(), psp_cpu.r[PSP_REG_RA]);
         int n = 0;
         for (const psp_frame *f = f0; f && f->ret && n < 6; f = f->prev, n++)
-            fprintf(stderr, " 0x%08X", f->ret);
-        fputc('\n', stderr);
+            psp_log(" 0x%08X", f->ret);
+        psp_log_putc('\n');
     }
 }
 
@@ -89,15 +90,15 @@ static void bad_access(uint32_t addr, int write, int width) {
             "zero","at","v0","v1","a0","a1","a2","a3","t0","t1","t2","t3",
             "t4","t5","t6","t7","s0","s1","s2","s3","s4","s5","s6","s7",
             "t8","t9","k0","k1","gp","sp","fp","ra" };
-        fprintf(stderr, "\n--- first bad access: %s%d at 0x%08X (last fn 0x%08X) ---\n",
+        psp_log("\n--- first bad access: %s%d at 0x%08X (last fn 0x%08X) ---\n",
                 write ? "write" : "read", width * 8, addr, psp_trace_last());
         for (int i = 0; i < 32; i += 4)
-            fprintf(stderr, "  %-3s=0x%08X  %-3s=0x%08X  %-3s=0x%08X  %-3s=0x%08X\n",
+            psp_log("  %-3s=0x%08X  %-3s=0x%08X  %-3s=0x%08X  %-3s=0x%08X\n",
                     N[i], psp_cpu.r[i], N[i+1], psp_cpu.r[i+1],
                     N[i+2], psp_cpu.r[i+2], N[i+3], psp_cpu.r[i+3]);
     }
     if (psp_mem_bad_access < 32)
-        fprintf(stderr, "psprecomp: bad %s%d at 0x%08X (last fn 0x%08X)\n",
+        psp_log("psprecomp: bad %s%d at 0x%08X (last fn 0x%08X)\n",
                 write ? "write" : "read", width * 8, addr, psp_trace_last());
     psp_mem_bad_access++;
 }

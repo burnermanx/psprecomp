@@ -32,6 +32,7 @@ too: a lit 3D factory scene where you cap pens.*
   now a label.
 
 **Hosting a game**
+- **Quiet by default.** The runtime's diagnostics go through `psp_log`/`psp_out` (`include/psprecomp/log.h`): nothing is printed unless `EMOTIONALSENSE_LOG=1`/`PSPRECOMP_LOG=1`, `psp_log_enable(1)` or an `*_TRACE_*` variable asks for it; `psp_fatal` always prints. With the log off, complete lines still reach a host-installed line hook (a crash report's last-lines ring). Other libraries' output is untouched.
 - **`psprecomp/window.h`: a window to play in.** Shows the front buffer
   scaled with whole-pixel nearest sampling, letterboxed, and feeds the
   keyboard and the first XInput controller to sceCtrl, on a host thread of

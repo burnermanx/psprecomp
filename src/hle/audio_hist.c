@@ -23,6 +23,7 @@
  * proof-of-content hook.
  */
 #include "psprecomp/audio_hist.h"
+#include "psprecomp/log.h"
 #include "psprecomp/mem.h"
 #include "psprecomp/hle.h"
 
@@ -159,7 +160,7 @@ static void audio_callback(void *userdata, Uint8 *stream, int len) {
                             g_underruns_play[ch]++;
                         else g_underruns_other[ch]++;
                         if (trace_on())
-                            fprintf(stderr,
+                            psp_log(
                                     "audio: underrun ch%d vblank=%llu scene=%u level=%u target=%u\n",
                                     ch, (unsigned long long)psp_display_vblanks(),
                                     scene,
@@ -199,7 +200,7 @@ static void audio_callback(void *userdata, Uint8 *stream, int len) {
              * measurement that has to be exact to the frame. */
             for (int ch = 0; ch < AUDIO_CHANNELS; ch++) {
                 if (!g_cb_n[ch]) continue;
-                fprintf(stderr,
+                psp_log(
                         "audio[%llus] ch%d level=%u/%u cb=%u/%u n=%u underruns=%llu scene=%u lat=%.1f\n",
                         (unsigned long long)((now - g_start_us) / 1000000u), ch,
                         g_ring[ch].count, g_target,
@@ -219,7 +220,7 @@ static int audio_open(void) {
     if (g_dev_state == 0) {
         g_dev_state = -1;
         if (SDL_InitSubSystem(SDL_INIT_AUDIO) != 0) {
-            fprintf(stderr, "psprecomp: SDL_InitSubSystem(AUDIO) failed (%s)\n", SDL_GetError());
+            psp_log("psprecomp: SDL_InitSubSystem(AUDIO) failed (%s)\n", SDL_GetError());
         } else {
             SDL_AudioSpec want = {
                 .freq = AUDIO_OUT_FREQ,
@@ -231,10 +232,10 @@ static int audio_open(void) {
             SDL_AudioSpec got = { 0 };
             g_dev = SDL_OpenAudioDevice(NULL, 0, &want, &got, 0);
             if (!g_dev) {
-                fprintf(stderr, "psprecomp: SDL_OpenAudioDevice failed (%s)\n", SDL_GetError());
+                psp_log("psprecomp: SDL_OpenAudioDevice failed (%s)\n", SDL_GetError());
             } else {
                 g_dev_samples = got.samples > 0 ? got.samples : want.samples;
-                fprintf(stderr,
+                psp_log(
                         "audio: driver=%s asked %d Hz/%d frames, got %d Hz/%d frames fmt %d ch %d\n",
                         SDL_GetCurrentAudioDriver() ? SDL_GetCurrentAudioDriver() : "?",
                         AUDIO_OUT_FREQ, want.samples, got.freq, got.samples,
@@ -299,7 +300,7 @@ void psprecomp_audio_report(void) {
         audio_ring *r = &g_ring[c];
         if (!r->blocks) continue;
         double avg = r->level_n ? (double)r->level_sum / (double)r->level_n : 0.0;
-        fprintf(stderr,
+        psp_log(
                 "psprecomp_audio_report: ch%d blocks=%llu samples/block=%u underruns=%llu "
                 "(play=%llu other=%llu) silence=%llu dropped=%llu "
                 "ring_min=%u ring_avg=%.0f ring_max=%u avg_ms=%.1f\n",
@@ -313,7 +314,7 @@ void psprecomp_audio_report(void) {
                 avg * 1000.0 / AUDIO_OUT_FREQ);
     }
     pthread_mutex_unlock(&g_lock);
-    fprintf(stderr, "psprecomp_audio_report: blocks=%llu maxblocks=%llu frames=%llu "
+    psp_log("psprecomp_audio_report: blocks=%llu maxblocks=%llu frames=%llu "
                 "mean_dBFS=%.1f max_dBFS=%.1f min_dBFS=%.1f\n",
             (unsigned long long)g_audio_blocks,
             (unsigned long long)g_audio_maxblocks,

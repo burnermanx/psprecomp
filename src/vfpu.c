@@ -1,6 +1,7 @@
 /* psprecomp — the VFPU. See include/psprecomp/vfpu.h. */
 
 #include "psprecomp/vfpu.h"
+#include "psprecomp/log.h"
 #include "psprecomp/recomp_rt.h"
 
 #include <math.h>
@@ -34,9 +35,9 @@ void psp_vfpu_unimplemented(uint32_t addr, const char *what) {
     /* First few only: a VFPU-heavy inner loop would otherwise produce
      * megabytes of identical lines and hide everything else. */
     if (g_traps < 16)
-        fprintf(stderr, "psprecomp: VFPU %s at 0x%08X not implemented\n", what, addr);
+        psp_log("psprecomp: VFPU %s at 0x%08X not implemented\n", what, addr);
     else if (g_traps == 16)
-        fprintf(stderr, "psprecomp: (further VFPU traps suppressed)\n");
+        psp_log("psprecomp: (further VFPU traps suppressed)\n");
     g_traps++;
 }
 

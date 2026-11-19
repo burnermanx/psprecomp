@@ -8,6 +8,7 @@
  */
 
 #include "psprecomp/hle.h"
+#include "psprecomp/log.h"
 #include "psprecomp/render.h"
 
 #include <stdio.h>
@@ -85,7 +86,7 @@ static void hle_ExitGame(void) {
     /* A game calling this is finished. Recording it rather than terminating
      * the process lets the host report what happened and dump its counters. */
     g_exit_requested = 1;
-    fprintf(stderr, "psprecomp: the game called sceKernelExitGame\n");
+    psp_log("psprecomp: the game called sceKernelExitGame\n");
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
@@ -196,7 +197,7 @@ static void script_load(void) {
     static char buf[131072];
     if (s && *s == '@') {
         FILE *f = fopen(s + 1, "r");
-        if (!f) { fprintf(stderr, "script: cannot open %s\n", s + 1); return; }
+        if (!f) { psp_log("script: cannot open %s\n", s + 1); return; }
         size_t n = fread(buf, 1, sizeof buf - 1, f);
         fclose(f);
         buf[n] = 0;
@@ -287,7 +288,7 @@ static void hle_ReadBufferPositive(void) {
             static uint32_t l_script;
             uint32_t script_bits = btns & ~g_buttons;
             if (script_bits != l_script) {
-                fprintf(stderr, "input[%llu]: script=%04X\n",
+                psp_log("input[%llu]: script=%04X\n",
                         (unsigned long long)vb, script_bits);
                 l_script = script_bits;
             }
@@ -310,7 +311,7 @@ static void hle_ReadBufferPositive(void) {
     static int ctrl_trace = -1;
     if (ctrl_trace < 0) ctrl_trace = getenv("EMOTIONALSENSE_TRACE_CTRL") != NULL;
     if (ctrl_trace && (btns || psp_read16(buf + 16) != psp_read16(buf + 18)))
-        fprintf(stderr, "ctrl[%llu]: %04X last=%04X cur=%04X\n",
+        psp_log("ctrl[%llu]: %04X last=%04X cur=%04X\n",
                 (unsigned long long)psp_display_vblanks(), btns,
                 psp_read16(buf + 16), psp_read16(buf + 18));
     for (uint32_t i = 0; i < count; i++) {
@@ -336,7 +337,7 @@ uint64_t psp_audio_blocks(void) { return g_audio_blocks; }
 
 static void hle_ChReserve(void) {
     if (getenv("PSPRECOMP_TRACE_SAS"))
-        fprintf(stderr, "audio: ChReserve ch %d samples %u format %u\n",
+        psp_log("audio: ChReserve ch %d samples %u format %u\n",
                 (int)psp_arg(0), psp_arg(1), psp_arg(2));
     /* (channel, samplecount, format) -- channel -1 means "any". */
     int32_t ch = (int32_t)psp_arg(0);
@@ -445,7 +446,7 @@ static void hle_SetChannelDataLen(void) {
     if (ch >= AUDIO_CHANNELS) { psp_ret(0x80260003); return; }   /* invalid channel */
     g_audio[ch].samples = psp_arg(1);
     if (getenv("PSPRECOMP_TRACE_SAS"))
-        fprintf(stderr, "audio: SetChannelDataLen ch %u samples %u\n", ch, psp_arg(1));
+        psp_log("audio: SetChannelDataLen ch %u samples %u\n", ch, psp_arg(1));
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 

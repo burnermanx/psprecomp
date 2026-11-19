@@ -10,6 +10,7 @@
  */
 
 #include "psprecomp/hle.h"
+#include "psprecomp/log.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -231,7 +232,7 @@ static void hle_Open(void) {
     /* PSPRECOMP_TRACE_IO=1 names every open and whether it worked. A game
      * that cannot find its assets usually does not crash; it waits. */
     if (getenv("PSPRECOMP_TRACE_IO"))
-        fprintf(stderr, "io: open \"%s\" -> \"%s\" flags 0x%X: %s\n",
+        psp_log("io: open \"%s\" -> \"%s\" flags 0x%X: %s\n",
                 guest, host, flags, f ? "ok" : "not found");
     if (!f) {
         /* A failed open is normal (a game probing for a save file) and is not
@@ -295,7 +296,7 @@ static int raw_read(io_file *h, uint8_t *dst, uint32_t bytes) {
     size_t got = fread(dst, 1, bytes, f);
     fclose(f);
     if (trace_io())
-        fprintf(stderr, "io: raw read lba %llu (+%llu in %s) %u bytes -> %zu\n", (unsigned long long)h->lba,
+        psp_log("io: raw read lba %llu (+%llu in %s) %u bytes -> %zu\n", (unsigned long long)h->lba,
                 (unsigned long long)(h->lba - base), guest, bytes, got);
     h->lba += (got + 2047) / 2048;
     return (int)got;
@@ -328,7 +329,7 @@ static void hle_Read(void) {
     long pos_before = trace_io() ? (long)io_tell(h->f) : 0;
     size_t got = fread(tmp, 1, size, h->f);
     if (trace_io())
-        fprintf(stderr, "io: read fd %d at %ld size %u -> %zu\n", (int)psp_arg(0), pos_before, size, got);
+        psp_log("io: read fd %d at %ld size %u -> %zu\n", (int)psp_arg(0), pos_before, size, got);
     if (got && psp_mem_write_block(dst, tmp, (uint32_t)got) != 0) {
         /* Fall back to byte-at-a-time so a partially mapped destination still
          * gets what fits, and the bad-access counter records the rest. */
@@ -346,7 +347,7 @@ static void hle_Write(void) {
     /* fd 1 and 2 are stdout/stderr: a game writing there is talking to us. */
     int32_t fd = (int32_t)psp_arg(0);
     if (fd == 1 || fd == 2) {
-        for (uint32_t i = 0; i < size; i++) fputc(psp_read8(src + i), stderr);
+        for (uint32_t i = 0; i < size; i++) psp_log_putc(psp_read8(src + i));
         psp_ret(size);
         return;
     }
@@ -364,7 +365,7 @@ static void hle_Write(void) {
         trace_save = e && e[0] && e[0] != '0';
     }
     if (trace_save)
-        fprintf(stderr, "save: write vblank=%llu \"%s\" off=%ld size=%u ra=0x%08X\n",
+        psp_log("save: write vblank=%llu \"%s\" off=%ld size=%u ra=0x%08X\n",
                 (unsigned long long)psp_display_vblanks(), h->guest,
                 ftell(h->f), size, psp_cpu.r[PSP_REG_RA]);
     size_t put = fwrite(tmp, 1, size, h->f);
@@ -414,7 +415,7 @@ static void hle_Dopen(void) {
     char guest[512], host[1024];
     psp_str(psp_arg(0), guest, sizeof guest);
     map_path(guest, host, sizeof host);
-    if (getenv("PSPRECOMP_TRACE_IO")) fprintf(stderr, "io: Dopen %s\n", guest);
+    if (getenv("PSPRECOMP_TRACE_IO")) psp_log("io: Dopen %s\n", guest);
 
     for (int i = 0; i < MAX_DIRS; i++) {
         if (g_dir[i].used) continue;
@@ -654,7 +655,7 @@ static void hle_Ioctl(void) {
             h->lba = (uint64_t)psp_read32(indata) | ((uint64_t)psp_read32(indata + 4) << 32);
             psp_threadman_sleep_exact(UMD_SEEK_US);
             if (trace)
-                fprintf(stderr, "io: ioctl raw seek lba=%llu dt=%llums\n",
+                psp_log("io: ioctl raw seek lba=%llu dt=%llums\n",
                         (unsigned long long)h->lba,
                         (unsigned long long)(psp_clock_us() - t0) / 1000);
             psp_ret(0);
@@ -672,14 +673,14 @@ static void hle_Ioctl(void) {
             for (int i = 0; i < got; i++) psp_write8(outdata + (uint32_t)i, tmp[i]);
             free(tmp);
             if (trace)
-                fprintf(stderr, "io: ioctl raw read lba=%llu sectors=%u dt=%llums\n",
+                psp_log("io: ioctl raw read lba=%llu sectors=%u dt=%llums\n",
                         (unsigned long long)h->lba, sectors,
                         (unsigned long long)(psp_clock_us() - t0) / 1000);
             psp_ret((uint32_t)((got + 2047) / 2048));
             return;
         }
         if (trace)
-            fprintf(stderr, "io: ioctl raw cmd 0x%08X in=0x%08X out=0x%08X/%u lba=%llu (no-op)\n",
+            psp_log("io: ioctl raw cmd 0x%08X in=0x%08X out=0x%08X/%u lba=%llu (no-op)\n",
                     cmd, indata, outdata, outlen, (unsigned long long)h->lba);
     }
     psp_ret(0);

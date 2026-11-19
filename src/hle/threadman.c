@@ -61,6 +61,7 @@
  */
 
 #include "psprecomp/hle.h"
+#include "psprecomp/log.h"
 #include "psprecomp/dispatch.h"
 
 #include <errno.h>
@@ -373,10 +374,10 @@ static uint64_t g_trace_n;
     if (!g_trace_init) { g_trace_init = 1; const char *v_ = getenv("PSPRECOMP_TRACE_SCHED"); g_trace_sched = v_ && v_[0] == '1'; } \
     if (g_trace_sched && g_trace_n < SCHED_TRACE_MAX) { \
         g_trace_n++; \
-        fprintf(stderr, "[sched %llu] ", (unsigned long long)g_trace_n); \
-        fprintf(stderr, __VA_ARGS__); \
+        psp_log("[sched %llu] ", (unsigned long long)g_trace_n); \
+        psp_log(__VA_ARGS__); \
         if (g_trace_n == SCHED_TRACE_MAX) \
-            fprintf(stderr, "[sched] %d lines is the limit; the rest is counted, not printed\n", SCHED_TRACE_MAX); \
+            psp_log("[sched] %d lines is the limit; the rest is counted, not printed\n", SCHED_TRACE_MAX); \
     } \
 } while (0)
 
@@ -512,7 +513,7 @@ static int park_us_timed(uint64_t timeout_us, uint64_t real_us) {
         g_tls_depth = depth;
         if (handed) g_handovers++;
         if (expired && g_handovers_expired++ == 0)
-            fprintf(stderr, "psprecomp: CPU handover exceeded %d ms; further expiries are counted\n",
+            psp_log("psprecomp: CPU handover exceeded %d ms; further expiries are counted\n",
                     HANDOVER_CAP_US / 1000);
     }
 
@@ -586,7 +587,7 @@ static void park_for(int kind, uint64_t timeout_us) {
         t->wait_kind = kind;
         host_mutex_unlock(&t->wlock);
         if (t->parks < 2)
-            fprintf(stderr, "thread %u parks  : %s (virtual time %llu us)\n",
+            psp_log("thread %u parks  : %s (virtual time %llu us)\n",
                     t->uid, wait_name(kind), (unsigned long long)g_vtime_us);
         t->last_wait_kind = (uint32_t)kind;
     }
@@ -607,7 +608,7 @@ void psp_threadman_reset(void) {
      * Never overwrite a live thread's locks or free memory it can still use. */
     for (int i = 0; i < MAX_THREADS - 1; i++) {
         if (g_thread[i].host_live) {
-            fputs("psprecomp: reset requires all guest threads to have ended\n", stderr);
+            psp_log_puts("psprecomp: reset requires all guest threads to have ended\n");
             abort();
         }
         if (g_thread[i].host_joinable) host_thread_join(g_thread[i].host);
@@ -889,11 +890,11 @@ static uint64_t g_wait_long;          /* long waits reported, real threads */
 static void warn_wait(const char *what, const char *name) {
 #if !PSPRECOMP_REAL_THREADS
     if (g_wait_gaveup++ == 0)
-        fprintf(stderr, "psprecomp: %s would block in inline mode; returning timeout\n", what);
+        psp_log("psprecomp: %s would block in inline mode; returning timeout\n", what);
     (void)name;
 #else
     if (g_wait_gaveup < 8)
-        fprintf(stderr,
+        psp_log(
                 "psprecomp: %s%s%s waited %llu ticks with nothing to wake it,"
                 " returning a timeout.\n",
                 what, (name && name[0]) ? " '" : "", (name && name[0]) ? name : "",
@@ -925,7 +926,7 @@ static uint32_t wait_loop(int (*ready)(void *), void *ctx, uint64_t timeout_us,
 #if PSPRECOMP_REAL_THREADS
             if (others_alive()) {
                 if (ticks == WAIT_TICKS_MAX + 1 && g_wait_long++ < 8)
-                    fprintf(stderr, "psprecomp: %s%s%s has waited %llu ticks; still waiting,"
+                    psp_log("psprecomp: %s%s%s has waited %llu ticks; still waiting,"
                             " other threads are alive\n", what,
                             (name && name[0]) ? " '" : "", (name && name[0]) ? name : "",
                             (unsigned long long)WAIT_TICKS_MAX);
@@ -972,7 +973,7 @@ static void *guest_thread_main(void *arg) {
     host_mutex_unlock(&g_baton_m);
     g_started++;
     if (getenv("EMOTIONALSENSE_DEBUG_THREADS"))
-        fprintf(stderr, "thread %u started : entry 0x%08X\n", t->uid, t->entry);
+        psp_log("thread %u started : entry 0x%08X\n", t->uid, t->entry);
 
     if (setjmp(t->unwind) == 0) {
         t->unwind_set = 1;
@@ -990,7 +991,7 @@ static void *guest_thread_main(void *arg) {
      * leaves the flag it was supposed to arm unset, and the address is what
      * says whether it finished or simply fell out somewhere. */
     if (getenv("EMOTIONALSENSE_DEBUG_THREADS"))
-        fprintf(stderr, "thread %u ended   : status 0x%08X, last fn 0x%08X\n",
+        psp_log("thread %u ended   : status 0x%08X, last fn 0x%08X\n",
                 t->uid, t->exit_status, psp_trace_last());
 
     if (t->delete_after && t->stack_base) {
@@ -1066,7 +1067,7 @@ static void hle_CreateThread(void) {
 #endif
     g_created++;
     if (getenv("EMOTIONALSENSE_DEBUG_THREADS"))
-        fprintf(stderr, "thread %u created : entry 0x%08X stack %u  (%s)\n",
+        psp_log("thread %u created : entry 0x%08X stack %u  (%s)\n",
                 t->uid, t->entry, t->stack_size, t->name);
     psp_ret(t->uid);
 }
@@ -1166,7 +1167,7 @@ static void hle_TerminateThread(void) {
     }
     t->terminated = 1;
     if (getenv("EMOTIONALSENSE_DEBUG_THREADS"))
-        fprintf(stderr, "thread %u terminated by %u\n", t->uid,
+        psp_log("thread %u terminated by %u\n", t->uid,
                 g_current ? g_current->uid : 0);
     wake_thread(t);
     wake_waiters(W_THREAD_END);
@@ -1730,13 +1731,13 @@ static uint32_t take_vpl_block(int blocking) {
                                 "sceKernelAllocateVpl", v->name);
         if (rc != SCE_KERNEL_ERROR_OK) {
             if (getenv("EMOTIONALSENSE_DEBUG_VPL"))
-                fprintf(stderr, "[VPL] AllocateVpl(uid=0x%X '%s', size=%u) failed wait: free_size=%u pool_size=%u\n",
+                psp_log("[VPL] AllocateVpl(uid=0x%X '%s', size=%u) failed wait: free_size=%u pool_size=%u\n",
                         v->uid, v->name, size, v->free_size, v->pool_size);
             return rc;
         }
     } else if (!vpl_room(&c)) {
         if (getenv("EMOTIONALSENSE_DEBUG_VPL"))
-            fprintf(stderr, "[VPL] TryAllocateVpl(uid=0x%X '%s', size=%u) NO ROOM: free_size=%u pool_size=%u sysmem_free=%u\n",
+            psp_log("[VPL] TryAllocateVpl(uid=0x%X '%s', size=%u) NO ROOM: free_size=%u pool_size=%u sysmem_free=%u\n",
                     v->uid, v->name, size, v->free_size, v->pool_size, psp_sysmem_free());
         return SCE_KERNEL_ERROR_WAIT_TIMEOUT;   /* the try variant never blocks */
     }
@@ -1744,7 +1745,7 @@ static uint32_t take_vpl_block(int blocking) {
     uint32_t addr = psp_sysmem_alloc(size, 0);
     if (!addr) {
         if (getenv("EMOTIONALSENSE_DEBUG_VPL"))
-            fprintf(stderr, "[VPL] TryAllocateVpl(uid=0x%X '%s', size=%u) SYSMEM FULL: free_size=%u pool_size=%u sysmem_free=%u\n",
+            psp_log("[VPL] TryAllocateVpl(uid=0x%X '%s', size=%u) SYSMEM FULL: free_size=%u pool_size=%u sysmem_free=%u\n",
                     v->uid, v->name, size, v->free_size, v->pool_size, psp_sysmem_free());
         return SCE_KERNEL_ERROR_NO_MEMORY;
     }
@@ -1757,7 +1758,7 @@ static uint32_t take_vpl_block(int blocking) {
             g_vplblk[i].used = 1;
             v->free_size -= size;
             if (getenv("EMOTIONALSENSE_TRACE_VPL"))
-                fprintf(stderr, "[VPL] uid=0x%X size=%u outp=%08X -> %08X\n",
+                psp_log("[VPL] uid=0x%X size=%u outp=%08X -> %08X\n",
                         v->uid, size, outp, addr);
             psp_write32(outp, addr);
             return SCE_KERNEL_ERROR_OK;
@@ -1853,7 +1854,7 @@ static int deliver_callbacks(void) {
             g_cb_unresolved++;
             if (g_cb_unresolved_logged < 4) {
                 g_cb_unresolved_logged++;
-                fprintf(stderr,
+                psp_log(
                         "psprecomp: callback '%s' (uid %u) points at 0x%08X, which is not a"
                         " recompiled function -- notification dropped\n",
                         c->name, c->uid, c->func);
@@ -1873,7 +1874,7 @@ static int deliver_callbacks(void) {
         psp_cpu.r[PSP_REG_A1] = arg;         /* and what the notification carried */
         psp_cpu.r[PSP_REG_RA] = 0;
         if (getenv("EMOTIONALSENSE_TRACE_CB"))
-            fprintf(stderr, "cbr: uid=%u func=%08X arg=%08X\n", c->uid, c->func, arg);
+            psp_log("cbr: uid=%u func=%08X arg=%08X\n", c->uid, c->func, arg);
         psp_call_from_host(c->func);
         c->delivery_status = (int32_t)psp_cpu.r[PSP_REG_V0];
         psp_cpu = saved;
@@ -1937,7 +1938,7 @@ static void hle_NotifyCallback(void) {
 int psp_callback_notify(uint32_t uid, uint32_t arg) {
     psp_callback *c = find_callback(uid);
     if (getenv("EMOTIONALSENSE_TRACE_CB"))
-        fprintf(stderr, "cbn: uid=%u arg=%08X found=%d owner=%u me=%u\n", uid, arg,
+        psp_log("cbn: uid=%u arg=%08X found=%d owner=%u me=%u\n", uid, arg,
                 c != NULL, c ? c->owner : 0, g_tls_me ? g_tls_me->uid : 0);
     if (!c) return 0;
     c->notify_arg = arg;

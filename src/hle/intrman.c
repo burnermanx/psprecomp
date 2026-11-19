@@ -32,6 +32,7 @@
  * forever.
  */
 #include "psprecomp/hle.h"
+#include "psprecomp/log.h"
 #include "psprecomp/dispatch.h"
 
 #include <stdio.h>
@@ -159,7 +160,7 @@ void psp_intr_tick(void) {
             g_unresolved++;
             if (g_unresolved_logged < INTR_LOG) {
                 g_unresolved_logged++;
-                fprintf(stderr,
+                psp_log(
                         "psprecomp: sub-intr handler 0x%08X (intr %d, subintr %d)"
                         " is not a recompiled function\n",
                         s->handler, s->intr, s->subintr);

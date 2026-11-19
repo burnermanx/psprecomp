@@ -1,6 +1,7 @@
 /* psprecomp — HLE dispatch. See include/psprecomp/hle.h. */
 
 #include "psprecomp/hle.h"
+#include "psprecomp/log.h"
 #include "psprecomp/dispatch.h"
 
 #include <stdio.h>
@@ -150,13 +151,13 @@ void psp_hle_call(uint32_t nid) {
         else trace_uid = e ? atoi(e) : -3;
     }
     if (nid == 0x237DBD4Fu)
-        fprintf(stderr, "psp_hle_call ENTERED for 0x237DBD4F (%d entries registered)\n", g_count);
+        psp_log("psp_hle_call ENTERED for 0x237DBD4F (%d entries registered)\n", g_count);
     for (int i = 0; i < g_count; i++) {
         if (g_entry[i].nid == nid) {
             g_calls[i]++;
             if (psp_hle_trace_hook) psp_hle_trace_hook(nid, g_entry[i].name);
             if (trace_uid == -1 || (trace_uid >= 0 && (int)psp_threadman_current_uid() == trace_uid))
-                fprintf(stderr, "hle[%u@%llu]: %s(0x%08X,0x%08X,0x%08X,0x%08X) ra=0x%08X t=%llu\n",
+                psp_log("hle[%u@%llu]: %s(0x%08X,0x%08X,0x%08X,0x%08X) ra=0x%08X t=%llu\n",
                         psp_threadman_current_uid(), (unsigned long long)psp_display_vblanks(), g_entry[i].name,
                         psp_cpu.r[PSP_REG_A0], psp_cpu.r[PSP_REG_A1],
                         psp_cpu.r[PSP_REG_A2], psp_cpu.r[PSP_REG_A3],
@@ -186,7 +187,7 @@ void psp_hle_call(uint32_t nid) {
     }
     if (g_unimpl_logged < UNIMPL_LOGGED) {
         g_unimpl_logged++;
-        fprintf(stderr, "psprecomp: unimplemented firmware call 0x%08X\n", nid);
+        psp_log("psprecomp: unimplemented firmware call 0x%08X\n", nid);
     } else if (g_unimpl_logged == UNIMPL_LOGGED) {
         /* Say so, once. A message that stopped appearing because it was silenced
          * must not read as a message that stopped happening: "bringing a game up
@@ -194,7 +195,7 @@ void psp_hle_call(uint32_t nid) {
          * how progress is measured here, so the instrument has to keep the two
          * apart. The total below the message is what makes them apart. */
         g_unimpl_logged++;
-        fprintf(stderr,
+        psp_log(
                 "psprecomp: further unimplemented firmware calls are counted, not"
                 " printed -- %llu so far, see psp_hle_unimplemented_calls()\n",
                 (unsigned long long)g_unimpl_total);
@@ -245,7 +246,7 @@ const char *psp_str(uint32_t addr, char *dst, size_t cap) {
     return dst;
 }
 
-static void miss_context(void) { psp_trace_dump(); psp_hle_dump_recent(stderr); }
+static void miss_context(void) { psp_trace_dump(); psp_hle_dump_recent(psp_log_stream()); }
 
 void psp_hle_init(void) {
     psp_set_miss_context(miss_context);

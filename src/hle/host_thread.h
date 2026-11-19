@@ -4,11 +4,12 @@
 #define PSPRECOMP_HOST_THREAD_H
 
 #include <stdint.h>
+#include "psprecomp/log.h"
 #include <stdlib.h>
 #include <stdio.h>
 
 static void host_thread_error(void) {
-    fputs("psprecomp: host synchronization failed\n", stderr);
+    psp_log_puts("psprecomp: host synchronization failed\n");
     abort();
 }
 

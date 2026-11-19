@@ -11,6 +11,7 @@
  */
 
 #include "psprecomp/render.h"
+#include "psprecomp/log.h"
 #include "psprecomp/mem.h"
 #include "psprecomp/hle.h"
 
@@ -430,7 +431,7 @@ static int dump_enabled(void) {
             snprintf(path, sizeof path, "%s/index.txt", d);
             g_dump_index = fopen(path, "w");
             if (!g_dump_index) {
-                fprintf(stderr, "tex dump: cannot write to %s\n", d);
+                psp_log("tex dump: cannot write to %s\n", d);
                 g_dump_on = 0;
             } else {
                 fprintf(g_dump_index, "# key addr fmt w h scene\n");
@@ -733,7 +734,7 @@ static void pack_load_file(const char *name) {
         free(px);
         if (!g_pack_over) {
             g_pack_over = 1;
-            fprintf(stderr, "tex pack: over the %llu MiB budget, keeping the "
+            psp_log("tex pack: over the %llu MiB budget, keeping the "
                             "original textures\n",
                     (unsigned long long)(g_pack_limit >> 20));
         }
@@ -977,7 +978,7 @@ static void bga_arrive(uint32_t *dst, int slot, uint64_t data_hash) {
     static int stats = -1;
     if (stats < 0) stats = getenv("EMOTIONALSENSE_BGA_STATS") != NULL;
     if (stats && g_bga.n_arrive % 120 == 0)
-        fprintf(stderr, "bga: arrivals=%llu blends=%llu cost=%.3f ms per arrival (%.3f ms/s at 30 arrivals/s)\n",
+        psp_log("bga: arrivals=%llu blends=%llu cost=%.3f ms per arrival (%.3f ms/s at 30 arrivals/s)\n",
                 (unsigned long long)g_bga.n_arrive, (unsigned long long)g_bga.n_blend,
                 g_bga.ms / (double)g_bga.n_arrive, 30.0 * g_bga.ms / (double)g_bga.n_arrive);
 }
@@ -1057,7 +1058,7 @@ static int resolve_texture(const psp_draw_state *st) {
         static int tr = -1;
         if (tr < 0) tr = getenv("EMOTIONALSENSE_TEX_TRACE") != NULL;
         if (tr)
-            fprintf(stderr, "tex: scene=%u addr=%08x fmt=%d %dx%d key=%016llx\n",
+            psp_log("tex: scene=%u addr=%08x fmt=%d %dx%d key=%016llx\n",
                     psp_scene_now(), st->tex_addr & PSP_ADDR_MASK, st->tex_fmt,
                     st->tex_w, st->tex_h,
                     (unsigned long long)dump_key(data_hash_orig, clut_hash, st->tex_fmt,
@@ -1725,7 +1726,7 @@ static int vk_init(int width, int height) {
     }
 
     g_vk_inited = 1;
-    fprintf(stderr, "render: Vulkan backend initialized on %s\n", chosen_props.deviceName);
+    psp_log("render: Vulkan backend initialized on %s\n", chosen_props.deviceName);
     return 0;
 }
 

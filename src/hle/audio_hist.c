@@ -35,6 +35,7 @@
 #include <string.h>
 #include <pthread.h>
 #include <time.h>
+#include "host_clock.h"
 
 #define HIST_BINS   512        /* magnitude buckets */
 #define FULL_SCALE 32767u       /* int16 peak; dBFS reference */
@@ -94,9 +95,7 @@ static uint64_t g_underruns_play[AUDIO_CHANNELS], g_underruns_other[AUDIO_CHANNE
 static uint64_t g_due_us[AUDIO_CHANNELS];   /* host-clock grid, the fallback */
 
 static uint64_t host_now_us(void) {
-    struct timespec ts;
-    timespec_get(&ts, TIME_UTC);
-    return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u;
+    return host_clock_us();
 }
 
 static int trace_on(void) {

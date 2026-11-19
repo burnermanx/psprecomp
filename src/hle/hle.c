@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include "host_clock.h"
 
 #define HLE_MAX 512
 
@@ -14,9 +15,7 @@
  * coarse to measure a 5.8 ms keysound block; audio_rate.py uses this stamp
  * to compare each block with the ideal grid. */
 static uint64_t trace_now_us(void) {
-    struct timespec ts;
-    timespec_get(&ts, TIME_UTC);
-    return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u;
+    return host_clock_us();
 }
 
 static psp_hle_entry g_entry[HLE_MAX];

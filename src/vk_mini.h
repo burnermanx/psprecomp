@@ -1077,7 +1077,24 @@ typedef struct VkSubmitInfo {
     const VkSemaphore*           pSignalSemaphores;
 } VkSubmitInfo;
 
+typedef struct VkLayerProperties {
+    char     layerName[256];
+    uint32_t specVersion;
+    uint32_t implementationVersion;
+    char     description[256];
+} VkLayerProperties;
+
+typedef struct VkExtensionProperties {
+    char     extensionName[256];
+    uint32_t specVersion;
+} VkExtensionProperties;
+
+typedef void (VKAPI_PTR *PFN_vkVoidFunction)(void);
+
 /* Function declarations */
+VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetInstanceProcAddr(VkInstance, const char*);
+VKAPI_ATTR VkResult VKAPI_CALL vkEnumerateInstanceLayerProperties(uint32_t*, VkLayerProperties*);
+VKAPI_ATTR VkResult VKAPI_CALL vkEnumerateInstanceExtensionProperties(const char*, uint32_t*, VkExtensionProperties*);
 VKAPI_ATTR VkResult VKAPI_CALL vkCreateInstance(const VkInstanceCreateInfo*, const VkAllocationCallbacks*, VkInstance*);
 VKAPI_ATTR VkResult VKAPI_CALL vkEnumeratePhysicalDevices(VkInstance, uint32_t*, VkPhysicalDevice*);
 VKAPI_ATTR void     VKAPI_CALL vkGetPhysicalDeviceProperties(VkPhysicalDevice, VkPhysicalDeviceProperties*);

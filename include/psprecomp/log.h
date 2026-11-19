@@ -36,6 +36,13 @@ void psp_log_putc(int c);
 void psp_log_puts(const char *s);
 FILE *psp_log_stream(void);   /* stderr when logging is on, else a stream that discards: for dump functions */
 
+/* The report: lines that are kept in memory whether or not logging is on (and also go through
+ * psp_log), for a host that writes them to a file the user can send (the Vulkan start-up
+ * steps). Bounded: the oldest lines are kept, later ones dropped once the buffer is full. */
+void psp_report(const char *fmt, ...) PSP_LOG_FMT(1, 2);
+const char *psp_report_text(void);
+void psp_report_clear(void);
+
 #ifdef __cplusplus
 }
 #endif

@@ -87,3 +87,21 @@ FILE *psp_log_stream(void) {
     if (!g_null) g_null = fopen(NULL_DEVICE, "w");
     return g_null ? g_null : stderr;
 }
+
+#define REPORT_MAX 24576
+static char g_rep[REPORT_MAX];
+static size_t g_repn;
+
+void psp_report(const char *fmt, ...) {
+    char buf[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(buf, sizeof buf, fmt, ap);
+    va_end(ap);
+    if (n < 0) return;
+    if ((size_t)n >= sizeof buf) n = (int)sizeof buf - 1;
+    if (g_repn + (size_t)n < REPORT_MAX - 1) { memcpy(g_rep + g_repn, buf, (size_t)n); g_repn += (size_t)n; g_rep[g_repn] = 0; }
+    emit(stderr, buf, (size_t)n);
+}
+const char *psp_report_text(void) { return g_rep; }
+void psp_report_clear(void) { g_repn = 0; g_rep[0] = 0; }

@@ -1383,12 +1383,147 @@ static VkPipeline get_pipeline(uint64_t key) {
 
 /* ---- Initialization ------------------------------------------------------ */
 
+/* ---- Start-up report ------------------------------------------------------
+ * Every step of the start-up goes through psp_report with its VkResult, so a machine where
+ * Vulkan does not start can say why (the host writes the report to <data>/logs/renderer.log). */
+static const char *vk_res_name(int r) {
+    switch (r) {
+    case 0: return "VK_SUCCESS";
+    case 1: return "VK_NOT_READY";
+    case 2: return "VK_TIMEOUT";
+    case 5: return "VK_INCOMPLETE";
+    case -1: return "VK_ERROR_OUT_OF_HOST_MEMORY";
+    case -2: return "VK_ERROR_OUT_OF_DEVICE_MEMORY";
+    case -3: return "VK_ERROR_INITIALIZATION_FAILED";
+    case -4: return "VK_ERROR_DEVICE_LOST";
+    case -5: return "VK_ERROR_MEMORY_MAP_FAILED";
+    case -6: return "VK_ERROR_LAYER_NOT_PRESENT";
+    case -7: return "VK_ERROR_EXTENSION_NOT_PRESENT";
+    case -8: return "VK_ERROR_FEATURE_NOT_PRESENT";
+    case -9: return "VK_ERROR_INCOMPATIBLE_DRIVER";
+    case -10: return "VK_ERROR_TOO_MANY_OBJECTS";
+    case -11: return "VK_ERROR_FORMAT_NOT_SUPPORTED";
+    default: return "unknown VkResult";
+    }
+}
+
+static const char *g_step = "start";
+
+/* The libraries of this process that matter for a failed start (loader, driver, layers, the
+ * Steam/Gamescope injection): the paths in /proc/self/maps, each once. */
+static void vk_report_libs(const char *stage) {
+#if defined(__linux__)
+    FILE *f = fopen("/proc/self/maps", "r");
+    if (!f) return;
+    static const char *keys[] = { "vulkan", "VkLayer", "vulkan_", "gameoverlay", "steam", "Steam", "libdrm",
+                                  "LLVM", "libstdc++", "libSDL", "nvidia", "mesa", "radeon", "amdgpu", "libz.so", "libzstd", "libelf" };
+    char seen[48][512];
+    int ns = 0;
+    char line[1024];
+    psp_report("vulkan: libraries in the process (%s):\n", stage);
+    while (fgets(line, sizeof line, f)) {
+        char *p = strchr(line, '/');
+        if (!p) continue;
+        size_t n = strlen(p);
+        while (n && (p[n - 1] == '\n' || p[n - 1] == ' ')) p[--n] = 0;
+        if (strstr(p, " (deleted)")) continue;
+        int hit = 0;
+        for (size_t k = 0; k < sizeof keys / sizeof *keys && !hit; k++) hit = strstr(p, keys[k]) != NULL;
+        if (!hit || ns >= 48) continue;
+        int dup = 0;
+        for (int i = 0; i < ns && !dup; i++) dup = !strcmp(seen[i], p);
+        if (dup) continue;
+        snprintf(seen[ns++], sizeof seen[0], "%s", p);
+        psp_report("  %s\n", p);
+    }
+    fclose(f);
+#else
+    (void)stage;
+#endif
+}
+
+static void vk_report_instance(void) {
+    uint32_t ver = 0;
+    PFN_vkVoidFunction pf = vkGetInstanceProcAddr(NULL, "vkEnumerateInstanceVersion");
+    if (pf) {
+        int r = ((int (VKAPI_PTR *)(uint32_t *))pf)(&ver);
+        psp_report("vulkan: vkEnumerateInstanceVersion -> %s, instance version %u.%u.%u\n", vk_res_name(r),
+                   ver >> 22, (ver >> 12) & 0x3ff, ver & 0xfff);
+    } else {
+        psp_report("vulkan: vkEnumerateInstanceVersion not provided (Vulkan 1.0 loader)\n");
+    }
+    uint32_t nl = 0;
+    int r = vkEnumerateInstanceLayerProperties(&nl, NULL);
+    psp_report("vulkan: vkEnumerateInstanceLayerProperties -> %s, %u layer(s)\n", vk_res_name(r), nl);
+    if (r == VK_SUCCESS && nl) {
+        VkLayerProperties lp[64];
+        if (nl > 64) nl = 64;
+        r = vkEnumerateInstanceLayerProperties(&nl, lp);
+        for (uint32_t i = 0; r >= 0 && i < nl; i++)
+            psp_report("  layer %s (spec %u.%u.%u, impl %u)\n", lp[i].layerName, lp[i].specVersion >> 22,
+                       (lp[i].specVersion >> 12) & 0x3ff, lp[i].specVersion & 0xfff, lp[i].implementationVersion);
+    }
+    uint32_t ne = 0;
+    r = vkEnumerateInstanceExtensionProperties(NULL, &ne, NULL);
+    psp_report("vulkan: vkEnumerateInstanceExtensionProperties -> %s, %u extension(s)\n", vk_res_name(r), ne);
+    if (r == VK_SUCCESS && ne) {
+        VkExtensionProperties ep[128];
+        if (ne > 128) ne = 128;
+        r = vkEnumerateInstanceExtensionProperties(NULL, &ne, ep);
+        char names[4096];
+        size_t o = 0;
+        names[0] = 0;
+        for (uint32_t i = 0; r >= 0 && i < ne && o < sizeof names - 300; i++)
+            o += (size_t)snprintf(names + o, sizeof names - o, "%s%s", i ? " " : "", ep[i].extensionName);
+        psp_report("  extensions: %s\n", names);
+    }
+    psp_report("vulkan: instance extensions requested: none; surface/swapchain: not used (the renderer draws "
+               "offscreen and SDL presents the frame)\n");
+}
+
+static int vk_init_inner(void);
+
 static int vk_init(int width, int height) {
     (void)width;
     (void)height;
     if (g_vk_inited) return 0;
     if (g_vk_failed) return -1;
+    psp_report("vulkan: start\n");
+#if !defined(_WIN32)
+    /* This renderer draws offscreen and never presents through Vulkan, so the implicit layers that
+     * hook presentation (the Gamescope WSI layer of the Steam Deck's Game Mode, Steam's overlay and
+     * pipeline-cache layers) have nothing to do here, and a failure inside one of them kills the
+     * whole process (the Gamescope layer asserts on any driver error). Keep them off for this
+     * instance; EMOTIONALSENSE_VK_LAYERS=1 leaves the environment as it is. */
+    {
+        const char *keep = getenv("EMOTIONALSENSE_VK_LAYERS");
+        if (keep && *keep && strcmp(keep, "0")) {
+            psp_report("vulkan: implicit layers left as the environment has them (EMOTIONALSENSE_VK_LAYERS)\n");
+        } else {
+            setenv("DISABLE_GAMESCOPE_WSI", "1", 1);
+            unsetenv("ENABLE_GAMESCOPE_WSI");
+            setenv("DISABLE_VK_LAYER_VALVE_steam_overlay_1", "1", 1);
+            setenv("DISABLE_VK_LAYER_VALVE_steam_fossilize_1", "1", 1);
+            unsetenv("ENABLE_VK_LAYER_VALVE_steam_overlay_1");
+            unsetenv("ENABLE_VK_LAYER_VALVE_steam_fossilize_1");
+            psp_report("vulkan: implicit layers disabled for this instance (offscreen renderer: Gamescope WSI, "
+                       "Steam overlay and fossilize layers)\n");
+        }
+    }
+#endif
+    vk_report_instance();
+    int r = vk_init_inner();
+    if (r != 0) {
+        psp_report("vulkan: FAILED in step '%s'\n", g_step);
+        if (strcmp(g_step, "vkCreateInstance")) vk_report_libs("after the failure");
+    } else {
+        psp_report("vulkan: started\n");
+    }
+    return r;
+}
 
+static int vk_init_inner(void) {
+    g_step = "vkCreateInstance";
     VkApplicationInfo app = {
         .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
         .pApplicationName = "emotionalsense",
@@ -1401,29 +1536,49 @@ static int vk_init(int width, int height) {
         .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
         .pApplicationInfo = &app
     };
-    if (vkCreateInstance(&ici, NULL, &g_inst) != VK_SUCCESS) {
-        g_vk_failed = 1;
-        return -1;
+    {
+        int r = vkCreateInstance(&ici, NULL, &g_inst);
+        psp_report("vulkan: vkCreateInstance -> %s (%d)\n", vk_res_name(r), r);
+        vk_report_libs("after vkCreateInstance");
+        if (r != VK_SUCCESS) {
+            g_vk_failed = 1;
+            return -1;
+        }
     }
 
+    g_step = "vkEnumeratePhysicalDevices";
     uint32_t dev_count = 0;
-    vkEnumeratePhysicalDevices(g_inst, &dev_count, NULL);
+    {
+        int r = vkEnumeratePhysicalDevices(g_inst, &dev_count, NULL);
+        psp_report("vulkan: vkEnumeratePhysicalDevices -> %s (%d), %u device(s)\n", vk_res_name(r), r, dev_count);
+        if (r != VK_SUCCESS) { g_vk_failed = 1; return -1; }
+    }
     if (dev_count == 0) { g_vk_failed = 1; return -1; }
     VkPhysicalDevice devs[16];
     if (dev_count > 16) dev_count = 16;
-    vkEnumeratePhysicalDevices(g_inst, &dev_count, devs);
+    {
+        int r = vkEnumeratePhysicalDevices(g_inst, &dev_count, devs);
+        if (r != VK_SUCCESS && r != VK_INCOMPLETE) {
+            psp_report("vulkan: vkEnumeratePhysicalDevices (list) -> %s (%d)\n", vk_res_name(r), r);
+            g_vk_failed = 1;
+            return -1;
+        }
+    }
 
     g_phys = devs[0];
     for (uint32_t i = 0; i < dev_count; i++) {
         VkPhysicalDeviceProperties props;
         vkGetPhysicalDeviceProperties(devs[i], &props);
+        psp_report("vulkan: device %u: %s (vendor 0x%04x, device 0x%04x, type %d, api %u.%u.%u, driver 0x%x)\n", i,
+                   props.deviceName, props.vendorID, props.deviceID, (int)props.deviceType, props.apiVersion >> 22,
+                   (props.apiVersion >> 12) & 0x3ff, props.apiVersion & 0xfff, props.driverVersion);
         if (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) {
             g_phys = devs[i];
             break;
         }
     }
 
-    VkPhysicalDeviceProperties chosen_props;
+VkPhysicalDeviceProperties chosen_props;
     vkGetPhysicalDeviceProperties(g_phys, &chosen_props);
     vkGetPhysicalDeviceMemoryProperties(g_phys, &g_mem_props);
 
@@ -1460,10 +1615,16 @@ static int vk_init(int width, int height) {
         .pQueueCreateInfos = &dqci,
         .pEnabledFeatures = &req_feats
     };
-    if (vkCreateDevice(g_phys, &dci, NULL, &g_dev) != VK_SUCCESS) {
-        g_vk_failed = 1;
-        return -1;
+    g_step = "vkCreateDevice";
+    {
+        int r = vkCreateDevice(g_phys, &dci, NULL, &g_dev);
+        psp_report("vulkan: vkCreateDevice -> %s (%d), queue family %u\n", vk_res_name(r), r, g_qfam);
+        if (r != VK_SUCCESS) {
+            g_vk_failed = 1;
+            return -1;
+        }
     }
+    g_step = "resources (command pool, images, buffers, pipelines)";
     vkGetDeviceQueue(g_dev, g_qfam, 0, &g_queue);
 
     VkCommandPoolCreateInfo cpci = {
@@ -1726,7 +1887,7 @@ static int vk_init(int width, int height) {
     }
 
     g_vk_inited = 1;
-    psp_log("render: Vulkan backend initialized on %s\n", chosen_props.deviceName);
+    psp_report("render: Vulkan backend initialized on %s\n", chosen_props.deviceName);
     return 0;
 }
 

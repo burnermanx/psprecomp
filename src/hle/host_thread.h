@@ -124,16 +124,30 @@ static void host_cond_signal(host_cond *c) { if (pthread_cond_signal(c)) host_th
 static void host_cond_broadcast(host_cond *c) { if (pthread_cond_broadcast(c)) host_thread_error(); }
 static void host_cond_wait(host_cond *c, host_mutex *m) { if (pthread_cond_wait(c, m)) host_thread_error(); }
 static void host_timer_init(void) { }   /* POSIX sleeps are already fine-grained */
+/* Monotonic, like the QPC clock of the Windows side: the guest's time, its frame pacing and
+ * the audio grid must not jump when the system clock is stepped (NTP/time sync on SteamOS,
+ * a manual change, a resume from suspend). It used to be CLOCK_REALTIME. */
 static uint64_t host_deadline_us(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts)) host_thread_error();
+    return (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)ts.tv_nsec / 1000ull;
+}
+static uint64_t host_epoch_us(void) {
     struct timespec ts;
     if (clock_gettime(CLOCK_REALTIME, &ts)) host_thread_error();
     return (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)ts.tv_nsec / 1000ull;
 }
-static uint64_t host_epoch_us(void) { return host_deadline_us(); }
+/* pthread_cond_timedwait counts on CLOCK_REALTIME (a condition variable made with the default
+ * attributes); the deadline is monotonic, so wait for the time left, counted from now. A step
+ * of the system clock can then only change one wait of a few milliseconds, never the timeline. */
 static int host_cond_until(host_cond *c, host_mutex *m, uint64_t deadline) {
+    uint64_t now = host_deadline_us();
+    uint64_t left = deadline > now ? deadline - now : 0;
     struct timespec ts;
-    ts.tv_sec = (time_t)(deadline / 1000000ull);
-    ts.tv_nsec = (long)((deadline % 1000000ull) * 1000ull);
+    if (clock_gettime(CLOCK_REALTIME, &ts)) host_thread_error();
+    uint64_t at_ns = (uint64_t)ts.tv_nsec + (left % 1000000ull) * 1000ull;
+    ts.tv_sec += (time_t)(left / 1000000ull + at_ns / 1000000000ull);
+    ts.tv_nsec = (long)(at_ns % 1000000000ull);
     int rc = pthread_cond_timedwait(c, m, &ts);
     if (rc && rc != ETIMEDOUT) host_thread_error();
     return rc == ETIMEDOUT;

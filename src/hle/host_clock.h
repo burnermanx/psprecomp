@@ -1,4 +1,4 @@
-/* Wall-clock microseconds for trace stamps. timespec_get/TIME_UTC is C11 and
+/* Host microseconds for trace stamps and the audio grid (monotonic on POSIX; Windows: system time). timespec_get/TIME_UTC is C11 and
  * not every MinGW-w64 header set declares it, so use the OS call directly. */
 #ifndef PSPRECOMP_HOST_CLOCK_H
 #define PSPRECOMP_HOST_CLOCK_H
@@ -20,7 +20,7 @@ static uint64_t host_clock_us(void) {
 #include <time.h>
 static uint64_t host_clock_us(void) {
     struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
+    clock_gettime(CLOCK_MONOTONIC, &ts);   /* same base as the guest clock (host_deadline_us) */
     return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u;
 }
 #endif

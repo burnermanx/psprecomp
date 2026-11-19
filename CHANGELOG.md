@@ -7,6 +7,12 @@ the time, and none were added afterwards.
 
 ### Unreleased
 
+- **POSIX: monotonic time base.** `host_deadline_us()` and `host_clock_us()` read `CLOCK_MONOTONIC`
+  (they read `CLOCK_REALTIME`, against the comment and unlike the QPC clock on Windows), so
+  guest time, frame pacing and the audio grid do not follow a step of the system clock.
+  `host_cond_until()` converts the monotonic deadline into the time left before calling
+  `pthread_cond_timedwait`.
+
 *WTF goes from its title screen, through the Job Share menu, into a game of
 Lumberjack and its paycheck screen. A second microgame, Pendemonium, plays
 too: a lit 3D factory scene where you cap pens.*

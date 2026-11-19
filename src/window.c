@@ -8,6 +8,17 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Start mode: an explicit choice (0 window, 1 full screen) wins; under gamescope
+ * full screen otherwise, whatever was remembered (the remembered mode only
+ * counts outside a gamescope session); else the remembered word ("fullscreen" /
+ * "window"), else a window. Pure, so it is tested without a window. */
+int psp_window_resolve_start_mode(int explicit_mode, int gamescope, const char *remembered) {
+    if (explicit_mode >= 0) return explicit_mode ? 1 : 0;
+    if (gamescope) return 1;
+    if (remembered && remembered[0]) return remembered[0] == 'f';
+    return 0;
+}
+
 #if defined(_WIN32) && !defined(PSPRECOMP_SDL2)
 
 #define WIN32_LEAN_AND_MEAN
@@ -329,6 +340,7 @@ static uint32_t pad(SDL_GameController *gc, uint8_t *ax, uint8_t *ay) {
  * and a 1080p window cannot hold it whole, so let SDL scale by aspect instead
  * of cropping the bottom rows. */
 static atomic_int g_win_h;          /* drawable height, for --internal-scale auto */
+static atomic_int g_desk_h;         /* desktop (output) height */
 
 static void fit_scale(SDL_Renderer *ren, int w, int h) {
     int dw = 0, dh = 0;
@@ -506,16 +518,12 @@ static int on_gamescope(void) {
 }
 
 static int want_fullscreen_at_start(void) {
-    if (g_start_mode >= 0) return g_start_mode;
+    char b[16] = "";
     if (g_state_path[0]) {
         FILE *f = fopen(g_state_path, "r");
-        if (f) {
-            char b[16] = "";
-            if (fgets(b, sizeof b, f)) { fclose(f); return b[0] == 'f'; }
-            fclose(f);
-        }
+        if (f) { if (!fgets(b, sizeof b, f)) b[0] = 0; fclose(f); }
     }
-    return on_gamescope();
+    return psp_window_resolve_start_mode(g_start_mode, on_gamescope(), b);
 }
 
 /* Borderless full screen over the desktop: no mode change, the swapchain (the
@@ -595,6 +603,10 @@ static int window_main(void *arg) {
         if (is) { SDL_SetWindowIcon(win, is); SDL_FreeSurface(is); }
     }
     g_win = win;
+    if (win) {
+        SDL_DisplayMode dm;
+        if (SDL_GetDesktopDisplayMode(SDL_GetWindowDisplayIndex(win), &dm) == 0) atomic_store(&g_desk_h, dm.h);
+    }
     if (win && getenv("EMOTIONALSENSE_TRACE_MODES")) {
         int di = SDL_GetWindowDisplayIndex(win);
         SDL_DisplayMode d, p;
@@ -749,7 +761,13 @@ void psp_window_request_close(void) { atomic_store(&g_closed, 1); }
 int psp_window_take_escape(void) { return atomic_exchange(&g_esc, 0); }
 void psp_window_set_overlay(psp_overlay_fn fn) { g_overlay = fn; }
 
-int psp_window_height(void) { return atomic_load(&g_win_h); }
+/* Height the picture is shown at, for --internal-scale auto. Under gamescope a
+ * window is stretched by the compositor to its output, so the output's height
+ * (the desktop mode) counts, not the window's. */
+int psp_window_height(void) {
+    int h = atomic_load(&g_win_h), d = atomic_load(&g_desk_h);
+    return (on_gamescope() && d > h) ? d : h;
+}
 
 #else
 

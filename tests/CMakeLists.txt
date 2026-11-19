@@ -59,3 +59,7 @@ add_test(NAME raster COMMAND test_raster)
 add_executable(test_module test_module.c)
 target_link_libraries(test_module PRIVATE psprecomp)
 add_test(NAME module COMMAND test_module)
+
+add_executable(test_window_mode test_window_mode.c)
+target_link_libraries(test_window_mode PRIVATE psprecomp)
+add_test(NAME window_mode COMMAND test_window_mode)

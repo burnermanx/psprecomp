@@ -43,6 +43,11 @@ int psp_window_start(const char *title, int scale);
 void psp_window_set_start_mode(int mode);
 void psp_window_set_state_file(const char *path);
 
+/* The start-mode decision (1 full screen, 0 window): `explicit_mode` -1 none /
+ * 0 / 1; `gamescope` nonzero in a gamescope session; `remembered` the saved
+ * word or NULL. Explicit wins; gamescope then full screen; else remembered. */
+int psp_window_resolve_start_mode(int explicit_mode, int gamescope, const char *remembered);
+
 /* Nonzero once the user has closed the window. */
 int psp_window_closed(void);
 

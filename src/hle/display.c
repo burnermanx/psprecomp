@@ -13,6 +13,7 @@
 #include "psprecomp/hle.h"
 #include "psprecomp/log.h"
 #include "psprecomp/render.h"
+#include "psprecomp/window.h"
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -171,8 +172,18 @@ int psp_display_capture(const char *path) {
         src = px;
     }
 
+    /* EMOTIONALSENSE_SHOT_OVERLAY=1: the capture carries the host overlay too (the window's compositor
+     * is not capturable from a script). */
+    uint32_t *with_ov = NULL;
+    {
+        const char *so = getenv("EMOTIONALSENSE_SHOT_OVERLAY");
+        if (so && *so == '1' && (with_ov = (uint32_t *)malloc((size_t)w * (size_t)h * 4u)) != NULL) {
+            memcpy(with_ov, src, (size_t)w * (size_t)h * 4u);
+            if (psp_window_overlay_apply(with_ov, w, h)) src = with_ov;
+        }
+    }
     FILE *f = fopen(path, "wb");
-    if (!f) return -1;
+    if (!f) { free(with_ov); return -1; }
     fprintf(f, "P6\n%d %d\n255\n", w, h);
     for (int i = 0; i < w * h; i++) {
         const uint32_t c = src[i];
@@ -180,6 +191,7 @@ int psp_display_capture(const char *path) {
         fwrite(rgb, 1, 3, f);            /* PPM is RGB; alpha is dropped */
     }
     fclose(f);
+    free(with_ov);
     return 0;
 }
 
@@ -232,7 +244,7 @@ const char *psp_host_temp_dir(void) {
 
 static void shot_if_wanted(void) {
     static int init;
-    static char spec[512];
+    static char spec[8192];
     static long every;
     static char dir[512];
     if (!init) {

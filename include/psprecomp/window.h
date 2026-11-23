@@ -65,6 +65,9 @@ int psp_window_take_escape(void);
  * `active` says whether it has: when it returns 0 the frame is shown as is. */
 typedef int (*psp_overlay_fn)(uint32_t *px, int w, int h);
 void psp_window_set_overlay(psp_overlay_fn fn);
+/* Run the overlay on a frame the caller owns (a test aid: EMOTIONALSENSE_SHOT_OVERLAY=1 makes the
+ * captures carry the overlay). Returns what the overlay returned, 0 without an overlay. */
+int psp_window_overlay_apply(uint32_t *px, int w, int h);
 
 /* Drawable height in pixels, or 0 when there is no window. */
 int psp_window_height(void);

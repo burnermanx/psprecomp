@@ -233,6 +233,7 @@ int psp_window_closed(void) { return g_closed != 0; }
 void psp_window_request_close(void) { InterlockedExchange(&g_closed, 1); }
 int psp_window_take_escape(void) { return 0; }
 void psp_window_set_overlay(psp_overlay_fn fn) { (void)fn; }
+int psp_window_overlay_apply(uint32_t *px, int w, int h) { (void)px; (void)w; (void)h; return 0; }
 void psp_window_set_state_file(const char *path) { (void)path; }
 void psp_window_set_start_mode(int mode) { (void)mode; }
 
@@ -760,6 +761,7 @@ int psp_window_closed(void) { return atomic_load(&g_closed) != 0; }
 void psp_window_request_close(void) { atomic_store(&g_closed, 1); }
 int psp_window_take_escape(void) { return atomic_exchange(&g_esc, 0); }
 void psp_window_set_overlay(psp_overlay_fn fn) { g_overlay = fn; }
+int psp_window_overlay_apply(uint32_t *px, int w, int h) { return g_overlay ? g_overlay(px, w, h) : 0; }
 
 /* Height the picture is shown at, for --internal-scale auto. Under gamescope a
  * window is stretched by the compositor to its output, so the output's height
@@ -781,6 +783,7 @@ int psp_window_closed(void) { return 0; }
 void psp_window_request_close(void) {}
 int psp_window_take_escape(void) { return 0; }
 void psp_window_set_overlay(psp_overlay_fn fn) { (void)fn; }
+int psp_window_overlay_apply(uint32_t *px, int w, int h) { (void)px; (void)w; (void)h; return 0; }
 
 int psp_window_height(void) { return 0; }
 

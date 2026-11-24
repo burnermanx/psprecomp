@@ -72,4 +72,9 @@ int psp_window_overlay_apply(uint32_t *px, int w, int h);
 /* Drawable height in pixels, or 0 when there is no window. */
 int psp_window_height(void);
 
+/* The kind of controller that last pressed something, for a host that names the
+ * buttons: 0 none yet, 1 Xbox, 2 PlayStation, 3 Switch, 4 Steam Deck. XInput (Windows)
+ * is always 1. The keyboard never changes it. */
+int psp_window_pad_kind(void);
+
 #endif

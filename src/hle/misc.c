@@ -125,11 +125,23 @@ static void hle_ModuleOk(void)             { psp_ret(SCE_KERNEL_ERROR_OK); }
 static uint32_t g_buttons;
 static uint8_t  g_analog_x = 128, g_analog_y = 128;
 
-void psp_ctrl_set(uint32_t buttons, uint8_t ax, uint8_t ay) {
+static uint32_t g_triggers;
+static int g_stick_moved;
+static int (*g_trigger_hook)(void);
+
+void psp_ctrl_set_ex(uint32_t buttons, uint8_t ax, uint8_t ay, uint32_t triggers, int stick_moved) {
     g_buttons = buttons;
     g_analog_x = ax;
     g_analog_y = ay;
+    g_triggers = triggers;
+    g_stick_moved = stick_moved;
 }
+
+void psp_ctrl_set(uint32_t buttons, uint8_t ax, uint8_t ay) {
+    psp_ctrl_set_ex(buttons, ax, ay, 0, ax != 128 || ay != 128);
+}
+
+void psp_ctrl_set_trigger_hook(int (*as_stick_now)(void)) { g_trigger_hook = as_stick_now; }
 
 #define BTN_FACE_SWAP 0x6000u   /* circle 0x2000, cross 0x4000 */
 static int g_swap_enabled;
@@ -146,7 +158,6 @@ static uint32_t face_swap(uint32_t btns) {
     static uint32_t masked;      /* face buttons held across a change of state */
     if (!g_swap_enabled) return btns;
     int now = g_swap_now ? g_swap_now() != 0 : 1;
-    psp_render_face_swap = now;     /* the on-screen glyphs follow the same gate */
     if (was >= 0 && now != was) masked = btns & BTN_FACE_SWAP;
     was = now;
     masked &= btns;              /* released: no longer masked */
@@ -240,6 +251,8 @@ static void hle_ReadBufferPositive(void) {
     uint32_t buf = psp_arg(0), count = psp_arg(1);
     if (!count) count = 1;
     uint32_t btns = g_buttons;
+    uint8_t ax = g_analog_x;
+    uint32_t tr = g_triggers;
     static int script_init;
     if (!script_init) { script_init = 1; script_load(); }
     if (g_script_n) {
@@ -294,6 +307,31 @@ static void hle_ReadBufferPositive(void) {
             }
         }
     }
+    /* Test routes: script masks above the PSP's 16 bits stand for what the pad and the
+     * keyboard deliver outside the sceCtrl word: 0x10000 left trigger, 0x20000 right trigger,
+     * 0x40000 stick left (the E key), 0x80000 stick right (the R key). */
+    if (btns & 0xFFFF0000u) {
+        if (btns & 0x10000u) tr |= PSP_TRIG_LEFT;
+        if (btns & 0x20000u) tr |= PSP_TRIG_RIGHT;
+        if (!g_stick_moved) {
+            if ((btns & 0x40000u) && !(btns & 0x80000u)) ax = 0;
+            else if ((btns & 0x80000u) && !(btns & 0x40000u)) ax = 255;
+        }
+        btns &= 0xFFFFu;
+    }
+    {   /* the triggers: L/R, or (when the host asks) the stick's X axis */
+        if (tr) {
+            if (g_trigger_hook && g_trigger_hook()) {
+                if (!g_stick_moved) {
+                    if ((tr & PSP_TRIG_LEFT) && !(tr & PSP_TRIG_RIGHT)) ax = 0;
+                    else if ((tr & PSP_TRIG_RIGHT) && !(tr & PSP_TRIG_LEFT)) ax = 255;
+                }
+            } else {
+                if (tr & PSP_TRIG_LEFT) btns |= 0x0100u;
+                if (tr & PSP_TRIG_RIGHT) btns |= 0x0200u;
+            }
+        }
+    }
     if (getenv("EMOTIONALSENSE_TEST_NAME")) {
         uint64_t vb = psp_display_vblanks();
         if (vb >= 490 && vb < 495) btns |= 0x2000u; /* CIRCLE: letter A */
@@ -310,15 +348,15 @@ static void hle_ReadBufferPositive(void) {
     if (g_ctrl_filter) btns = g_ctrl_filter(btns);
     static int ctrl_trace = -1;
     if (ctrl_trace < 0) ctrl_trace = getenv("EMOTIONALSENSE_TRACE_CTRL") != NULL;
-    if (ctrl_trace && (btns || psp_read16(buf + 16) != psp_read16(buf + 18)))
-        psp_log("ctrl[%llu]: %04X last=%04X cur=%04X\n",
-                (unsigned long long)psp_display_vblanks(), btns,
+    if (ctrl_trace && (btns || ax != 128 || psp_read16(buf + 16) != psp_read16(buf + 18)))
+        psp_log("ctrl[%llu]: %04X ax=%u last=%04X cur=%04X\n",
+                (unsigned long long)psp_display_vblanks(), btns, ax,
                 psp_read16(buf + 16), psp_read16(buf + 18));
     for (uint32_t i = 0; i < count; i++) {
         uint32_t at = buf + i * 16;
         psp_write32(at, (uint32_t)psp_clock_us());   /* SceCtrlData timestamp is us */
         psp_write32(at + 4, btns);
-        psp_write8(at + 8, g_analog_x);
+        psp_write8(at + 8, ax);
         psp_write8(at + 9, g_analog_y);
         for (int k = 10; k < 16; k++) psp_write8(at + (uint32_t)k, 0);
     }

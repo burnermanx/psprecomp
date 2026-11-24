@@ -803,17 +803,26 @@ void psp_tex_pack_report(FILE *f) {
 
 /* ---- Button glyphs -------------------------------------------------------
  *
- * See psp_glyph_rule. The rewrite happens on the uploaded copy, at whatever
- * integer scale a pack gave the texture, and the cache entry carries the swap
- * state in its hash so the original and the rewritten texture never collide. */
+ * See psp_glyph_rule / psp_glyph_map. The rewrite happens on the uploaded copy, at whatever
+ * integer scale a pack gave the texture, and the cache entry carries the map's id in its hash
+ * so the original and every rewritten version never collide. */
 
 #define GLYPH_SALT 0x5A17C0DE5A17C0DEull
 static const psp_glyph_rule *g_glyph_rules;
 static int g_glyph_n;
+static psp_glyph_map g_gmap[2];            /* double buffer: the host writes one, the uploads read the other */
+static volatile int g_gmap_cur;
 
 void psp_render_set_glyph_rules(const psp_glyph_rule *rules, int n) {
     g_glyph_rules = rules;
     g_glyph_n = n;
+}
+
+void psp_render_set_glyph_map(const psp_glyph_map *m) {
+    const int nxt = g_gmap_cur ^ 1;
+    if (m) g_gmap[nxt] = *m; else memset(&g_gmap[nxt], 0, sizeof g_gmap[nxt]);
+    __sync_synchronize();
+    g_gmap_cur = nxt;
 }
 
 static int glyph_has_rule(uint64_t key, int w, int h) {
@@ -823,12 +832,54 @@ static int glyph_has_rule(uint64_t key, int w, int h) {
     return 0;
 }
 
+static int glyph_sym_index(char c) { return c == 'x' ? 0 : c == 'o' ? 1 : c == 's' ? 2 : c == 't' ? 3 : -1; }
+
 static int px_lum(uint32_t p) {
     return (int)(((p & 0xFF) * 30u + ((p >> 8) & 0xFF) * 59u + ((p >> 16) & 0xFF) * 11u) / 100u);
 }
 
-/* Redraw the symbol of one disc glyph (ring or cross) over its dark button. */
-static void glyph_paint(uint32_t *px, int stride, int x0, int y0, int gw, int gh, char kind) {
+/* Distance from (px, py) to the segment (ax, ay)-(bx, by). */
+static float seg_dist(float px, float py, float ax, float ay, float bx, float by) {
+    float vx = bx - ax, vy = by - ay, wx = px - ax, wy = py - ay;
+    float l2 = vx * vx + vy * vy, t = l2 > 0.0f ? (wx * vx + wy * vy) / l2 : 0.0f;
+    if (t < 0.0f) t = 0.0f; else if (t > 1.0f) t = 1.0f;
+    float dx = wx - t * vx, dy = wy - t * vy;
+    return sqrtf(dx * dx + dy * dy);
+}
+
+/* Letters A, B, X, Y as strokes in a unit square (x right, y down, -1..1), rasterised by
+ * the code: nothing of the game's art, no font. Returns the distance to the nearest stroke
+ * in unit-square units. */
+static float letter_dist(char L, float u, float v) {
+    static const float A[][4] = { {-1, 1, 0, -1}, {0, -1, 1, 1}, {-0.55f, 0.35f, 0.55f, 0.35f} };
+    static const float B[][4] = {
+        {-0.7f, -1, -0.7f, 1}, {-0.7f, -1, 0.15f, -1}, {0.15f, -1, 0.62f, -0.85f}, {0.62f, -0.85f, 0.78f, -0.5f},
+        {0.78f, -0.5f, 0.62f, -0.15f}, {0.62f, -0.15f, 0.15f, 0}, {0.15f, 0, -0.7f, 0},
+        {0.15f, 0, 0.72f, 0.15f}, {0.72f, 0.15f, 0.9f, 0.5f}, {0.9f, 0.5f, 0.72f, 0.85f},
+        {0.72f, 0.85f, 0.15f, 1}, {0.15f, 1, -0.7f, 1} };
+    static const float X[][4] = { {-0.9f, -1, 0.9f, 1}, {-0.9f, 1, 0.9f, -1} };
+    static const float Y[][4] = { {-0.95f, -1, 0, -0.05f}, {0.95f, -1, 0, -0.05f}, {0, -0.05f, 0, 1} };
+    const float (*sg)[4]; int n;
+    switch (L) {
+    case 'A': sg = A; n = 3; break;
+    case 'B': sg = B; n = 12; break;
+    case 'X': sg = X; n = 2; break;
+    case 'Y': sg = Y; n = 3; break;
+    default: return 9.0f;
+    }
+    float d = 9.0f;
+    for (int i = 0; i < n; i++) {
+        float e = seg_dist(u, v, sg[i][0], sg[i][1], sg[i][2], sg[i][3]);
+        if (e < d) d = e;
+    }
+    return d;
+}
+
+/* Redraw the symbol of one disc glyph over its dark button: ring ('O'), cross ('X') or the
+ * letter `kind` ('A', 'B', 'x' = letter X, 'Y'), in `rgb` (0xRRGGBB, 0 = the glyph's own symbol
+ * colour). `rot` quarter turns clockwise: the texture is stored turned and drawn upright. */
+static void glyph_paint(uint32_t *px, int stride, int x0, int y0, int gw, int gh, char kind,
+                        uint32_t rgb, int rot) {
     /* Symbol colour: the mean of the bright opaque texels; button colour: of
      * the dark ones. Both are read from the glyph, so nothing is invented. */
     uint32_t sym = 0, dark = 0;
@@ -843,10 +894,12 @@ static void glyph_paint(uint32_t *px, int stride, int x0, int y0, int gw, int gh
         }
     if (!sl || !dl) return;
     sym = 0xFF000000u | (uint32_t)(sr / sl) | ((uint32_t)(sg / sl) << 8) | ((uint32_t)(sb / sl) << 16);
+    if (rgb) sym = 0xFF000000u | ((rgb & 0xFF) << 16) | (rgb & 0xFF00u) | ((rgb >> 16) & 0xFF);   /* to 0xAABBGGRR */
     dark = 0xFF000000u | (uint32_t)(dr / dl) | ((uint32_t)(dg / dl) << 8) | ((uint32_t)(db / dl) << 16);
     const float cx = (gw - 1) * 0.5f, cy = (gh - 1) * 0.5f;
     const float rin = gw * 0.37f, arm = gw * 0.26f, hw = gw * 0.07f + 0.5f;
     const float rring = gw * 0.27f, thick = gw * 0.085f + 0.4f;
+    const float lh = gw * 0.27f, lw = gw * 0.235f, lt = gw * 0.072f + 0.55f;
     for (int y = 0; y < gh; y++)
         for (int x = 0; x < gw; x++) {
             uint32_t *p = &px[(size_t)(y0 + y) * (size_t)stride + (size_t)(x0 + x)];
@@ -859,8 +912,14 @@ static void glyph_paint(uint32_t *px, int stride, int x0, int y0, int gw, int gh
                 float d = d1 < d2 ? d1 : d2;
                 if (fabsf(dx) <= arm + 0.5f && fabsf(dy) <= arm + 0.5f)
                     cov = hw + 0.5f - d;
-            } else {
+            } else if (kind == 'O') {
                 cov = thick * 0.5f + 0.5f - fabsf(r - rring);
+            } else {
+                float rx = dx, ry = dy;                    /* undo the texture's turn */
+                for (int k = 0; k < (rot & 3); k++) { float t = rx; rx = ry; ry = -t; }
+                float d = letter_dist(kind == 'x' ? 'X' : kind, rx / lw, ry / lh);
+                /* d is in unit-square units: scale by the half size of that axis (the mean) */
+                cov = lt * 0.5f + 0.5f - d * (lw + lh) * 0.5f;
             }
             if (cov < 0.0f) cov = 0.0f;
             if (cov > 1.0f) cov = 1.0f;
@@ -873,21 +932,34 @@ static void glyph_paint(uint32_t *px, int stride, int x0, int y0, int gw, int gh
         }
 }
 
-/* Apply every rule of `key` to the uploaded copy, `s` times the original size. */
-static void glyph_rewrite(uint32_t *px, int up_w, int s, uint64_t key, int w, int h) {
+/* Apply every rule of `key` to the uploaded copy, `s` times the original size, as the current
+ * map says. `src` is an untouched copy of the same texture (a rectangle's look can be another
+ * rectangle's pixels: the circle glyph of a pair becomes the cross glyph, exactly). */
+static void glyph_rewrite(uint32_t *px, const uint32_t *src, int up_w, int s, uint64_t key, int w, int h) {
+    const psp_glyph_map *m = &g_gmap[g_gmap_cur];
     for (int i = 0; i < g_glyph_n; i++) {
         const psp_glyph_rule *r = &g_glyph_rules[i];
         if (r->key != key || r->w != w || r->h != h) continue;
-        int gw = r->gw * s, gh = r->gh * s;
-        if (r->kind == 'S') {
-            for (int y = 0; y < gh; y++)
-                for (int x = 0; x < gw; x++) {
-                    uint32_t *a = &px[(size_t)(r->ay * s + y) * (size_t)up_w + (size_t)(r->ax * s + x)];
-                    uint32_t *b = &px[(size_t)(r->by * s + y) * (size_t)up_w + (size_t)(r->bx * s + x)];
-                    uint32_t t = *a; *a = *b; *b = t;
-                }
-        } else if (r->kind == 'X' || r->kind == 'O') {
-            glyph_paint(px, up_w, r->ax * s, r->ay * s, gw, gh, r->kind);
+        const int si = glyph_sym_index(r->sym);
+        if (si < 0) continue;
+        const psp_glyph_look *lk = &m->look[si];
+        const int gw = r->gw * s, gh = r->gh * s;
+        if (lk->letter) {
+            glyph_paint(px, up_w, r->x * s, r->y * s, gw, gh, lk->letter, lk->rgb, r->rot);
+        } else if (lk->shows && lk->shows != r->sym) {
+            const psp_glyph_rule *o = NULL;                 /* a rectangle of this texture that holds that symbol */
+            for (int j = 0; j < g_glyph_n; j++) {
+                const psp_glyph_rule *q = &g_glyph_rules[j];
+                if (q->key == key && q->w == w && q->h == h && q->sym == lk->shows && q->gw == r->gw && q->gh == r->gh && q->rot == r->rot) { o = q; break; }
+            }
+            if (o) {
+                for (int y = 0; y < gh; y++)
+                    for (int x = 0; x < gw; x++)
+                        px[(size_t)(r->y * s + y) * (size_t)up_w + (size_t)(r->x * s + x)] =
+                            src[(size_t)(o->y * s + y) * (size_t)up_w + (size_t)(o->x * s + x)];
+            } else if (lk->shows == 'x' || lk->shows == 'o') {
+                glyph_paint(px, up_w, r->x * s, r->y * s, gw, gh, lk->shows == 'x' ? 'X' : 'O', 0, 0);
+            }
         }
     }
 }
@@ -1019,11 +1091,12 @@ static int resolve_texture(const psp_draw_state *st) {
      * lookup below keep using the original hash. */
     const uint64_t data_hash_orig = data_hash;
     int glyph_swap = 0;
-    if (g_glyph_n && psp_render_face_swap &&
+    const uint32_t gmap_id = g_gmap[g_gmap_cur].id;
+    if (g_glyph_n && gmap_id &&
         glyph_has_rule(dump_key(data_hash, clut_hash, st->tex_fmt, st->tex_w, st->tex_h),
                        st->tex_w, st->tex_h)) {
         glyph_swap = 1;
-        data_hash ^= GLYPH_SALT;
+        data_hash ^= GLYPH_SALT * (0x9E3779B97F4A7C15ull * gmap_id | 1ull);
     }
 
     const int bga = bga_candidate(st);
@@ -1129,9 +1202,15 @@ static int resolve_texture(const psp_draw_state *st) {
 
     if (bga && !pack && !glyph_swap) bga_arrive(dst, slot, data_hash);
 
-    if (glyph_swap)
-        glyph_rewrite(dst, up_w, uv_scale, dump_key(data_hash_orig, clut_hash, st->tex_fmt,
-                                                    st->tex_w, st->tex_h), st->tex_w, st->tex_h);
+    if (glyph_swap) {
+        uint32_t *orig = malloc((size_t)up_w * (size_t)up_h * 4u);
+        if (orig) {
+            memcpy(orig, dst, (size_t)up_w * (size_t)up_h * 4u);
+            glyph_rewrite(dst, orig, up_w, uv_scale, dump_key(data_hash_orig, clut_hash, st->tex_fmt,
+                                                              st->tex_w, st->tex_h), st->tex_w, st->tex_h);
+            free(orig);
+        }
+    }
 
     g_tex_staging_off = aligned_off + bytes_needed;
     g_tex_uploads[g_num_tex_uploads++] = (vk_tex_upload){ slot, aligned_off, up_w, up_h };

@@ -93,8 +93,17 @@ static uint32_t keyboard(void) {
     return b;
 }
 
+/* E / R: the stick pushed left / right (both = centre). */
+static void keyboard_stick(uint8_t *ax) {
+    const int l = (GetAsyncKeyState('E') & 0x8000) != 0, r = (GetAsyncKeyState('R') & 0x8000) != 0;
+    if (l != r) *ax = r ? 255 : 0;
+}
+
+static volatile int g_xinput_seen;
+int psp_window_pad_kind(void) { return g_xinput_seen ? 1 : 0; }   /* XInput: Xbox buttons */
+
 /* The first XInput controller, if one is connected. */
-static uint32_t pad(uint8_t *ax, uint8_t *ay) {
+static uint32_t pad(uint8_t *ax, uint8_t *ay, uint32_t *trig, int *moved) {
     static const struct { WORD x; uint32_t bit; } P[] = {
         { XINPUT_GAMEPAD_DPAD_UP, B_UP }, { XINPUT_GAMEPAD_DPAD_RIGHT, B_RIGHT },
         { XINPUT_GAMEPAD_DPAD_DOWN, B_DOWN }, { XINPUT_GAMEPAD_DPAD_LEFT, B_LEFT },
@@ -105,16 +114,18 @@ static uint32_t pad(uint8_t *ax, uint8_t *ay) {
     };
     XINPUT_STATE s;
     if (XInputGetState(0, &s) != ERROR_SUCCESS) return 0;
+    g_xinput_seen = 1;
     uint32_t b = 0;
     for (size_t i = 0; i < sizeof P / sizeof P[0]; i++)
         if (s.Gamepad.wButtons & P[i].x) b |= P[i].bit;
-    if (s.Gamepad.bLeftTrigger > XINPUT_GAMEPAD_TRIGGER_THRESHOLD) b |= B_L;
-    if (s.Gamepad.bRightTrigger > XINPUT_GAMEPAD_TRIGGER_THRESHOLD) b |= B_R;
+    if (s.Gamepad.bLeftTrigger > XINPUT_GAMEPAD_TRIGGER_THRESHOLD) *trig |= PSP_TRIG_LEFT;
+    if (s.Gamepad.bRightTrigger > XINPUT_GAMEPAD_TRIGGER_THRESHOLD) *trig |= PSP_TRIG_RIGHT;
     /* The PSP stick is 0..255 with 128 at rest and y growing downwards. */
     const int lx = s.Gamepad.sThumbLX, ly = s.Gamepad.sThumbLY;
     if (lx * lx + ly * ly > XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE * XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE) {
         *ax = (uint8_t)((lx + 32768) >> 8);
         *ay = (uint8_t)((32767 - ly) >> 8);
+        *moved = 1;
     }
     return b;
 }
@@ -159,9 +170,14 @@ static LRESULT CALLBACK proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_TIMER: {
         uint8_t ax = 128, ay = 128;
-        uint32_t b = pad(&ax, &ay);
-        if (GetForegroundWindow() == h) b |= keyboard();   /* keys only when focused */
-        psp_ctrl_set(b, ax, ay);
+        uint32_t b, trig = 0;
+        int moved = 0;
+        b = pad(&ax, &ay, &trig, &moved);
+        if (GetForegroundWindow() == h) {                   /* keys only when focused */
+            b |= keyboard();
+            if (!moved) keyboard_stick(&ax);
+        }
+        psp_ctrl_set_ex(b, ax, ay, trig, moved);
         InvalidateRect(h, NULL, FALSE);
         return 0;
     }
@@ -310,7 +326,45 @@ static uint32_t keyboard(void) {
     return b;
 }
 
-static uint32_t pad(SDL_GameController *gc, uint8_t *ax, uint8_t *ay) {
+/* E / R: the stick pushed left / right (both = centre). */
+static void keyboard_stick(uint8_t *ax) {
+    const Uint8 *ks = SDL_GetKeyboardState(NULL);
+    const int l = ks[SDL_SCANCODE_E] != 0, r = ks[SDL_SCANCODE_R] != 0;
+    if (l != r) *ax = r ? 255 : 0;
+}
+
+/* What kind of controller is this, for a host that draws its button names (1 xbox,
+ * 2 playstation, 3 switch, 4 steam deck). SDL knows the real type of a physical
+ * controller, and of a Steam Input one when the Steam client describes it
+ * (SteamVirtualGamepadInfo, SDL 2.30+/sdl2-compat); the Steam virtual pad
+ * itself (28de:11ff) says "Xbox 360" and is a Steam Deck's when SteamDeck=1. */
+static int pad_kind(SDL_GameController *gc) {
+    const Uint16 vid = SDL_GameControllerGetVendor(gc), pid = SDL_GameControllerGetProduct(gc);
+    int kind = 1;
+    switch (SDL_GameControllerGetType(gc)) {
+    case SDL_CONTROLLER_TYPE_PS3: case SDL_CONTROLLER_TYPE_PS4: case SDL_CONTROLLER_TYPE_PS5:
+        kind = 2; break;
+    case SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_PRO:
+#if SDL_VERSION_ATLEAST(2, 24, 0)
+    case SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_JOYCON_LEFT:
+    case SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_JOYCON_RIGHT:
+    case SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_JOYCON_PAIR:
+#endif
+        kind = 3; break;
+    default: break;
+    }
+    const char *sd = getenv("SteamDeck");
+    const int deck_env = sd && *sd && strcmp(sd, "0") != 0;
+    if (vid == 0x28de && pid == 0x1205) kind = 4;                         /* the Deck's own pad */
+    else if (kind == 1 && deck_env && vid == 0x28de) kind = 4;           /* Steam's virtual pad on a Deck */
+    return kind;
+}
+
+#define MAX_PADS 4
+static atomic_int g_pad_kind;       /* kind of the controller that last pressed something, 0 none */
+int psp_window_pad_kind(void) { return atomic_load(&g_pad_kind); }
+
+static uint32_t pad(SDL_GameController *gc, uint8_t *ax, uint8_t *ay, uint32_t *trig, int *moved) {
     static const struct { SDL_GameControllerButton btn; uint32_t bit; } P[] = {
         { SDL_CONTROLLER_BUTTON_DPAD_UP, B_UP }, { SDL_CONTROLLER_BUTTON_DPAD_RIGHT, B_RIGHT },
         { SDL_CONTROLLER_BUTTON_DPAD_DOWN, B_DOWN }, { SDL_CONTROLLER_BUTTON_DPAD_LEFT, B_LEFT },
@@ -323,8 +377,8 @@ static uint32_t pad(SDL_GameController *gc, uint8_t *ax, uint8_t *ay) {
     uint32_t b = 0;
     for (size_t i = 0; i < sizeof P / sizeof P[0]; i++)
         if (SDL_GameControllerGetButton(gc, P[i].btn)) b |= P[i].bit;
-    if (SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_TRIGGERLEFT)  > 8000) b |= B_L;
-    if (SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_TRIGGERRIGHT) > 8000) b |= B_R;
+    if (SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_TRIGGERLEFT)  > 8000) *trig |= PSP_TRIG_LEFT;
+    if (SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_TRIGGERRIGHT) > 8000) *trig |= PSP_TRIG_RIGHT;
     /* The PSP stick is 0..255 with 128 at rest and y growing downwards --
      * the same direction as SDL's. */
     const int lx = SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_LEFTX);
@@ -332,6 +386,7 @@ static uint32_t pad(SDL_GameController *gc, uint8_t *ax, uint8_t *ay) {
     if (lx * lx + ly * ly > 7849 * 7849) {
         *ax = (uint8_t)((lx + 32768) >> 8);
         *ay = (uint8_t)((ly + 32768) >> 8);
+        *moved = 1;
     }
     return b;
 }
@@ -573,6 +628,10 @@ static int window_main(void *arg) {
 #ifdef SDL_HINT_WINDOWS_DPI_AWARENESS   /* SDL >= 2.24; older SDL2 (Ubuntu 22.04: 2.0.20) lacks it */
     SDL_SetHint(SDL_HINT_WINDOWS_DPI_AWARENESS, "permonitorv2");
 #endif
+    /* Positional face buttons: the bottom one is always the same button, whatever is
+     * printed on it (a Nintendo pad would otherwise swap A/B and X/Y in SDL). Set before the
+     * init; a value the user put in the environment stays. */
+    SDL_SetHintWithPriority("SDL_GAMECONTROLLER_USE_BUTTON_LABELS", "0", SDL_HINT_DEFAULT);
     if (SDL_InitSubSystem(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER) != 0) {
         psp_log("psprecomp: SDL_Init: %s\n", SDL_GetError());
         atomic_store(&g_closed, 1); atomic_store(&g_ready, -1);
@@ -645,7 +704,7 @@ static int window_main(void *arg) {
     }
     atomic_store(&g_ready, 1);
 
-    SDL_GameController *gc = NULL;
+    SDL_GameController *gcs[MAX_PADS] = { NULL };
     uint64_t last_poll_us = 0;
     while (!atomic_load(&g_closed)) {
         if (g_trace) {
@@ -688,12 +747,23 @@ static int window_main(void *arg) {
                 }
                 break;
             case SDL_CONTROLLERDEVICEADDED:
-                if (!gc && host_input_enabled()) gc = SDL_GameControllerOpen(ev.cdevice.which);
+                if (host_input_enabled())
+                    for (int i = 0; i < MAX_PADS; i++)
+                        if (!gcs[i]) {
+                            gcs[i] = SDL_GameControllerOpen(ev.cdevice.which);
+                            if (gcs[i] && getenv("EMOTIONALSENSE_TRACE_PAD"))
+                                psp_log("pad: opened '%s' type=%d vid=%04x pid=%04x kind=%d\n",
+                                        SDL_GameControllerName(gcs[i]), (int)SDL_GameControllerGetType(gcs[i]),
+                                        SDL_GameControllerGetVendor(gcs[i]), SDL_GameControllerGetProduct(gcs[i]),
+                                        pad_kind(gcs[i]));
+                            break;
+                        }
                 break;
             case SDL_CONTROLLERDEVICEREMOVED:
-                if (gc && SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(gc)) == ev.cdevice.which) {
-                    SDL_GameControllerClose(gc); gc = NULL;
-                }
+                for (int i = 0; i < MAX_PADS; i++)
+                    if (gcs[i] && SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(gcs[i])) == ev.cdevice.which) {
+                        SDL_GameControllerClose(gcs[i]); gcs[i] = NULL;
+                    }
                 break;
             case SDL_KEYDOWN:
                 if (ev.key.keysym.sym == SDLK_ESCAPE) {
@@ -719,12 +789,22 @@ static int window_main(void *arg) {
             }
         }
         uint8_t ax = 128, ay = 128;
-        uint32_t bp = 0, bk = 0;
+        uint32_t bp = 0, bk = 0, trig = 0;
+        int moved = 0;
         if (host_input_enabled()) {
-            bp = pad(gc, &ax, &ay);
-            if (SDL_GetWindowFlags(win) & SDL_WINDOW_INPUT_FOCUS) bk = keyboard();
+            for (int i = 0; i < MAX_PADS; i++) {
+                if (!gcs[i]) continue;
+                uint32_t t = 0;
+                const uint32_t b = pad(gcs[i], &ax, &ay, &t, &moved);
+                bp |= b; trig |= t;
+                if (b || t) atomic_store(&g_pad_kind, pad_kind(gcs[i]));   /* the last one to press */
+            }
+            if (SDL_GetWindowFlags(win) & SDL_WINDOW_INPUT_FOCUS) {
+                bk = keyboard();
+                if (!moved) keyboard_stick(&ax);
+            }
         }
-        psp_ctrl_set(bp | bk, ax, ay);
+        psp_ctrl_set_ex(bp | bk, ax, ay, trig, moved);
         static int in_trace = -1;
         if (in_trace < 0) in_trace = getenv("EMOTIONALSENSE_TRACE_INPUT") != NULL;
         if (in_trace) {
@@ -739,7 +819,7 @@ static int window_main(void *arg) {
     }
     atomic_store(&g_closed, 1);
     SDL_WaitThread(pt, NULL);
-    if (gc) SDL_GameControllerClose(gc);
+    for (int i = 0; i < MAX_PADS; i++) if (gcs[i]) SDL_GameControllerClose(gcs[i]);
     SDL_DestroyWindow(win);
     return 0;
 }
@@ -786,5 +866,6 @@ void psp_window_set_overlay(psp_overlay_fn fn) { (void)fn; }
 int psp_window_overlay_apply(uint32_t *px, int w, int h) { (void)px; (void)w; (void)h; return 0; }
 
 int psp_window_height(void) { return 0; }
+int psp_window_pad_kind(void) { return 0; }
 
 #endif

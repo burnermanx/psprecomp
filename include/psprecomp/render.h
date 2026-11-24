@@ -149,24 +149,40 @@ extern int psp_render_tex_filter;
  * (then psp_display_read() is the way to get the 480x272 frame). */
 int psp_render_frame(const uint32_t **px, int *w, int *h);
 
-/* Button-glyph rewriting, for a host that swaps circle and cross. A rule names
- * a texture by the dump key (content + CLUT + format + size) and one rectangle
- * of 18x18-ish texels:
- *   'S'  swap rectangle A with rectangle B (a circle and a cross glyph)
- *   'X'  rewrite the circle glyph at A into a cross
- *   'O'  rewrite the cross glyph at A into a circle
- * The texture is changed only while psp_render_face_swap is non-zero, in the
- * uploaded copy only: nothing is written anywhere, and the numbers in a rule
- * are the only game-specific data. Vulkan backend only. */
+/* Button-glyph rewriting, for a host that shows other button symbols than the game draws.
+ * A rule names a texture by the dump key (content + CLUT + format + size) and one square of
+ * 18x18-ish texels that holds a button disc, and says which symbol that disc shows:
+ * 'x' cross, 'o' circle, 's' square, 't' triangle. `rot` is the number of quarter turns
+ * (clockwise) the texture is stored turned relative to how it is drawn (letters only).
+ *
+ * The host describes the look it wants per original symbol with a psp_glyph_map (id 0 =
+ * the game's own, nothing is changed): `letter` != 0 repaints the disc with that letter
+ * ('A', 'B', 'x' for the letter X, 'Y'; the strokes are rasterised in the renderer) in
+ * `rgb` (0xRRGGBB, 0 = the glyph's own symbol colour); else `shows` != the original symbol
+ * replaces the disc by the one of that symbol. Look index: 0 cross, 1 circle, 2 square,
+ * 3 triangle. A change of map applies to textures uploaded afterwards (the cache keys
+ * carry the id), so the host changes it at a quiet moment. The texture is changed in the
+ * uploaded copy only: nothing is written anywhere, and the numbers in a rule are the only
+ * game-specific data. Vulkan backend only. */
 typedef struct {
     uint64_t key;
     int w, h;               /* the texture size, as part of the key */
-    int ax, ay, bx, by;     /* rectangle corners in texels; B used by 'S' */
-    int gw, gh;             /* rectangle size */
-    char kind;
+    int x, y;               /* the square's corner in texels */
+    int gw, gh;             /* its size */
+    char sym;
+    char rot;
 } psp_glyph_rule;
-extern volatile int psp_render_face_swap;
+typedef struct {
+    char letter;
+    char shows;             /* 'x' 'o' 's' 't', or 0 = the original */
+    uint32_t rgb;
+} psp_glyph_look;
+typedef struct {
+    uint32_t id;            /* 0 = identity; every distinct look needs its own non-zero id */
+    psp_glyph_look look[4];
+} psp_glyph_map;
 void psp_render_set_glyph_rules(const psp_glyph_rule *rules, int n);
+void psp_render_set_glyph_map(const psp_glyph_map *m);
 
 /* Texture dump (EMOTIONALSENSE_TEX_DUMP). Writes RGBA8 PNGs, no dependency. */
 int  psp_tex_png_write(const char *path, const uint32_t *rgba, int w, int h);

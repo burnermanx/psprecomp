@@ -193,6 +193,17 @@ void psp_misc_reset(void);
 int  psp_exit_requested(void);
 void psp_ctrl_set(uint32_t buttons, uint8_t ax, uint8_t ay);
 
+/* The same, with the analog triggers kept apart: bit 0 = left trigger, bit 1 =
+ * right trigger (past their threshold), and `stick_moved` = the physical
+ * stick is outside its dead zone. Without a trigger hook the triggers are the
+ * L and R buttons. With one (psp_ctrl_set_trigger_hook), a non-zero answer at
+ * read time turns them into the PSP stick instead: left trigger = X 0, right
+ * trigger = X 255, both = centre, and a moved physical stick wins. */
+#define PSP_TRIG_LEFT  1u
+#define PSP_TRIG_RIGHT 2u
+void psp_ctrl_set_ex(uint32_t buttons, uint8_t ax, uint8_t ay, uint32_t triggers, int stick_moved);
+void psp_ctrl_set_trigger_hook(int (*as_stick_now)(void));
+
 /* Swap the circle and cross bits (0x2000 / 0x4000) in the buttons the guest
  * reads from sceCtrl, for a game that hardcodes circle as "confirm" on a
  * host that wants cross. `swap_now` is asked on every read and says whether

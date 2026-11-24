@@ -930,6 +930,44 @@ static void test_ctrl_face_swap(void) {
     psp_ctrl_set(0, 128, 128);
 }
 
+/* The triggers: L/R without a hook, the stick's X axis when the host says so. */
+static int g_trig_hook;
+static int trig_hook(void) { return g_trig_hook; }
+
+static void test_ctrl_triggers(void) {
+    const uint32_t buf = 0x08100000u;
+    psp_ctrl_set_trigger_hook(NULL);
+    psp_ctrl_set_ex(0, 128, 128, PSP_TRIG_LEFT, 0);
+    call(0x1F803938u, buf, 1, 0, 0);
+    CHECK(psp_read32(buf + 4) == 0x0100u && psp_read8(buf + 8) == 128, "no hook: LT is L");
+    psp_ctrl_set_ex(0, 128, 128, PSP_TRIG_RIGHT, 0);
+    call(0x1F803938u, buf, 1, 0, 0);
+    CHECK(psp_read32(buf + 4) == 0x0200u, "no hook: RT is R");
+
+    psp_ctrl_set_trigger_hook(trig_hook);
+    g_trig_hook = 0;
+    psp_ctrl_set_ex(0, 128, 128, PSP_TRIG_LEFT, 0);
+    call(0x1F803938u, buf, 1, 0, 0);
+    CHECK(psp_read32(buf + 4) == 0x0100u && psp_read8(buf + 8) == 128, "hook says no: LT is L");
+    g_trig_hook = 1;
+    call(0x1F803938u, buf, 1, 0, 0);
+    CHECK(psp_read32(buf + 4) == 0 && psp_read8(buf + 8) == 0, "hook says yes: LT is stick left, not L");
+    psp_ctrl_set_ex(0, 128, 128, PSP_TRIG_RIGHT, 0);
+    call(0x1F803938u, buf, 1, 0, 0);
+    CHECK(psp_read32(buf + 4) == 0 && psp_read8(buf + 8) == 255, "hook says yes: RT is stick right");
+    psp_ctrl_set_ex(0, 128, 128, PSP_TRIG_LEFT | PSP_TRIG_RIGHT, 0);
+    call(0x1F803938u, buf, 1, 0, 0);
+    CHECK(psp_read8(buf + 8) == 128, "both triggers: centre");
+    psp_ctrl_set_ex(0x0100u, 128, 128, PSP_TRIG_RIGHT, 0);
+    call(0x1F803938u, buf, 1, 0, 0);
+    CHECK(psp_read32(buf + 4) == 0x0100u && psp_read8(buf + 8) == 255, "LB stays L while RT is the stick");
+    psp_ctrl_set_ex(0, 40, 128, PSP_TRIG_RIGHT, 1);
+    call(0x1F803938u, buf, 1, 0, 0);
+    CHECK(psp_read8(buf + 8) == 40, "a moved physical stick wins");
+    psp_ctrl_set_trigger_hook(NULL);
+    psp_ctrl_set(0, 128, 128);
+}
+
 int main(void) {
     CHECK(psp_mem_init() == 0, "memory init");
     psp_cpu_reset();
@@ -940,6 +978,7 @@ int main(void) {
 
     test_sha1_vectors();
     test_ctrl_face_swap();
+    test_ctrl_triggers();
     test_nids_match_names();
     test_sysmem();
     test_semaphores();

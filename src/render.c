@@ -510,7 +510,6 @@ const psp_render_backend psp_render_null = {
     "null", null_init, null_noop, null_target, null_draw, null_noop, null_noop, NULL
 };
 
-volatile int psp_render_face_swap;
 int psp_render_scale = 1;
 int psp_render_subpixel = 1;
 int psp_render_bga_smooth = 0;

@@ -22,12 +22,14 @@ static int g_whits;
 static int g_wlimit = 8;
 static uint32_t g_wlast;
 static int g_wseen;
+static int g_wall;      /* EMOTIONALSENSE_WATCH_ALL=1: every write, not only a change of the value before it */
 void psp_mem_watch_write(uint32_t addr) {
     g_wwatch = addr; g_whits = 0; g_wseen = 0;
     /* A field written every frame drowns in its own noise; let the caller ask
      * for more than the default handful. */
     const char *l = getenv("EMOTIONALSENSE_WATCH_LIMIT");
     if (l) g_wlimit = atoi(l);
+    g_wall = getenv("EMOTIONALSENSE_WATCH_ALL") != NULL;
 }
 int psp_mem_watch_hits(void) { return g_whits; }
 
@@ -36,7 +38,7 @@ static void note_write(uint32_t addr, uint32_t width) {
     /* Only report a change: a counter bumping once a frame is one fact, not
      * a million lines. */
     uint32_t v = psp_read32(g_wwatch);
-    if (g_wseen && v == g_wlast) return;
+    if (g_wseen && v == g_wlast && !g_wall) return;
     g_wlast = v; g_wseen = 1;
     if (g_whits++ < g_wlimit)
     {

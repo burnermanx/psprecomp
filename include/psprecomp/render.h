@@ -176,11 +176,21 @@ typedef struct {
     char letter;
     char shows;             /* 'x' 'o' 's' 't', or 0 = the original */
     uint32_t rgb;
+    char label[4];          /* look 4..7 only: what a button pill shows (see below); "" = the game's own */
 } psp_glyph_look;
+#define PSP_GLYPH_LOOKS 8
 typedef struct {
     uint32_t id;            /* 0 = identity; every distinct look needs its own non-zero id */
-    psp_glyph_look look[4];
+    psp_glyph_look look[PSP_GLYPH_LOOKS];
 } psp_glyph_map;
+/* Button pills (round 36b). A rule whose `sym` is 'S' (START), 'E' (SELECT), 'l' (left shoulder) or
+ * 'r' (right shoulder) names the *text box* of a pill drawn by the game (x, y, gw, gh in texels, inside
+ * the pill's face): the renderer erases the game's word there (each row is blended between the two
+ * texels just outside the box, so a gradient face or a black pill stays as it is) and draws the look's
+ * `label`: "M" the Menu icon (three bars), "V" the View icon (two overlapping squares), "+" and "-"
+ * (the Switch's plus and minus), or up to three characters of text ("L1", "RB", "L", "R": strokes
+ * rasterised by the renderer), centred in the box, in `rgb` (0 = the dark of the original text).
+ * Look index 4 START, 5 SELECT, 6 left shoulder, 7 right shoulder. */
 void psp_render_set_glyph_rules(const psp_glyph_rule *rules, int n);
 void psp_render_set_glyph_map(const psp_glyph_map *m);
 

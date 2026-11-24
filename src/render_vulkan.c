@@ -832,7 +832,9 @@ static int glyph_has_rule(uint64_t key, int w, int h) {
     return 0;
 }
 
-static int glyph_sym_index(char c) { return c == 'x' ? 0 : c == 'o' ? 1 : c == 's' ? 2 : c == 't' ? 3 : -1; }
+static int glyph_sym_index(char c) {
+    return c == 'x' ? 0 : c == 'o' ? 1 : c == 's' ? 2 : c == 't' ? 3 : c == 'S' ? 4 : c == 'E' ? 5 : c == 'l' ? 6 : c == 'r' ? 7 : -1;
+}
 
 static int px_lum(uint32_t p) {
     return (int)(((p & 0xFF) * 30u + ((p >> 8) & 0xFF) * 59u + ((p >> 16) & 0xFF) * 11u) / 100u);
@@ -932,6 +934,134 @@ static void glyph_paint(uint32_t *px, int stride, int x0, int y0, int gw, int gh
         }
 }
 
+
+/* ---- Button pills (round 36b): START, SELECT and the shoulder buttons ---------------------------
+ * The game draws them as small pills with a word in them. The pill (shape, rim, gradient) stays;
+ * the word's box is erased row by row (a blend of the two texels just outside the box, which keeps a
+ * gradient face and a black pill as they are) and the new label is drawn in it from geometry:
+ * bars, squares, plus, minus and four stroked characters. Nothing of any maker's art or font. */
+
+static float sd_box(float x, float y, float hx, float hy, float r) {      /* signed distance, rounded box */
+    float qx = fabsf(x) - (hx - r), qy = fabsf(y) - (hy - r);
+    float ox = qx > 0.0f ? qx : 0.0f, oy = qy > 0.0f ? qy : 0.0f;
+    float in = qx > qy ? qx : qy;
+    return sqrtf(ox * ox + oy * oy) + (in < 0.0f ? in : 0.0f) - r;
+}
+
+static float stroke_dist(const float (*sg)[4], int n, float x, float y) {
+    float d = 9.0f;
+    for (int i = 0; i < n; i++) {
+        float e = seg_dist(x, y, sg[i][0], sg[i][1], sg[i][2], sg[i][3]);
+        if (e < d) d = e;
+    }
+    return d;
+}
+
+/* Characters of the shoulder labels as strokes in a unit box (x right, y down, 0..1). */
+static const float PC_L[][4] = { {0, 0, 0, 1}, {0, 1, 1, 1} };
+static const float PC_R[][4] = { {0, 1, 0, 0}, {0, 0, 0.72f, 0}, {0.72f, 0, 1, 0.14f}, {1, 0.14f, 1, 0.36f},
+                                 {1, 0.36f, 0.72f, 0.5f}, {0.72f, 0.5f, 0, 0.5f}, {0.45f, 0.5f, 1, 1} };
+static const float PC_B[][4] = { {0, 0, 0, 1}, {0, 0, 0.72f, 0}, {0.72f, 0, 1, 0.12f}, {1, 0.12f, 1, 0.38f},
+                                 {1, 0.38f, 0.72f, 0.5f}, {0.72f, 0.5f, 0, 0.5f}, {0.72f, 0.5f, 1, 0.62f},
+                                 {1, 0.62f, 1, 0.88f}, {1, 0.88f, 0.72f, 1}, {0.72f, 1, 0, 1} };
+static const float PC_1[][4] = { {0.6f, 0, 0.6f, 1}, {0.6f, 0, 0.1f, 0.28f} };
+
+/* Coverage (0..1) of a pill label at (x, y), in texels from the box centre; `ppt` = pixels per texel. */
+static float pill_label_cov(const char *lb, float x, float y, float ppt) {
+    float d = 9.0f, thick = 1.3f;
+    if (lb[0] == 'M' && !lb[1]) {                                   /* Menu: three bars */
+        for (int i = -1; i <= 1; i++) {
+            float e = sd_box(x, y - 2.9f * (float)i, 4.0f, 0.7f, 0.25f);
+            if (e < d) d = e;
+        }
+        return fminf(fmaxf(0.5f - d * ppt, 0.0f), 1.0f);
+    }
+    if (lb[0] == 'V' && !lb[1]) {                                   /* View: two squares, the front one on top */
+        const float hs = 2.4f, off = 1.4f, st = 1.15f;
+        float back = fabsf(sd_box(x + off, y + off, hs, hs, 0.7f)) - st * 0.5f;
+        float frontin = sd_box(x - off, y - off, hs + st * 0.5f + 0.55f, hs + st * 0.5f + 0.55f, 0.9f);
+        float front = fabsf(sd_box(x - off, y - off, hs, hs, 0.7f)) - st * 0.5f;
+        float cb = fminf(fmaxf(0.5f - back * ppt, 0.0f), 1.0f);
+        float cm = fminf(fmaxf(0.5f + frontin * ppt, 0.0f), 1.0f);       /* 1 outside the front square's margin */
+        float cf = fminf(fmaxf(0.5f - front * ppt, 0.0f), 1.0f);
+        return fmaxf(cb * cm, cf);
+    }
+    if (lb[0] == '+' && !lb[1]) {
+        d = fminf(sd_box(x, y, 3.9f, 0.8f, 0.2f), sd_box(x, y, 0.8f, 3.9f, 0.2f));
+        return fminf(fmaxf(0.5f - d * ppt, 0.0f), 1.0f);
+    }
+    if (lb[0] == '-' && !lb[1]) {
+        d = sd_box(x, y, 3.9f, 0.8f, 0.2f);
+        return fminf(fmaxf(0.5f - d * ppt, 0.0f), 1.0f);
+    }
+    /* text: cap height 7.6 texels, italic like the game's own labels */
+    const float ch = 7.6f, adv = 0.64f * ch, gap = 1.3f;
+    int n = 0;
+    float widths[3], total = 0.0f;
+    for (; n < 3 && lb[n]; n++) {
+        widths[n] = lb[n] == '1' ? 0.5f * ch : adv;
+        total += widths[n] + (n ? gap : 0.0f);
+    }
+    if (!n) return 0.0f;
+    float xs = x + 0.17f * y + total * 0.5f;                       /* shear, then from the text's left edge */
+    float v = (y + ch * 0.5f) / ch, pen = 0.0f;
+    for (int i = 0; i < n; i++) {
+        float u = (xs - pen) / widths[i];
+        const float (*sg)[4]; int ns;
+        switch (lb[i]) {
+        case 'L': sg = PC_L; ns = 2; break;
+        case 'R': sg = PC_R; ns = 7; break;
+        case 'B': sg = PC_B; ns = 10; break;
+        case '1': sg = PC_1; ns = 2; break;
+        default: sg = NULL; ns = 0; break;
+        }
+        if (sg) {
+            float e = stroke_dist(sg, ns, u, v);                    /* unit-box distance */
+            float k = (widths[i] + ch) * 0.5f;                      /* back to texels (mean of the two axes) */
+            if (e * k < d) d = e * k;
+        }
+        pen += widths[i] + gap;
+    }
+    return fminf(fmaxf((thick * 0.5f - d) * ppt + 0.5f, 0.0f), 1.0f);
+}
+
+static void pill_paint(uint32_t *px, int stride, int ph, int X, int Y, int W, int H, int s, const char *label,
+                       uint32_t rgb) {
+    if (X < 1 || Y < 0 || X + W + 1 > stride || Y + H > ph) return;
+    /* erase: per row, blend the texels just outside the box (only where the pill is opaque) */
+    for (int y = 0; y < H; y++) {
+        uint32_t a = px[(size_t)(Y + y) * (size_t)stride + (size_t)(X - 1)];
+        uint32_t b = px[(size_t)(Y + y) * (size_t)stride + (size_t)(X + W)];
+        if ((a >> 24) < 0xE0 || (b >> 24) < 0xE0) continue;
+        for (int x = 0; x < W; x++) {
+            uint32_t *p = &px[(size_t)(Y + y) * (size_t)stride + (size_t)(X + x)];
+            if ((*p >> 24) < 0xE0) continue;
+            int t = W > 1 ? x * 256 / (W - 1) : 0;
+            uint32_t o = 0xFF000000u;
+            for (int c = 0; c < 24; c += 8)
+                o |= (uint32_t)((((a >> c) & 0xFF) * (256 - t) + ((b >> c) & 0xFF) * t) >> 8) << c;
+            *p = o;
+        }
+    }
+    uint32_t col = rgb ? (0xFF000000u | ((rgb & 0xFF) << 16) | (rgb & 0xFF00u) | ((rgb >> 16) & 0xFF)) : 0xFF181818u;
+    const float cx = (float)X + (float)W * 0.5f, cy = (float)Y + (float)H * 0.5f;
+    const int pad = s;                                              /* an icon may be a little taller than the box */
+    for (int y = Y - pad; y < Y + H + pad; y++)
+        for (int x = X - pad; x < X + W + pad; x++) {
+            if (y < 0 || y >= ph || x < 0 || x >= stride) continue;
+            uint32_t *p = &px[(size_t)y * (size_t)stride + (size_t)x];
+            if ((*p >> 24) < 0xE0) continue;
+            float c = pill_label_cov(label, ((float)x + 0.5f - cx) / (float)s, ((float)y + 0.5f - cy) / (float)s, (float)s);
+            if (c <= 0.0f) continue;
+            uint32_t out = 0xFF000000u;
+            for (int sh = 0; sh < 24; sh += 8) {
+                float o0 = (float)((*p >> sh) & 0xFF), n0 = (float)((col >> sh) & 0xFF);
+                out |= (uint32_t)(o0 + (n0 - o0) * c + 0.5f) << sh;
+            }
+            *p = out;
+        }
+}
+
 /* Apply every rule of `key` to the uploaded copy, `s` times the original size, as the current
  * map says. `src` is an untouched copy of the same texture (a rectangle's look can be another
  * rectangle's pixels: the circle glyph of a pair becomes the cross glyph, exactly). */
@@ -944,6 +1074,11 @@ static void glyph_rewrite(uint32_t *px, const uint32_t *src, int up_w, int s, ui
         if (si < 0) continue;
         const psp_glyph_look *lk = &m->look[si];
         const int gw = r->gw * s, gh = r->gh * s;
+        if (si >= 4) {                                          /* a button pill: START, SELECT, L, R */
+            if (lk->label[0])
+                pill_paint(px, up_w, h * s, r->x * s, r->y * s, gw, gh, s, lk->label, lk->rgb);
+            continue;
+        }
         if (lk->letter) {
             glyph_paint(px, up_w, r->x * s, r->y * s, gw, gh, lk->letter, lk->rgb, r->rot);
         } else if (lk->shows && lk->shows != r->sym) {
@@ -1208,6 +1343,15 @@ static int resolve_texture(const psp_draw_state *st) {
             memcpy(orig, dst, (size_t)up_w * (size_t)up_h * 4u);
             glyph_rewrite(dst, orig, up_w, uv_scale, dump_key(data_hash_orig, clut_hash, st->tex_fmt,
                                                               st->tex_w, st->tex_h), st->tex_w, st->tex_h);
+            /* EMOTIONALSENSE_TEX_DUMP_GLYPH=<dir>: the rewritten copy, as <key>_m<map id>.png (a test aid: with the
+             * internal scale at 1 it compares texel for texel with the dump of the original) */
+            const char *gd = getenv("EMOTIONALSENSE_TEX_DUMP_GLYPH");
+            if (gd && *gd) {
+                char gp[600];
+                snprintf(gp, sizeof gp, "%s/%016llx_m%u.png", gd,
+                         (unsigned long long)dump_key(data_hash_orig, clut_hash, st->tex_fmt, st->tex_w, st->tex_h), gmap_id);
+                psp_tex_png_write(gp, dst, up_w, up_h);
+            }
             free(orig);
         }
     }

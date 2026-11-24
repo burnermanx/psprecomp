@@ -478,8 +478,29 @@ static int present_main(void *arg) {
                          * overlaid frame (a test aid: the compositor is not
                          * capturable from a script). */
                         static int shot_done; const char *sp;
-                        if (!shot_done && (sp = getenv("EMOTIONALSENSE_OVERLAY_SHOT")) && *sp) {
-                            FILE *f = fopen(sp, "wb");
+                        /* EMOTIONALSENSE_OVERLAY_SHOT_EVERY=N: instead of only the first, one overlaid frame
+                         * every N vblanks, as <file>.<vblank>.ppm */
+                        static unsigned long long last_slot = ~0ull;
+                        const char *ev = getenv("EMOTIONALSENSE_OVERLAY_SHOT_EVERY");
+                        const unsigned long long evn = ev ? strtoull(ev, NULL, 10) : 0;
+                        const unsigned long long vbn = psp_display_vblanks();
+                        char shotname[1100];
+                        int take = 0;
+                        sp = getenv("EMOTIONALSENSE_OVERLAY_SHOT");
+                        if (sp && *sp) {
+                            if (evn) {
+                                if (vbn / evn != last_slot) {
+                                    last_slot = vbn / evn;
+                                    snprintf(shotname, sizeof shotname, "%s.%llu.ppm", sp, vbn);
+                                    take = 1;
+                                }
+                            } else if (!shot_done) {
+                                snprintf(shotname, sizeof shotname, "%s", sp);
+                                take = 1;
+                            }
+                        }
+                        if (take) {
+                            FILE *f = fopen(shotname, "wb");
                             if (f) {
                                 fprintf(f, "P6\n%d %d\n255\n", tex_w, tex_h);
                                 for (int i = 0; i < tex_w * tex_h; i++) {

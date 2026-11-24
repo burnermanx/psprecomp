@@ -321,6 +321,17 @@ static void hle_ReadBufferPositive(void) {
     }
     {   /* the triggers: L/R, or (when the host asks) the stick's X axis */
         if (tr) {
+            static int trig_trace = -1;
+            if (trig_trace < 0) trig_trace = getenv("EMOTIONALSENSE_TRACE_INPUT") != NULL;
+            if (trig_trace) {
+                static uint32_t last_tr = ~0u; static int last_h = -1;
+                int h = g_trigger_hook ? g_trigger_hook() : -2;
+                if (tr != last_tr || h != last_h) {
+                    psp_log("input[%llu]: triggers=%u hook=%d stick_moved=%d scene=%u\n",
+                            (unsigned long long)psp_display_vblanks(), tr, h, g_stick_moved, psp_scene_now());
+                    last_tr = tr; last_h = h;
+                }
+            }
             if (g_trigger_hook && g_trigger_hook()) {
                 if (!g_stick_moved) {
                     if ((tr & PSP_TRIG_LEFT) && !(tr & PSP_TRIG_RIGHT)) ax = 0;

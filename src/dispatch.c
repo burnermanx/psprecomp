@@ -3,6 +3,7 @@
 #include "psprecomp/dispatch.h"
 #include "psprecomp/log.h"
 #include "psprecomp/cpu.h"
+#include "psprecomp/hle.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -120,7 +121,38 @@ void psp_trace_watch(uint32_t addr, void (*fn)(uint32_t)) {
     g_watch_fn = fn;
 }
 
+/* EMOTIONALSENSE_FN_RANGE=0xLO-0xHI[@vb1-vb2]: log the entry of every function in the range (a trace build
+ * only), at most once per function per 20 vblanks, inside the vblank window if one is given. A timeline of which
+ * code runs while a screen is up. */
+static uint32_t g_range_lo, g_range_hi;
+static uint64_t g_range_vb1, g_range_vb2 = ~0ull;
+static int g_range_init;
+static uint64_t g_range_last[0x8000];
+
+static void range_init(void) {
+    g_range_init = 1;
+    const char *e = getenv("EMOTIONALSENSE_FN_RANGE");
+    if (!e) return;
+    char *end;
+    g_range_lo = (uint32_t)strtoul(e, &end, 0);
+    if (*end == '-') g_range_hi = (uint32_t)strtoul(end + 1, &end, 0);
+    if (*end == '@') {
+        g_range_vb1 = strtoull(end + 1, &end, 0);
+        if (*end == '-') g_range_vb2 = strtoull(end + 1, &end, 0);
+    }
+    if (g_range_hi - g_range_lo > 0x20000u) g_range_lo = g_range_hi = 0;
+}
+
 void psp_trace_enter(uint32_t addr) {
+    if (!g_range_init) range_init();
+    if (addr >= g_range_lo && addr < g_range_hi) {
+        uint64_t vb = psp_display_vblanks();
+        uint32_t k = (addr - g_range_lo) >> 2;
+        if (vb >= g_range_vb1 && vb <= g_range_vb2 && (g_range_last[k] == 0 || vb - g_range_last[k] >= 20)) {
+            g_range_last[k] = vb ? vb : 1;
+            psp_log("fnr[%llu] 0x%08X ra=0x%08X\n", (unsigned long long)vb, addr, psp_cpu.r[PSP_REG_RA]);
+        }
+    }
     if (addr == g_watch_addr && g_watch_fn) g_watch_fn(addr);
     g_trace[g_trace_n % TRACE_DEPTH] = addr;
     g_trace_n++;

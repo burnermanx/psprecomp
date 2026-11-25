@@ -77,6 +77,33 @@ const psp_hle_entry *psp_hle_entries(int *count) {
     return g_entry;
 }
 
+/* Calls made so far to the entries whose name starts with `prefix` (NULL = all). A test aid: the vblank trace
+ * (EMOTIONALSENSE_TRACE_VBDT) differences it from frame to frame. */
+uint64_t psp_hle_calls_named(const char *prefix) {
+    uint64_t n = 0;
+    for (int i = 0; i < g_count; i++)
+        if (!prefix || (g_entry[i].name && !strncmp(g_entry[i].name, prefix, strlen(prefix)))) n += g_calls[i];
+    return n;
+}
+
+/* The firmware calls made since the previous call of this function, busiest first (at most 8 names), as one
+ * log line; nothing is printed when fewer than `min_total` calls were made. */
+void psp_hle_delta_report(const char *tag, uint64_t min_total) {
+    static uint64_t snap[HLE_MAX];
+    uint64_t total = 0, d[HLE_MAX];
+    for (int i = 0; i < g_count; i++) { d[i] = g_calls[i] - snap[i]; snap[i] = g_calls[i]; total += d[i]; }
+    if (total < min_total) return;
+    psp_log("%s calls:", tag);
+    for (int k = 0; k < 8; k++) {
+        int best = -1;
+        for (int i = 0; i < g_count; i++) if (d[i] && (best < 0 || d[i] > d[best])) best = i;
+        if (best < 0) break;
+        psp_log(" %s=%llu", g_entry[best].name ? g_entry[best].name : "?", (unsigned long long)d[best]);
+        d[best] = 0;
+    }
+    psp_log("\n");
+}
+
 /* A short history of firmware calls that returned zero.
  *
  * Zero is the value a game most often treats as an address, so a stubbed or

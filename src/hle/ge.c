@@ -136,6 +136,29 @@ typedef struct {
     int      done;
 } ge_queue;
 
+/* PSPRECOMP_GE_CENSUS=1: every command the interpreter does not decode (and the few it only decodes to
+ * ignore: BEZIER, SPLINE, BJUMP, SIGNAL, TEXLEVEL), counted per game scene
+ * (psp_scene_now(), 0..15) with how many carried a non-zero argument (a command that only ever
+ * carries zero is the hardware default being re-sent, not a use of the feature). Printed with
+ * the rest of the GE report. */
+#define CEN_SCENES 16
+static int g_cen_on = -1;
+static uint64_t g_cen[CEN_SCENES][256], g_cen_nz[CEN_SCENES][256], g_cen_lists[CEN_SCENES];
+static uint32_t g_cen_args[256][4];          /* first distinct non-zero arguments seen */
+
+static void census_note(uint32_t cmd, uint32_t arg) {
+    uint32_t sc = psp_scene_now();
+    if (sc >= CEN_SCENES) sc = CEN_SCENES - 1;
+    g_cen[sc][cmd]++;
+    if (arg) {
+        g_cen_nz[sc][cmd]++;
+        for (int i = 0; i < 4; i++) {
+            if (g_cen_args[cmd][i] == arg) return;
+            if (!g_cen_args[cmd][i]) { g_cen_args[cmd][i] = arg; return; }
+        }
+    }
+}
+
 static ge_queue g_queue[MAX_QUEUES];
 static uint32_t g_next_id;
 
@@ -383,6 +406,23 @@ void psp_ge_dump_stats(FILE *out) {
             if (g_ge.op_count[i])
                 fprintf(out, "      0x%02X x%-8llu last arg 0x%06X\n", i,
                         (unsigned long long)g_ge.op_count[i], g_ge.op_last[i]);
+    }
+    if (g_cen_on > 0) {
+        fprintf(out, "    GE census by scene (ignored command: total / with a non-zero argument):\n");
+        for (int sc = 0; sc < CEN_SCENES; sc++) {
+            if (!g_cen_lists[sc]) continue;
+            fprintf(out, "      scene %d: %llu lists\n", sc, (unsigned long long)g_cen_lists[sc]);
+            for (int c = 0; c < 256; c++)
+                if (g_cen[sc][c])
+                    fprintf(out, "        scene %d cmd 0x%02X %llu / %llu\n", sc, c,
+                            (unsigned long long)g_cen[sc][c], (unsigned long long)g_cen_nz[sc][c]);
+        }
+        for (int c = 0; c < 256; c++)
+            if (g_cen_args[c][0]) {
+                fprintf(out, "        args 0x%02X:", c);
+                for (int i = 0; i < 4 && g_cen_args[c][i]; i++) fprintf(out, " 0x%06X", g_cen_args[c][i]);
+                fprintf(out, "\n");
+            }
     }
     fprintf(out, "    pixels written: %llu\n", (unsigned long long)psp_render_pixels());
     if (g_xf.behind)
@@ -638,6 +678,8 @@ static void run_list(ge_queue *q) {
     uint64_t budget = 1u << 22;
 
     g_ge.lists++;
+    if (g_cen_on < 0) g_cen_on = getenv("PSPRECOMP_GE_CENSUS") != NULL;
+    if (g_cen_on > 0) { uint32_t sc = psp_scene_now(); g_cen_lists[sc >= CEN_SCENES ? CEN_SCENES - 1 : sc]++; }
 
     while (budget--) {
         if (q->stall && ((q->list ^ q->stall) & PSP_ADDR_MASK) == 0) break;   /* caught up to the CPU */
@@ -666,6 +708,7 @@ static void run_list(ge_queue *q) {
             /* Patches expand to triangles on hardware; counted as their own
              * thing rather than folded into the triangle count. */
             g_ge.prims[3]++;
+            if (g_cen_on > 0) census_note(cmd, arg);
             break;
 
         case GE_JUMP:
@@ -683,6 +726,7 @@ static void run_list(ge_queue *q) {
              * not process. Not taking it means we walk the enclosed commands
              * rather than skipping them -- the conservative direction, since
              * skipping would under-report what the game drew. */
+            if (g_cen_on > 0) census_note(cmd, arg);
             break;
 
         case GE_END:
@@ -699,6 +743,7 @@ static void run_list(ge_queue *q) {
         case GE_SIGNAL:
             /* Raises a callback on hardware. Callbacks are not delivered yet
              * (no scheduler), so this is recorded and ignored. */
+            if (g_cen_on > 0) census_note(cmd, arg);
             break;
 
         case GE_BASE:        q->base = ((arg & 0xFF0000) << 8) & PSP_ADDR_MASK; break;
@@ -788,6 +833,7 @@ static void run_list(ge_queue *q) {
         case GE_TEXFILTER: g_ds.tex_filter = arg & 1; break;
         case GE_TEXLEVEL:
             /* Mipmaps are not sampled; the base level is always used. */
+            if (g_cen_on > 0) census_note(cmd, arg);
             break;
         case GE_TEXFLUSH:
             /* Flushes the GE's texture cache. Nothing is cached here. */
@@ -851,6 +897,7 @@ static void run_list(ge_queue *q) {
             g_ge.unknown++;
             g_ge.op_count[cmd]++;
             g_ge.op_last[cmd] = arg;
+            if (g_cen_on > 0) census_note(cmd, arg);
             break;
         }
     }

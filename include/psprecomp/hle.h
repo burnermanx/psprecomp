@@ -231,6 +231,8 @@ void psp_audio_wait(int channel, uint64_t play_us);
 void psp_set_scene_source(uint32_t addr);
 void psp_set_scene_source_ptr(uint32_t ptr_addr, uint32_t off, uint32_t fallback);
 uint32_t psp_scene_now(void);
+void psp_hle_delta_report(const char *tag, uint64_t min_total);   /* busiest calls since the last report (test aid) */
+uint64_t psp_hle_calls_named(const char *prefix);   /* calls so far to entries whose name starts with prefix (NULL: all) */
 
 void psp_threadman_init(void);
 void psp_threadman_register(void);

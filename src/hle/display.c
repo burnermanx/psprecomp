@@ -353,8 +353,38 @@ static void trace_fps_vblank(void) {
     }
 }
 
+/* EMOTIONALSENSE_TRACE_VBDT=<from>-<to>: for each vblank in the range, the guest clock step since the previous
+ * one (a normal frame is 16683 us; a long frame is a whole number of periods more) and the number of guest
+ * firmware calls made in between (all, the two MPEG access-unit getters, CheckCallback). Round 37 (the opening's stream change, ours at 481, PPSSPP at 484-510). */
+static void trace_vbdt(void) {
+    static int on = -1;
+    static uint64_t lo, hi, prev_us, prev_calls, prev_a, prev_v, prev_c;
+    if (on < 0) {
+        const char *e = getenv("EMOTIONALSENSE_TRACE_VBDT");
+        on = e && *e;
+        if (on) { char *end; lo = strtoull(e, &end, 0); hi = *end == '-' ? strtoull(end + 1, NULL, 0) : lo; }
+    }
+    if (!on) return;
+    uint64_t now = psp_clock_us(), calls = psp_hle_calls_named(NULL), a = psp_hle_calls_named("sceMpegGetAtracAu"),
+             v = psp_hle_calls_named("sceMpegGetAvcAu"), c = psp_hle_calls_named("sceKernelCheckCallback");
+    if (g_vblank_count >= lo && g_vblank_count <= hi)
+        psp_log("vbdt[%llu]: dt=%llu us (%.2f frames) calls=%llu atracAu=%llu avcAu=%llu checkcb=%llu\n",
+                (unsigned long long)g_vblank_count, (unsigned long long)(now - prev_us), (double)(now - prev_us) / 16683.0,
+                (unsigned long long)(calls - prev_calls), (unsigned long long)(a - prev_a),
+                (unsigned long long)(v - prev_v), (unsigned long long)(c - prev_c));
+    if (g_vblank_count >= lo && g_vblank_count <= hi) {
+        char tag[40];
+        snprintf(tag, sizeof tag, "vbdt[%llu]", (unsigned long long)g_vblank_count);
+        psp_hle_delta_report(tag, 200);
+    } else {
+        psp_hle_delta_report("", ~0ull);          /* keep the snapshot current outside the range */
+    }
+    prev_us = now; prev_calls = calls; prev_a = a; prev_v = v; prev_c = c;
+}
+
 static void hle_WaitVblank(void) {
     g_vblank_count++;
+    trace_vbdt();
     if (trace_fps_on()) trace_fps_vblank();
     if (getenv("EMOTIONALSENSE_DEBUG_FB") && (g_vblank_count % 100) == 0) {
         psp_log("vblank %llu\n", (unsigned long long)g_vblank_count);

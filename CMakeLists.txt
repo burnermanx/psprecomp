@@ -79,16 +79,24 @@ endif()
 # SDL2 window/input backend. Opt-in so the core keeps building with nothing
 # installed. Windows uses it too: audio already goes through SDL2 there, and
 # one window/input path is less to get wrong.
-option(PSPRECOMP_SDL2 "Build the SDL2 window backend (Linux, macOS, Windows)" OFF)
+option(PSPRECOMP_SDL2 "Build the SDL2 window backend (Linux, macOS, Windows, Android)" OFF)
 if(PSPRECOMP_SDL2)
-    find_package(SDL2 REQUIRED)
     target_compile_definitions(psprecomp PUBLIC PSPRECOMP_SDL2=1)
-    if(TARGET SDL2::SDL2)
-        target_link_libraries(psprecomp PUBLIC SDL2::SDL2)
+    if(ANDROID AND SDL2_INCLUDE_DIR AND SDL2_LIBRARY)
+        target_include_directories(psprecomp PUBLIC ${SDL2_INCLUDE_DIR})
+        target_link_libraries(psprecomp PUBLIC ${SDL2_LIBRARY})
     else()
-        target_include_directories(psprecomp PUBLIC ${SDL2_INCLUDE_DIRS})
-        target_link_libraries(psprecomp PUBLIC ${SDL2_LIBRARIES})
+        find_package(SDL2 REQUIRED)
+        if(TARGET SDL2::SDL2)
+            target_link_libraries(psprecomp PUBLIC SDL2::SDL2)
+        else()
+            target_include_directories(psprecomp PUBLIC ${SDL2_INCLUDE_DIRS})
+            target_link_libraries(psprecomp PUBLIC ${SDL2_LIBRARIES})
+        endif()
     endif()
+endif()
+if(ANDROID)
+    target_link_libraries(psprecomp PUBLIC log android)
 endif()
 option(PSPRECOMP_VULKAN "Build the Vulkan render backend" OFF)
 if(PSPRECOMP_VULKAN)
@@ -107,9 +115,16 @@ endif()
 
 # --- the recompiler -----------------------------------------------------------
 
-# The recompiler runs on the build machine. A cross build reuses the C that a
-# native build already generated (EMOTIONALSENSE_GEN_DIR).
-if(NOT CMAKE_CROSSCOMPILING)
+# The recompiler runs on the build machine by default. A cross build reuses
+# the C that a native build already generated (EMOTIONALSENSE_GEN_DIR), unless
+# PSPRECOMP_BUILD_RECOMPILER=ON is requested (e.g. for on-device Android builds).
+if(CMAKE_CROSSCOMPILING)
+    set(_default_build_recompiler OFF)
+else()
+    set(_default_build_recompiler ON)
+endif()
+option(PSPRECOMP_BUILD_RECOMPILER "Build allegrexrecomp tool" ${_default_build_recompiler})
+if(PSPRECOMP_BUILD_RECOMPILER)
     add_subdirectory(tools/allegrexrecomp)
 endif()
 

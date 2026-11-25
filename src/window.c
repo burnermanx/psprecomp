@@ -252,6 +252,9 @@ void psp_window_set_overlay(psp_overlay_fn fn) { (void)fn; }
 int psp_window_overlay_apply(uint32_t *px, int w, int h) { (void)px; (void)w; (void)h; return 0; }
 void psp_window_set_state_file(const char *path) { (void)path; }
 void psp_window_set_start_mode(int mode) { (void)mode; }
+void psp_window_set_touch_state(uint32_t buttons, uint8_t lx, uint8_t ly, uint32_t triggers) {
+    (void)buttons; (void)lx; (void)ly; (void)triggers;
+}
 
 #elif defined(PSPRECOMP_SDL2)
 
@@ -412,6 +415,13 @@ static atomic_int g_present_state;  /* 0 starting, 1 running, -1 failed */
 static atomic_int g_dirty = 1;      /* redraw the last frame (resize, expose) */
 static atomic_int g_refit;          /* the window size changed: refit the scale */
 static atomic_int g_esc;            /* Escape presses not yet taken by the host */
+#ifdef __ANDROID__
+static atomic_int g_paused;         /* 1 while the Android activity is backgrounded */
+#endif
+static _Atomic uint32_t g_touch_buttons;
+static _Atomic uint32_t g_touch_triggers;
+static atomic_int g_touch_lx = 128;
+static atomic_int g_touch_ly = 128;
 static psp_overlay_fn g_overlay;
 static uint32_t *g_px_ov;           /* scratch copy the overlay draws on */
 
@@ -442,6 +452,12 @@ static int present_main(void *arg) {
     uint32_t snap_seq = 0;
     FILE *tp = g_trace;
     while (!atomic_load(&g_closed)) {
+#ifdef __ANDROID__
+        if (atomic_load(&g_paused)) {
+            SDL_Delay(16);
+            continue;
+        }
+#endif
         if (atomic_exchange(&g_refit, 0)) fit_scale(ren, tex_w, tex_h);
         /* Present only when the guest produced a frame (or the window changed),
          * so the screen rate never paces the game. */
@@ -673,6 +689,11 @@ static int window_main(void *arg) {
             if (g_scale < 1) g_scale = 1;
         }
     }
+#ifdef __ANDROID__
+    SDL_Window *win = SDL_CreateWindow(g_title, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+                                       W * g_scale, H * g_scale,
+                                       SDL_WINDOW_FULLSCREEN | SDL_WINDOW_ALLOW_HIGHDPI);
+#else
     const int start_fs = want_fullscreen_at_start();
     SDL_Window *win = SDL_CreateWindow(g_title, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
                                        W * g_scale, H * g_scale,
@@ -683,6 +704,7 @@ static int window_main(void *arg) {
                                                              SDL_PIXELFORMAT_RGBA32);
         if (is) { SDL_SetWindowIcon(win, is); SDL_FreeSurface(is); }
     }
+#endif
     g_win = win;
     if (win) {
         SDL_DisplayMode dm;
@@ -755,6 +777,19 @@ static int window_main(void *arg) {
         while (SDL_PollEvent(&ev)) {
             switch (ev.type) {
             case SDL_QUIT: atomic_store(&g_closed, 1); break;
+#ifdef __ANDROID__
+            case SDL_APP_WILLENTERBACKGROUND:
+                atomic_store(&g_paused, 1);
+                break;
+            case SDL_APP_DIDENTERFOREGROUND:
+                atomic_store(&g_paused, 0);
+                atomic_store(&g_refit, 1);
+                atomic_store(&g_dirty, 1);
+                break;
+            case SDL_APP_TERMINATING:
+                atomic_store(&g_closed, 1);
+                break;
+#endif
             case SDL_WINDOWEVENT:
                 if (ev.window.event == SDL_WINDOWEVENT_SIZE_CHANGED ||
                     ev.window.event == SDL_WINDOWEVENT_EXPOSED) {
@@ -825,7 +860,13 @@ static int window_main(void *arg) {
                 if (!moved) keyboard_stick(&ax);
             }
         }
-        psp_ctrl_set_ex(bp | bk, ax, ay, trig, moved);
+        uint32_t tb = atomic_load_explicit(&g_touch_buttons, memory_order_relaxed);
+        uint32_t tt = atomic_load_explicit(&g_touch_triggers, memory_order_relaxed);
+        uint8_t tlx = (uint8_t)atomic_load_explicit(&g_touch_lx, memory_order_relaxed);
+        uint8_t tly = (uint8_t)atomic_load_explicit(&g_touch_ly, memory_order_relaxed);
+        if (tlx != 128) { ax = tlx; moved = 1; }
+        if (tly != 128) { ay = tly; moved = 1; }
+        psp_ctrl_set_ex(bp | bk | tb, ax, ay, trig | tt, moved);
         static int in_trace = -1;
         if (in_trace < 0) in_trace = getenv("EMOTIONALSENSE_TRACE_INPUT") != NULL;
         if (in_trace) {
@@ -872,6 +913,13 @@ int psp_window_height(void) {
     return (on_gamescope() && d > h) ? d : h;
 }
 
+void psp_window_set_touch_state(uint32_t buttons, uint8_t lx, uint8_t ly, uint32_t triggers) {
+    atomic_store_explicit(&g_touch_buttons, buttons, memory_order_relaxed);
+    atomic_store_explicit(&g_touch_lx, (int)lx, memory_order_relaxed);
+    atomic_store_explicit(&g_touch_ly, (int)ly, memory_order_relaxed);
+    atomic_store_explicit(&g_touch_triggers, triggers, memory_order_relaxed);
+}
+
 #else
 
 /* ponytail: no window without Win32 or SDL2 (configure with
@@ -888,5 +936,8 @@ int psp_window_overlay_apply(uint32_t *px, int w, int h) { (void)px; (void)w; (v
 
 int psp_window_height(void) { return 0; }
 int psp_window_pad_kind(void) { return 0; }
+void psp_window_set_touch_state(uint32_t buttons, uint8_t lx, uint8_t ly, uint32_t triggers) {
+    (void)buttons; (void)lx; (void)ly; (void)triggers;
+}
 
 #endif

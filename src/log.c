@@ -4,6 +4,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef __ANDROID__
+#  include <android/log.h>
+#endif
+
 #ifdef _WIN32
 extern char **_environ;
 #  define ENV_LIST _environ
@@ -48,10 +52,38 @@ static void feed(const char *s, size_t n) {
     }
 }
 
+#ifdef __ANDROID__
+static char g_alog_line[2048];
+static size_t g_alog_ll;
+
+static void android_log_feed(int prio, const char *s, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        if (s[i] == '\n') {
+            g_alog_line[g_alog_ll] = 0;
+            __android_log_write(prio, "EmotionalSense", g_alog_line);
+            g_alog_ll = 0;
+        } else {
+            if (g_alog_ll >= sizeof g_alog_line - 1) {
+                g_alog_line[g_alog_ll] = 0;
+                __android_log_write(prio, "EmotionalSense", g_alog_line);
+                g_alog_ll = 0;
+            }
+            g_alog_line[g_alog_ll++] = s[i];
+        }
+    }
+}
+#endif
+
 static void emit(FILE *f, const char *s, size_t n) {
     if (!g_init) init();
-    if (g_on) fwrite(s, 1, n, f);
-    else feed(s, n);
+    if (g_on) {
+        fwrite(s, 1, n, f);
+#ifdef __ANDROID__
+        android_log_feed(f == stdout ? ANDROID_LOG_INFO : ANDROID_LOG_DEBUG, s, n);
+#endif
+    } else {
+        feed(s, n);
+    }
 }
 
 static void vemit(FILE *f, const char *fmt, va_list ap) {
@@ -73,6 +105,12 @@ void psp_out(const char *fmt, ...) { va_list ap; va_start(ap, fmt); vemit(stdout
 void psp_fatal(const char *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
+#ifdef __ANDROID__
+    va_list ap2;
+    va_copy(ap2, ap);
+    __android_log_vprint(ANDROID_LOG_ERROR, "EmotionalSense", fmt, ap2);
+    va_end(ap2);
+#endif
     vfprintf(stderr, fmt, ap);
     va_end(ap);
     fflush(stderr);

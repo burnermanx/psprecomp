@@ -77,4 +77,8 @@ int psp_window_height(void);
  * is always 1. The keyboard never changes it. */
 int psp_window_pad_kind(void);
 
+/* Lock-free touch overlay input state (Android). `lx`/`ly` default to 128
+ * (center); any non-128 value overrides the analog axis. */
+void psp_window_set_touch_state(uint32_t buttons, uint8_t lx, uint8_t ly, uint32_t triggers);
+
 #endif
